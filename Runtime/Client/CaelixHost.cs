@@ -107,6 +107,9 @@ namespace Caelix
 
         public HostTimingStats LastTickTimings { get; private set; }
 
+        /// <summary>Old name of <see cref="MonoSingleton{T}.Current"/>. Titania still calls it.</summary>
+        [Obsolete("Use CaelixHost.Current.")] public static CaelixHost Any => Current;
+
         /// <summary>Counters of the last alien propagation pass.</summary>
         public BrickOverlapPropagationStats LastBrickOverlapPropagationStats =>
             World != null ? World.LastBrickOverlapPropagationStats : default;
