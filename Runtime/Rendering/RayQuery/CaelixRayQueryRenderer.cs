@@ -51,6 +51,10 @@ namespace Caelix.Rendering.RayQuery
         [SerializeField, Tooltip("Upper size of one brick pool page, in bricks (1096 bytes each). Clamped to the platform's maximum buffer size. Lower it only to test paging.")]
         private int pageCapacityLimitBricks = CaelixBrickPool.DefaultPageCapacityLimitBricks;
 
+        [Header("Render Groups")]
+        [SerializeField, Tooltip("Bricks per acceleration-structure instance. Changing it while running re-uploads the world.")]
+        private RenderGroupSize groupSize = RenderGroupSize.Bricks16;
+
         /// <summary>Debug field showing the current number of instances in the acceleration structure.</summary>
         [Header("Debug Utils")] public int instanceCount;
 
@@ -63,8 +67,32 @@ namespace Caelix.Rendering.RayQuery
         /// <summary>Debug field showing how many bricks the pool's page buffers can hold together.</summary>
         public int poolCapacityBricks;
 
+        /// <summary>Debug field: live group renderers over every view.</summary>
+        public int groupCount;
+
+        /// <summary>Debug field: group render jobs this tick scheduled.</summary>
+        public int groupsEmittedThisTick;
+
+        /// <summary>Debug field: brick records this tick staged into the pool.</summary>
+        public int bricksStagedThisTick;
+
+        /// <summary>Debug field: groups whose AABB buffer this tick replaced.</summary>
+        public int aabbReallocsThisTick;
+
+        /// <summary>Debug field: acceleration-structure instances this tick removed and re-added.</summary>
+        public int instanceRebuildsThisTick;
+
+        /// <summary>Debug field: bytes the brick pool's page buffers occupy.</summary>
+        public long poolVramBytes;
+
+        /// <summary>Debug field: bytes every group's AABB buffer occupies together.</summary>
+        public long aabbVramBytes;
+
         private ClientWorld source;
         private bool warnedTooManyPages;
+
+        /// <summary>The grouping every live group renderer was built with. Follows <see cref="groupSize"/>.</summary>
+        private RenderGroup grouping = RenderGroup.Default;
 
         /// <summary>
         /// Set while the renderer still has to upload a world it did not watch being built: after
@@ -133,6 +161,15 @@ namespace Caelix.Rendering.RayQuery
 
         /// <summary>The client world this renderer draws, once resolved.</summary>
         public ClientWorld Source => source;
+
+        /// <summary>The grouping in force. Only changes at the top of a <see cref="Tick"/>.</summary>
+        public RenderGroup Grouping => grouping;
+
+        /// <summary>
+        /// The group shape preset. A new value is applied on the next <see cref="Tick"/>, which
+        /// drops every group and uploads the world again.
+        /// </summary>
+        public RenderGroupSize GroupSize { get => groupSize; set => groupSize = value; }
 
         /// <summary>
         /// True while every GPU resource the trace needs exists: between Awake/Tick and OnDisable. False
@@ -301,6 +338,25 @@ namespace Caelix.Rendering.RayQuery
         /// </remarks>
         public void Tick()
         {
+            groupCount = 0;
+            groupsEmittedThisTick = 0;
+            bricksStagedThisTick = 0;
+            aabbReallocsThisTick = 0;
+            instanceRebuildsThisTick = 0;
+            poolVramBytes = 0;
+            aabbVramBytes = 0;
+
+            // The grouping sizes every group renderer's brick map, AABB buffer and pool range, so a
+            // new preset is applied by dropping them all. ReleaseResources unbinds the source and
+            // raises needsInitialUpload; the lines below rebind it and recreate the pool, the
+            // instance table and the acceleration structure.
+            RenderGroup wanted = RenderGroupPresets.Of(groupSize);
+            if (!wanted.Equals(grouping))
+            {
+                ReleaseResources();
+                grouping = wanted;
+            }
+
             if (!EnsureSource())
             {
                 return;
@@ -344,7 +400,7 @@ namespace Caelix.Rendering.RayQuery
                     // Nothing told this renderer about the bricks that arrived before it was
                     // bound, so the work is synthesised from the storage itself.
                     NativeArray<BrickChange> initial = RenderGroupChanges.BuildFullUploadChanges(view.Data);
-                    buckets = ChangeBuckets.Build(initial);
+                    buckets = ChangeBuckets.Build(initial, grouping);
                     initial.Dispose();
                 }
                 else
@@ -355,7 +411,7 @@ namespace Caelix.Rendering.RayQuery
                         continue;
                     }
 
-                    buckets = ChangeBuckets.Build(changes);
+                    buckets = ChangeBuckets.Build(changes, grouping);
                 }
 
                 frameBuckets.Add((view, buckets));
@@ -376,7 +432,7 @@ namespace Caelix.Rendering.RayQuery
                             continue;
                         }
 
-                        renderer = new RayQueryGroupRenderer(view, groupKey, brickMat, ledger);
+                        renderer = new RayQueryGroupRenderer(view, groupKey, brickMat, ledger, grouping);
                         viewGroups[groupKey] = renderer;
                     }
 
@@ -417,7 +473,10 @@ namespace Caelix.Rendering.RayQuery
 
                 foreach (var kvp in viewGroups)
                 {
-                    kvp.Value.ApplyCompletedRenderJob(Pool);
+                    if (kvp.Value.ApplyCompletedRenderJob(Pool))
+                    {
+                        aabbReallocsThisTick++;
+                    }
 
                     // A group that renders nothing owns an instance, a pool range and a brick map
                     // for no geometry. Dropping it here is what replaces the old sector-removal
@@ -457,8 +516,14 @@ namespace Caelix.Rendering.RayQuery
                 {
                     foreach (var kvp in viewGroups)
                     {
-                        kvp.Value.UploadBricks(Pool);
-                        kvp.Value.RenderModifyAS(ref _voxelScene, view, kvp.Key, Instances);
+                        bricksStagedThisTick += kvp.Value.UploadBricks(Pool);
+                        if (kvp.Value.RenderModifyAS(ref _voxelScene, view, kvp.Key, Instances))
+                        {
+                            instanceRebuildsThisTick++;
+                        }
+
+                        groupCount++;
+                        aabbVramBytes += kvp.Value.AabbVramBytes;
                     }
                 }
 
@@ -484,6 +549,7 @@ namespace Caelix.Rendering.RayQuery
 
             poolLiveBricks = Pool.TotalLiveBricks;
             poolCapacityBricks = Pool.TotalCapacityBricks;
+            poolVramBytes = (long)Pool.VRAMUsage;
         }
 
         private Dictionary<int3, RayQueryGroupRenderer> GetOrCreateViewGroups(EntityView view)
@@ -507,7 +573,7 @@ namespace Caelix.Rendering.RayQuery
             return false;
         }
 
-        private static void CombineJob(
+        private void CombineJob(
             RayQueryGroupRenderer renderer, ref JobHandle renderJobs, ref bool hasRenderJobs)
         {
             if (!renderer.TryGetScheduledJobHandle(out JobHandle groupJob))
@@ -515,6 +581,7 @@ namespace Caelix.Rendering.RayQuery
                 return;
             }
 
+            groupsEmittedThisTick++;
             renderJobs = JobHandle.CombineDependencies(renderJobs, groupJob);
             hasRenderJobs = true;
         }

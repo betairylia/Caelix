@@ -75,6 +75,23 @@ internal static class CaelixRayQueryDispatch
     }
 
     /// <summary>
+    /// Enables exactly the group-shape keyword the renderer's grouping needs on this kernel's
+    /// compute shader.
+    /// </summary>
+    /// <remarks>
+    /// Recorded into the command buffer rather than set with <c>ComputeShader.EnableKeyword</c>,
+    /// which would mutate the asset's runtime keyword state instead of the command stream.
+    /// </remarks>
+    public static void SetGroupKeyword(CommandBuffer cmd, ComputeShader cs, RenderGroupSize size)
+    {
+        string wanted = RenderGroupPresets.Keyword(size);
+        foreach (string name in RenderGroupPresets.Keywords)
+        {
+            cmd.SetKeyword(cs, new LocalKeyword(cs, name), name == wanted);
+        }
+    }
+
+    /// <summary>
     /// Binds the acceleration structure, the brick pool pages, the instance records and the
     /// material table to one trace kernel.
     /// </summary>

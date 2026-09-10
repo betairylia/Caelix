@@ -73,6 +73,8 @@ public class CaelixBudgetGBufferPass : ScriptableRenderPass
 
         internal ComputeShader computeShader;
         internal int kernel;
+        /// <summary>Group shape the trace kernel must decode this frame.</summary>
+        internal RenderGroupSize groupSize;
         internal int[] bakeMaterialsKernels;
         /// <summary>Set the first time a material buffer is used: the bake kernels fill it before the trace.</summary>
         internal bool bakeMaterials;
@@ -202,6 +204,7 @@ public class CaelixBudgetGBufferPass : ScriptableRenderPass
 
             passData.computeShader = computeShader;
             passData.kernel = kernel;
+            passData.groupSize = rayQuery.GroupSize;
             passData.brickPages = CaelixRayQueryDispatch.FillBrickPages(rayQuery?.Pool, brickPages);
             passData.instanceTable = rayQuery?.Instances?.Buffer;
             passData.bakeMaterialsKernels = bakeMaterialsKernels;
@@ -275,6 +278,8 @@ public class CaelixBudgetGBufferPass : ScriptableRenderPass
         {
             CaelixRayQueryDispatch.BakeMaterials(cmd, cs, data.bakeMaterialsKernels, data.materialTable);
         }
+
+        CaelixRayQueryDispatch.SetGroupKeyword(cmd, cs, data.groupSize);
 
         CaelixRayQueryDispatch.BindSceneInputs(
             cmd, cs, k, data.voxAS, data.brickPages, data.instanceTable, data.materialTable);

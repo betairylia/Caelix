@@ -31,7 +31,7 @@ namespace Caelix.Tests
                 for (int b = 0; b < bricksPerSector; b++)
                 {
                     // Same x-fastest brick layout the storage region uses; see RenderGroupTests.
-                    writer.Write(sectorOrigin + RenderGroup.LocalBrickPos(b));
+                    writer.Write(sectorOrigin + RenderGroup.Default.LocalBrickPos(b));
                     writer.Write((byte)BrickOp.Update);
                     writer.Write((byte)1);
                     writer.Write((byte)SectorSlotId.Block);
@@ -81,7 +81,7 @@ namespace Caelix.Tests
                         Assert.That(allocated, Is.EqualTo(bricksPerSector));
                         int3 p = BrickKey.ToBlockOrigin(
                             VoxelRegion.FirstKeyOf(regionPos) +
-                            RenderGroup.LocalBrickPos(bricksPerSector - 1)) + new int3(7);
+                            RenderGroup.Default.LocalBrickPos(bricksPerSector - 1)) + new int3(7);
                         Assert.That(view.Data.GetBlock(p), Is.EqualTo(new Block((ushort)(0x8001 + s))));
                     }
                     client.EndFrame();

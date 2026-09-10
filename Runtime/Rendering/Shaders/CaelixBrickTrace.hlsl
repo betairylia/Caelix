@@ -11,21 +11,28 @@
 #define SIZE_IN_BLOCKS_U (1u << SHIFT_SIZE_IN_BLOCKS_U)
 #endif
 
-#ifndef SHIFT_SIZE_IN_BRICKS
-#define SHIFT_SIZE_IN_BRICKS 4
+// Render group shape: bits of the group-local brick index per axis. Must match
+// RenderGroupPresets.Keyword on the C# side. Default (no keyword) is 16x16x16 bricks.
+#if defined(CAELIX_GROUP_3_3_3)
+#define CAELIX_GROUP_SHIFT_X 3u
+#define CAELIX_GROUP_SHIFT_Y 3u
+#define CAELIX_GROUP_SHIFT_Z 3u
+#elif defined(CAELIX_GROUP_5_5_5)
+#define CAELIX_GROUP_SHIFT_X 5u
+#define CAELIX_GROUP_SHIFT_Y 5u
+#define CAELIX_GROUP_SHIFT_Z 5u
+#elif defined(CAELIX_GROUP_4_7_4)
+#define CAELIX_GROUP_SHIFT_X 4u
+#define CAELIX_GROUP_SHIFT_Y 7u
+#define CAELIX_GROUP_SHIFT_Z 4u
+#else
+#define CAELIX_GROUP_SHIFT_X 4u
+#define CAELIX_GROUP_SHIFT_Y 4u
+#define CAELIX_GROUP_SHIFT_Z 4u
 #endif
 
-#ifndef SIZE_IN_BRICKS
-#define SIZE_IN_BRICKS (1 << SHIFT_SIZE_IN_BRICKS)
-#endif
-
-#ifndef BRICK_POS_MASK
-#define BRICK_POS_MASK 15u
-#endif
-
-#ifndef SIZE_IN_BRICKS_SQUARED
-#define SIZE_IN_BRICKS_SQUARED 256
-#endif
+#define CAELIX_GROUP_MASK_X ((1u << CAELIX_GROUP_SHIFT_X) - 1u)
+#define CAELIX_GROUP_MASK_Y ((1u << CAELIX_GROUP_SHIFT_Y) - 1u)
 
 #ifndef BRICK_RAY_MAX_STEPS
 #define BRICK_RAY_MAX_STEPS 22
@@ -49,7 +56,7 @@
 #define BRICK_OCCUPANCY_WORDS 16
 #define BRICK_BLOCK_DATA_OFFSET 18
 #define BRICK_DATA_LENGTH 274
-#define BRICK_INFO_ABSOLUTE_INDEX_MASK 0xFFFu
+#define BRICK_INFO_ABSOLUTE_INDEX_MASK 0xFFFFu
 #define BRICK_INFO_COARSE_OCCUPANCY_SHIFT 16u
 #define BRICK_INFO_COARSE_OCCUPANCY_MASK 0xFFu
 #define BRICK_COARSE_SIZE_IN_BLOCKS 4
@@ -368,9 +375,9 @@ inline float CaelixTraceBrickPrimitiveCore(uint brickBase, float3 objectRayOrigi
     // AABB Intersection against the tight occupied-bounds box (word 1).
     // The DDA below still runs in full-brick coordinates; only the entry point moves.
     uint idx = brickInfo.x & BRICK_INFO_ABSOLUTE_INDEX_MASK;
-    int bX = int((idx & BRICK_POS_MASK) << SHIFT_SIZE_IN_BLOCKS);
-    int bY = int(((idx >> SHIFT_SIZE_IN_BRICKS) & BRICK_POS_MASK) << SHIFT_SIZE_IN_BLOCKS);
-    int bZ = int((idx >> (SHIFT_SIZE_IN_BRICKS + SHIFT_SIZE_IN_BRICKS)) << SHIFT_SIZE_IN_BLOCKS);
+    int bX = int((idx & CAELIX_GROUP_MASK_X) << SHIFT_SIZE_IN_BLOCKS);
+    int bY = int(((idx >> CAELIX_GROUP_SHIFT_X) & CAELIX_GROUP_MASK_Y) << SHIFT_SIZE_IN_BLOCKS);
+    int bZ = int((idx >> (CAELIX_GROUP_SHIFT_X + CAELIX_GROUP_SHIFT_Y)) << SHIFT_SIZE_IN_BLOCKS);
 
     uint tightBounds = brickInfo.y;
     float3 tightMin = float3(

@@ -2,6 +2,7 @@ using NUnit.Framework;
 using Unity.Collections;
 using Unity.Jobs;
 using Unity.Mathematics;
+using UnityEngine;
 using Caelix.Rendering;
 using Caelix.Rendering.RayQuery;
 using Caelix.Tests.TestSupport;
@@ -17,8 +18,19 @@ namespace Caelix.Tests
     {
         private sealed class JobScope : System.IDisposable
         {
-            public SparseBrickIdTable Map = SparseBrickIdTable.New(Allocator.Persistent);
+            public readonly RenderGroup Grouping;
+            public SparseBrickIdTable Map;
             public NativeList<BrickRecordLayout.BrickAABB> Aabbs = new(0, Allocator.Persistent);
+
+            public JobScope() : this(RenderGroup.Default)
+            {
+            }
+
+            public JobScope(RenderGroup grouping)
+            {
+                Grouping = grouping;
+                Map = SparseBrickIdTable.New(grouping.BricksInGroup, Allocator.Persistent);
+            }
 
             public GenerateGroupRenderDataJob Run(
                 VoxelEntityData data, NativeArray<BrickChange> changes, int count, bool fullUpload)
@@ -30,6 +42,7 @@ namespace Caelix.Tests
                     start = 0,
                     count = count,
                     groupKey = int3.zero,
+                    grouping = Grouping,
                     forceFullUpload = fullUpload,
                     rendererBrickMap = Map,
                     aabbBuffer = Aabbs,
@@ -134,12 +147,52 @@ namespace Caelix.Tests
             var empty = new NativeArray<BrickChange>(1, Allocator.TempJob);
             GenerateGroupRenderDataJob rebuild = jobs.Run(scope.Data, empty, 0, fullUpload: true);
 
+            RenderGroup grouping = RenderGroup.Default;
             Assert.That(jobs.Map.Count, Is.EqualTo(1));
-            Assert.That(jobs.Map.indices[RenderGroup.LocalBrickIdx(new int3(4, 0, 0))], Is.Not.EqualTo(SparseBrickIdTable.EMPTY));
-            Assert.That(jobs.Map.indices[RenderGroup.LocalBrickIdx(new int3(0, 0, 0))], Is.EqualTo(SparseBrickIdTable.EMPTY));
-            Assert.That(jobs.Map.indices[RenderGroup.LocalBrickIdx(new int3(2, 0, 0))], Is.EqualTo(SparseBrickIdTable.EMPTY));
+            Assert.That(jobs.Map.indices[grouping.LocalBrickIdx(new int3(4, 0, 0))], Is.Not.EqualTo(SparseBrickIdTable.EMPTY));
+            Assert.That(jobs.Map.indices[grouping.LocalBrickIdx(new int3(0, 0, 0))], Is.EqualTo(SparseBrickIdTable.EMPTY));
+            Assert.That(jobs.Map.indices[grouping.LocalBrickIdx(new int3(2, 0, 0))], Is.EqualTo(SparseBrickIdTable.EMPTY));
 
             DisposeJob(rebuild);
+            empty.Dispose();
+        }
+
+        /// <summary>
+        /// A group 128 bricks tall reaches a brick the default 16-brick group never could, and its
+        /// slot index runs through the y shift instead of a cube's.
+        /// </summary>
+        [Test]
+        public void FullUpload_TallGroup_PlacesABrickAtY800()
+        {
+            using var scope = new EntityDataTestScope();
+            using var jobs = new JobScope(RenderGroupPresets.Of(RenderGroupSize.Bricks16x128x16));
+
+            // Regions are 128 blocks per axis, so y 800 lies in region y index 6.
+            scope.Data.EnsureRegion(new int3(0, 6, 0));
+            scope.Data.SetBlock(new int3(1, 801, 1), new Block(5));
+            scope.Data.PropagateDirtyFlags(DirtyFlags.All).Complete();
+            scope.Data.BuildChangeList();
+
+            var empty = new NativeArray<BrickChange>(1, Allocator.TempJob);
+            GenerateGroupRenderDataJob job = jobs.Run(scope.Data, empty, 0, fullUpload: true);
+
+            Assert.That(jobs.Map.Count, Is.EqualTo(1));
+
+            int slot = 100 << 4;
+            Assert.That(slot, Is.EqualTo(jobs.Grouping.LocalBrickIdx(new int3(0, 100, 0))));
+
+            short id = jobs.Map.indices[slot];
+            Assert.That(id, Is.Not.EqualTo(SparseBrickIdTable.EMPTY));
+
+            // Group-local block coordinates, so the brick origin is (0, 800, 0) and not the
+            // entity-local one. Block 5 is a transparent medium, so the six air cells that border
+            // it carry interface faces and count as occupied as well: the tight box is the 3x3x3
+            // shell around block (1, 1, 1), which is (0, 0, 0)..(2, 2, 2) inclusive.
+            BrickRecordLayout.BrickAABB box = jobs.Aabbs[id];
+            Assert.That(box.min, Is.EqualTo(new Vector3(0, 800, 0)));
+            Assert.That(box.max, Is.EqualTo(new Vector3(3, 803, 3)));
+
+            DisposeJob(job);
             empty.Dispose();
         }
 
@@ -148,7 +201,8 @@ namespace Caelix.Tests
         [TestCase(0x123)]
         public void LocalBrickPos_RoundTripsLocalBrickIdx(int idx)
         {
-            Assert.That(RenderGroup.LocalBrickIdx(RenderGroup.LocalBrickPos(idx)), Is.EqualTo(idx));
+            RenderGroup grouping = RenderGroup.Default;
+            Assert.That(grouping.LocalBrickIdx(grouping.LocalBrickPos(idx)), Is.EqualTo(idx));
         }
     }
 }

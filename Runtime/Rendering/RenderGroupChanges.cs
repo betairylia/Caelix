@@ -38,6 +38,9 @@ namespace Caelix.Rendering
         /// <summary>Output: number of entries of each group.</summary>
         public NativeList<int> groupCounts;
 
+        /// <summary>The group shape that decides which group a brick key falls in.</summary>
+        public RenderGroup grouping;
+
         public void Execute()
         {
             if (changeCount <= 0)
@@ -49,7 +52,7 @@ namespace Caelix.Rendering
 
             for (int i = 0; i < changeCount; i++)
             {
-                int3 group = RenderGroup.Of(changes[i].Key);
+                int3 group = grouping.Of(changes[i].Key);
                 if (groupIndex.TryGetValue(group, out int slot))
                 {
                     groupCounts[slot] = groupCounts[slot] + 1;
@@ -76,7 +79,7 @@ namespace Caelix.Rendering
             sorted.Resize(changeCount, NativeArrayOptions.UninitializedMemory);
             for (int i = 0; i < changeCount; i++)
             {
-                int slot = groupIndex[RenderGroup.Of(changes[i].Key)];
+                int slot = groupIndex[grouping.Of(changes[i].Key)];
                 sorted[cursor[slot]] = changes[i];
                 cursor[slot] = cursor[slot] + 1;
             }
@@ -108,10 +111,10 @@ namespace Caelix.Rendering
         public NativeList<int> GroupCounts;
 
         /// <summary>Buckets a plain array, for the work a full upload synthesises.</summary>
-        public static ChangeBuckets Build(NativeArray<BrickChange> changes)
-            => Build(changes.AsReadOnly());
+        public static ChangeBuckets Build(NativeArray<BrickChange> changes, RenderGroup grouping)
+            => Build(changes.AsReadOnly(), grouping);
 
-        public static ChangeBuckets Build(NativeArray<BrickChange>.ReadOnly changes)
+        public static ChangeBuckets Build(NativeArray<BrickChange>.ReadOnly changes, RenderGroup grouping)
         {
             int count = changes.Length;
             var buckets = new ChangeBuckets
@@ -144,7 +147,8 @@ namespace Caelix.Rendering
                 sorted = buckets.Sorted,
                 groupKeys = buckets.GroupKeys,
                 groupStarts = buckets.GroupStarts,
-                groupCounts = buckets.GroupCounts
+                groupCounts = buckets.GroupCounts,
+                grouping = grouping
             }.Run();
 
             return buckets;

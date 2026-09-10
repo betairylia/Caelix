@@ -14,31 +14,40 @@ namespace Caelix.Tests
     /// </summary>
     public class RenderGroupTests
     {
+        private static readonly RenderGroupSize[] AllPresets =
+        {
+            RenderGroupSize.Bricks16,
+            RenderGroupSize.Bricks8,
+            RenderGroupSize.Bricks32,
+            RenderGroupSize.Bricks16x128x16,
+        };
+
         /// <summary>
         /// The group and the storage region share their layout BY CONSTRUCTION in milestone 1: both
-        /// are 16 bricks per axis, x-fastest. Storage no longer says so, so the numbers are pinned
-        /// as literals; changing the group shift is a milestone 4 experiment that has to update
-        /// these on purpose.
+        /// are 16 bricks per axis, x-fastest. Storage no longer says so, and the group shape is a
+        /// renderer setting since milestone 4, so the DEFAULT preset's numbers are pinned as
+        /// literals; changing them has to be a deliberate edit here.
         /// </summary>
         [Test]
         public void LocalBrickIndexIsXFastestOverSixteenBricksPerAxis()
         {
-            for (int z = 0; z < RenderGroup.BricksPerAxis; z++)
-            for (int y = 0; y < RenderGroup.BricksPerAxis; y++)
-            for (int x = 0; x < RenderGroup.BricksPerAxis; x++)
+            RenderGroup grouping = RenderGroup.Default;
+            for (int z = 0; z < grouping.BricksPerAxis.z; z++)
+            for (int y = 0; y < grouping.BricksPerAxis.y; y++)
+            for (int x = 0; x < grouping.BricksPerAxis.x; x++)
             {
                 Assert.That(
-                    RenderGroup.LocalBrickIdx(new int3(x, y, z)),
+                    grouping.LocalBrickIdx(new int3(x, y, z)),
                     Is.EqualTo(x + y * 16 + z * 16 * 16));
             }
         }
 
         [Test]
-        public void GroupSizeMatchesTheStorageRegionItReplacesInMilestoneOne()
+        public void DefaultGroupIsSixteenBricksPerAxis()
         {
-            Assert.That(RenderGroup.BricksPerAxis, Is.EqualTo(16));
-            Assert.That(RenderGroup.BricksInGroup, Is.EqualTo(4096));
-            Assert.That(RenderGroup.Mask, Is.EqualTo(15));
+            Assert.That(RenderGroup.Default.BricksPerAxis, Is.EqualTo(new int3(16)));
+            Assert.That(RenderGroup.Default.BricksInGroup, Is.EqualTo(4096));
+            Assert.That(RenderGroup.Default.Mask, Is.EqualTo(new int3(15)));
         }
 
         [TestCase(0, 0, 0)]
@@ -51,38 +60,125 @@ namespace Caelix.Tests
         {
             var key = new int3(x, y, z);
 
-            int3 group = RenderGroup.Of(key);
-            int3 local = RenderGroup.LocalBrick(key);
+            foreach (RenderGroupSize size in AllPresets)
+            {
+                RenderGroup grouping = RenderGroupPresets.Of(size);
 
-            Assert.That(math.all(local >= 0) && math.all(local < RenderGroup.BricksPerAxis), Is.True);
-            Assert.That(RenderGroup.FirstKey(group) + local, Is.EqualTo(key));
-            Assert.That(math.all(key >= RenderGroup.FirstKey(group)), Is.True);
-            Assert.That(math.all(key <= RenderGroup.LastKey(group)), Is.True);
-            Assert.That(RenderGroup.LastKey(group) - RenderGroup.FirstKey(group),
-                Is.EqualTo(new int3(RenderGroup.Mask)));
+                int3 group = grouping.Of(key);
+                int3 local = grouping.LocalBrick(key);
+
+                Assert.That(
+                    math.all(local >= 0) && math.all(local < grouping.BricksPerAxis), Is.True, size.ToString());
+                Assert.That(grouping.FirstKey(group) + local, Is.EqualTo(key), size.ToString());
+                Assert.That(math.all(key >= grouping.FirstKey(group)), Is.True, size.ToString());
+                Assert.That(math.all(key <= grouping.LastKey(group)), Is.True, size.ToString());
+                Assert.That(
+                    grouping.LastKey(group) - grouping.FirstKey(group),
+                    Is.EqualTo(grouping.Mask), size.ToString());
+                Assert.That(
+                    grouping.LocalBrickPos(grouping.LocalBrickIdx(local)),
+                    Is.EqualTo(local), size.ToString());
+            }
         }
 
         [Test]
         public void BlockOriginIsTheGroupsFirstBlock()
         {
-            Assert.That(RenderGroup.BlockOrigin(new int3(0, 0, 0)), Is.EqualTo(new int3(0, 0, 0)));
-            Assert.That(RenderGroup.BlockOrigin(new int3(-1, 0, 0)), Is.EqualTo(new int3(-128, 0, 0)));
-            Assert.That(RenderGroup.BlockOrigin(new int3(1, 2, 3)), Is.EqualTo(new int3(128, 256, 384)));
+            RenderGroup grouping = RenderGroup.Default;
+            Assert.That(grouping.BlockOrigin(new int3(0, 0, 0)), Is.EqualTo(new int3(0, 0, 0)));
+            Assert.That(grouping.BlockOrigin(new int3(-1, 0, 0)), Is.EqualTo(new int3(-128, 0, 0)));
+            Assert.That(grouping.BlockOrigin(new int3(1, 2, 3)), Is.EqualTo(new int3(128, 256, 384)));
+        }
+
+        /// <summary>
+        /// A group need not be a cube: the tall preset is the one that separates a per-axis shift
+        /// from a single one.
+        /// </summary>
+        [Test]
+        public void TallGroupPlacesKeysByAxis()
+        {
+            RenderGroup grouping = RenderGroupPresets.Of(RenderGroupSize.Bricks16x128x16);
+
+            Assert.That(grouping.BricksPerAxis, Is.EqualTo(new int3(16, 128, 16)));
+            Assert.That(grouping.BricksInGroup, Is.EqualTo(32768));
+
+            Assert.That(grouping.Of(new int3(0, 100, 0)), Is.EqualTo(new int3(0, 0, 0)));
+            Assert.That(grouping.Of(new int3(0, 128, 0)), Is.EqualTo(new int3(0, 1, 0)));
+            Assert.That(grouping.Of(new int3(16, 0, 0)), Is.EqualTo(new int3(1, 0, 0)));
+            Assert.That(grouping.Of(new int3(-1, -1, -1)), Is.EqualTo(new int3(-1, -1, -1)));
+
+            Assert.That(grouping.LocalBrickIdx(new int3(0, 100, 0)), Is.EqualTo(100 << 4));
+
+            foreach (int idx in new[] { 0, 32767, 0x1234 })
+            {
+                Assert.That(grouping.LocalBrickIdx(grouping.LocalBrickPos(idx)), Is.EqualTo(idx));
+            }
         }
 
         [Test]
-        public void BucketChangesGroupsEntriesAndKeepsTheirRelativeOrder()
+        public void PresetsStayWithinTheIndexBudget()
         {
-            // Seven changes across three groups, deliberately interleaved.
+            foreach (RenderGroupSize size in AllPresets)
+            {
+                RenderGroup grouping = RenderGroupPresets.Of(size);
+                Assert.That(grouping.IndexBits, Is.LessThanOrEqualTo(RenderGroup.MaxIndexBits), size.ToString());
+                Assert.That(grouping.BricksInGroup, Is.LessThanOrEqualTo(32768), size.ToString());
+            }
+
+            Assert.Throws<System.ArgumentOutOfRangeException>(() => new RenderGroup(new int3(6, 6, 6)));
+        }
+
+        /// <summary>
+        /// The brick info word gives the group-local index bits 0..15 and the coarse occupancy
+        /// bits 16..23, so the widest preset's index survives the pack untouched.
+        /// </summary>
+        [Test]
+        public void PackBrickInfoKeepsAFifteenBitIndexApartFromTheOccupancy()
+        {
+            int word = BrickRecordLayout.PackBrickInfo(32767, 0xFF);
+
+            Assert.That(word & 0xFFFF, Is.EqualTo(32767));
+            Assert.That((word >> 16) & 0xFF, Is.EqualTo(0xFF));
+        }
+
+        [Test]
+        public void KeywordsNameEveryNonDefaultPreset()
+        {
+            Assert.That(RenderGroupPresets.Keyword(RenderGroupSize.Bricks16), Is.EqualTo(string.Empty));
+
+            var seen = new HashSet<string>();
+            foreach (RenderGroupSize size in new[]
+                     {
+                         RenderGroupSize.Bricks8, RenderGroupSize.Bricks32, RenderGroupSize.Bricks16x128x16
+                     })
+            {
+                string keyword = RenderGroupPresets.Keyword(size);
+                Assert.That(keyword, Is.Not.Empty, size.ToString());
+                Assert.That(seen.Add(keyword), Is.True, $"{size} reuses keyword {keyword}");
+                Assert.That(RenderGroupPresets.Keywords, Does.Contain(keyword));
+            }
+
+            Assert.That(RenderGroupPresets.Keywords.Length, Is.EqualTo(seen.Count));
+        }
+
+        [TestCase(RenderGroupSize.Bricks16)]
+        [TestCase(RenderGroupSize.Bricks8)]
+        [TestCase(RenderGroupSize.Bricks32)]
+        [TestCase(RenderGroupSize.Bricks16x128x16)]
+        public void BucketChangesGroupsEntriesAndKeepsTheirRelativeOrder(RenderGroupSize size)
+        {
+            RenderGroup grouping = RenderGroupPresets.Of(size);
+
+            // Seven changes across three groups of the default preset, deliberately interleaved.
             var keys = new[]
             {
-                new int3(0, 0, 0),     // group (0,0,0)
-                new int3(16, 0, 0),    // group (1,0,0)
-                new int3(1, 0, 0),     // group (0,0,0)
-                new int3(-1, 0, 0),    // group (-1,0,0)
-                new int3(17, 0, 0),    // group (1,0,0)
-                new int3(2, 0, 0),     // group (0,0,0)
-                new int3(-16, 0, 0),   // group (-1,0,0)
+                new int3(0, 0, 0),     // default group (0,0,0)
+                new int3(16, 0, 0),    // default group (1,0,0)
+                new int3(1, 0, 0),     // default group (0,0,0)
+                new int3(-1, 0, 0),    // default group (-1,0,0)
+                new int3(17, 0, 0),    // default group (1,0,0)
+                new int3(2, 0, 0),     // default group (0,0,0)
+                new int3(-16, 0, 0),   // default group (-1,0,0)
             };
 
             using var source = BuildChanges(keys);
@@ -98,20 +194,37 @@ namespace Caelix.Tests
                 sorted = sorted,
                 groupKeys = groupKeys,
                 groupStarts = groupStarts,
-                groupCounts = groupCounts
+                groupCounts = groupCounts,
+                grouping = grouping
             }.Run();
 
-            Assert.That(sorted.Length, Is.EqualTo(keys.Length));
-            Assert.That(groupKeys.Length, Is.EqualTo(3));
-            Assert.That(groupStarts.Length, Is.EqualTo(3));
-            Assert.That(groupCounts.Length, Is.EqualTo(3));
-
-            var expected = new Dictionary<int3, List<int3>>
+            // Expectations come from the grouping under test, in first-seen order.
+            var expected = new Dictionary<int3, List<int3>>();
+            foreach (int3 key in keys)
             {
-                { new int3(0, 0, 0), new List<int3> { new int3(0, 0, 0), new int3(1, 0, 0), new int3(2, 0, 0) } },
-                { new int3(1, 0, 0), new List<int3> { new int3(16, 0, 0), new int3(17, 0, 0) } },
-                { new int3(-1, 0, 0), new List<int3> { new int3(-1, 0, 0), new int3(-16, 0, 0) } },
-            };
+                int3 group = grouping.Of(key);
+                if (!expected.TryGetValue(group, out List<int3> members))
+                {
+                    members = new List<int3>();
+                    expected[group] = members;
+                }
+
+                members.Add(key);
+            }
+
+            if (size == RenderGroupSize.Bricks16)
+            {
+                // The default preset's group keys stay pinned as literals.
+                Assert.That(expected.Keys, Is.EquivalentTo(new[]
+                {
+                    new int3(0, 0, 0), new int3(1, 0, 0), new int3(-1, 0, 0)
+                }));
+            }
+
+            Assert.That(sorted.Length, Is.EqualTo(keys.Length));
+            Assert.That(groupKeys.Length, Is.EqualTo(expected.Count));
+            Assert.That(groupStarts.Length, Is.EqualTo(expected.Count));
+            Assert.That(groupCounts.Length, Is.EqualTo(expected.Count));
 
             int total = 0;
             int previousEnd = 0;
@@ -128,7 +241,7 @@ namespace Caelix.Tests
                 {
                     BrickChange change = sorted[groupStarts[g] + i];
                     Assert.That(change.Key, Is.EqualTo(want[i]));
-                    Assert.That(RenderGroup.Of(change.Key), Is.EqualTo(group));
+                    Assert.That(grouping.Of(change.Key), Is.EqualTo(group));
                 }
 
                 previousEnd = groupStarts[g] + groupCounts[g];
@@ -156,7 +269,8 @@ namespace Caelix.Tests
                 sorted = sorted,
                 groupKeys = groupKeys,
                 groupStarts = groupStarts,
-                groupCounts = groupCounts
+                groupCounts = groupCounts,
+                grouping = RenderGroup.Default
             }.Run();
 
             Assert.That(sorted.Length, Is.EqualTo(0));
@@ -168,14 +282,19 @@ namespace Caelix.Tests
         /// The path the scene renderer actually takes: read a live entity's change view, copy it
         /// into a job array and bucket it. Guards the read-only view's use on the main thread.
         /// </summary>
-        [Test]
-        public void BucketChangesAcceptsALiveChangeList()
+        [TestCase(RenderGroupSize.Bricks16)]
+        [TestCase(RenderGroupSize.Bricks8)]
+        [TestCase(RenderGroupSize.Bricks32)]
+        [TestCase(RenderGroupSize.Bricks16x128x16)]
+        public void BucketChangesAcceptsALiveChangeList(RenderGroupSize size)
         {
+            RenderGroup grouping = RenderGroupPresets.Of(size);
+
             var data = new VoxelEntityData(Allocator.Persistent);
             try
             {
-                data.SetBlock(new int3(1, 1, 1), new Block(1));          // brick (0,0,0),    group (0,0,0)
-                data.SetBlock(new int3(200, 200, 200), new Block(1));    // brick (25,25,25), group (1,1,1)
+                data.SetBlock(new int3(1, 1, 1), new Block(1));          // brick (0,0,0)
+                data.SetBlock(new int3(200, 200, 200), new Block(1));    // brick (25,25,25)
                 data.PropagateDirtyFlags(DirtyFlags.All).Complete();
                 data.BuildChangeList();
 
@@ -195,15 +314,29 @@ namespace Caelix.Tests
                     sorted = sorted,
                     groupKeys = groupKeys,
                     groupStarts = groupStarts,
-                    groupCounts = groupCounts
+                    groupCounts = groupCounts,
+                    grouping = grouping
                 }.Run();
 
-                Assert.That(groupKeys.Length, Is.EqualTo(2));
-                var found = new List<int3> { groupKeys[0], groupKeys[1] };
-                Assert.That(found, Does.Contain(new int3(0, 0, 0)));
-                Assert.That(found, Does.Contain(new int3(1, 1, 1)));
-                Assert.That(groupCounts[0], Is.EqualTo(1));
-                Assert.That(groupCounts[1], Is.EqualTo(1));
+                var wanted = new HashSet<int3>
+                {
+                    grouping.Of(new int3(0, 0, 0)), grouping.Of(new int3(25, 25, 25))
+                };
+
+                if (size == RenderGroupSize.Bricks16)
+                {
+                    Assert.That(wanted, Is.EquivalentTo(new[] { new int3(0, 0, 0), new int3(1, 1, 1) }));
+                }
+
+                Assert.That(groupKeys.Length, Is.EqualTo(wanted.Count));
+                int totalCounted = 0;
+                for (int g = 0; g < groupKeys.Length; g++)
+                {
+                    Assert.That(wanted, Does.Contain(groupKeys[g]));
+                    totalCounted += groupCounts[g];
+                }
+
+                Assert.That(totalCounted, Is.EqualTo(2));
                 Assert.That(sorted.Length, Is.EqualTo(2));
             }
             finally

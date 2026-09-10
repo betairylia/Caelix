@@ -14,6 +14,9 @@
 // future editor reports Int64 as an unknown feature here, drop it from this line rather than
 // changing the DDA.
 #pragma require inlineraytracing Int64
+// Render group shape. Exactly one keyword is enabled per dispatch by
+// CaelixRayQueryDispatch.SetGroupKeyword; the default variant decodes 16x16x16 bricks.
+#pragma multi_compile _ CAELIX_GROUP_3_3_3 CAELIX_GROUP_5_5_5 CAELIX_GROUP_4_7_4
 
 #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Packing.hlsl"

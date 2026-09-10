@@ -30,8 +30,12 @@ namespace Caelix.Rendering.Meshing
             DirtyFlags.BlockBrickRemoved |
             DirtyFlags.GeometryWithLocalNeighbor;
 
-        /// <summary>Blocks along one axis of a render group (16 bricks x 8 blocks = 128).</summary>
-        private const int GroupSizeInBlocks = RenderGroup.BricksPerAxis * BrickKey.BlocksPerAxis;
+        /// <summary>
+        /// Blocks along one axis of a render group (16 bricks x 8 blocks = 128). The mesh renderer
+        /// keeps the default grouping; only the ray query renderer's group shape is configurable.
+        /// </summary>
+        private static readonly int GroupSizeInBlocks =
+            RenderGroup.Default.BricksPerAxis.x * BrickKey.BlocksPerAxis;
 
         // Chunk management
         private readonly int3 chunksPerAxis;
@@ -79,7 +83,7 @@ namespace Caelix.Rendering.Meshing
             // Create parent GameObject
             GroupObject = new GameObject($"Group_{groupKey.x}_{groupKey.y}_{groupKey.z}");
             GroupObject.transform.SetParent(worldTransform, false);
-            GroupObject.transform.localPosition = RenderGroup.BlockOrigin(groupKey).ToVector3Int();
+            GroupObject.transform.localPosition = RenderGroup.Default.BlockOrigin(groupKey).ToVector3Int();
 
             // Allocate arrays
             chunkObjects = new GameObject[totalChunks];
@@ -168,7 +172,7 @@ namespace Caelix.Rendering.Meshing
             // same storage, so a local one reads exactly the same bricks.
             VoxelEntityData store = data;
             int bricksPerChunk = bricksPerChunkAxis * bricksPerChunkAxis * bricksPerChunkAxis;
-            int3 groupFirstKey = RenderGroup.FirstKey(groupKey);
+            int3 groupFirstKey = RenderGroup.Default.FirstKey(groupKey);
 
             // Schedule jobs for dirty chunks
             foreach (int chunkIdx in dirtyChunks)
@@ -317,7 +321,7 @@ namespace Caelix.Rendering.Meshing
         {
             VoxelEntityData store = data;
             foreach (int3 unused in store.EnumerateBricks(
-                         RenderGroup.FirstKey(groupKey), RenderGroup.LastKey(groupKey)))
+                         RenderGroup.Default.FirstKey(groupKey), RenderGroup.Default.LastKey(groupKey)))
             {
                 return false;
             }
@@ -333,7 +337,7 @@ namespace Caelix.Rendering.Meshing
         /// <summary>Chunk coordinate, inside this group, of the chunk that holds a brick key.</summary>
         private int3 ChunkOf(int3 key)
         {
-            return (BrickKey.ToBlockOrigin(RenderGroup.LocalBrick(key))) / chunkSize;
+            return (BrickKey.ToBlockOrigin(RenderGroup.Default.LocalBrick(key))) / chunkSize;
         }
 
         /// <summary>

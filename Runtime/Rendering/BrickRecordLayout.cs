@@ -49,9 +49,14 @@ namespace Caelix.Rendering
             return BRICK_INFO_WORDS + coarseBit * 2 + (microBit >> 5);
         }
 
+        /// <summary>
+        /// Packs brick info word 0: bits 0..15 = group-local brick index
+        /// (<see cref="Caelix.Rendering.RayQuery.RenderGroup.MaxIndexBits"/> wide at most),
+        /// bits 16..23 = coarse occupancy.
+        /// </summary>
         public static int PackBrickInfo(int brickIdxAbsolute, uint coarseOccupancy)
         {
-            return unchecked((int)(((uint)brickIdxAbsolute & 0xFFFu) | ((coarseOccupancy & 0xFFu) << 16)));
+            return unchecked((int)(((uint)brickIdxAbsolute & 0xFFFFu) | ((coarseOccupancy & 0xFFu) << 16)));
         }
 
         /// <summary>

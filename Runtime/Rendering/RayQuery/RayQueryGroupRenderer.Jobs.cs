@@ -37,10 +37,16 @@ namespace Caelix.Rendering.RayQuery
         /// <summary>The group being generated, in group coordinates.</summary>
         public int3 groupKey;
 
+        /// <summary>The group shape: how brick keys map to this group and to its local indices.</summary>
+        public RenderGroup grouping;
+
         /// <summary>Generate every allocated brick of the group instead of only the changed ones.</summary>
         public bool forceFullUpload;
 
-        /// <summary>Group-local brick position to renderer brick id. Keyed by the group's 16^3 grid.</summary>
+        /// <summary>
+        /// Group-local brick position to renderer brick id, indexed by the grouping's flat
+        /// brick index; one slot per brick of the group.
+        /// </summary>
         public SparseBrickIdTable rendererBrickMap;
 
         /// <summary>
@@ -88,7 +94,7 @@ namespace Caelix.Rendering.RayQuery
                 RetireAllRendererBricks(ref removedStagingBase);
 
                 foreach (int3 key in data.EnumerateBricks(
-                             RenderGroup.FirstKey(groupKey), RenderGroup.LastKey(groupKey)))
+                             grouping.FirstKey(groupKey), grouping.LastKey(groupKey)))
                 {
                     ProcessBrick(key, true, ref removedStagingBase);
                 }
@@ -101,7 +107,7 @@ namespace Caelix.Rendering.RayQuery
 
                     if (change.Kind == ChangeKind.Removed)
                     {
-                        RemoveRendererBrick(RenderGroup.LocalBrick(change.Key), ref removedStagingBase);
+                        RemoveRendererBrick(grouping.LocalBrick(change.Key), ref removedStagingBase);
                         continue;
                     }
 
@@ -162,14 +168,15 @@ namespace Caelix.Rendering.RayQuery
                 return;
             }
 
-            for (int i = 0; i < SparseBrickIdTable.CAPACITY; i++)
+            for (int i = 0; i < rendererBrickMap.SlotCount; i++)
             {
                 if (rendererBrickMap.indices[i] == SparseBrickIdTable.EMPTY)
                 {
                     continue;
                 }
 
-                RemoveRendererBrick(RenderGroup.LocalBrickPos(i), ref removedStagingBase);
+                // The loop index IS the slot, so no position round trip is needed.
+                RemoveRendererBrickAt(i, ref removedStagingBase);
             }
         }
 
@@ -179,8 +186,15 @@ namespace Caelix.Rendering.RayQuery
         /// No-op when the position holds no renderer brick.
         /// </summary>
         private void RemoveRendererBrick(int3 local, ref NativeArray<int> removedStagingBase)
+            => RemoveRendererBrickAt(grouping.LocalBrickIdx(local), ref removedStagingBase);
+
+        /// <summary>
+        /// Retires one group-local brick slot. Same work as <see cref="RemoveRendererBrick"/>, for
+        /// the callers that already hold the flat slot index.
+        /// </summary>
+        private void RemoveRendererBrickAt(int slot, ref NativeArray<int> removedStagingBase)
         {
-            int removed = rendererBrickMap.RemoveBrick(local);
+            int removed = rendererBrickMap.RemoveBrickAt(slot);
             if (removed == SparseBrickIdTable.EMPTY)
             {
                 return;
@@ -189,8 +203,8 @@ namespace Caelix.Rendering.RayQuery
             if (!removedStagingBase.IsCreated)
             {
                 removedStagingBase = new NativeArray<int>(
-                    SparseBrickIdTable.CAPACITY, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
-                for (int i = 0; i < SparseBrickIdTable.CAPACITY; i++)
+                    rendererBrickMap.SlotCount, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+                for (int i = 0; i < rendererBrickMap.SlotCount; i++)
                 {
                     removedStagingBase[i] = -1;
                 }
@@ -199,7 +213,7 @@ namespace Caelix.Rendering.RayQuery
             // An all-zero record: no occupancy, so the slot traces as empty even if the
             // acceleration structure has not been rebuilt yet.
             int removedBase = TakeStagingRecord(removed, ref removedStagingBase);
-            stagingWords[removedBase] = BrickRecordLayout.PackBrickInfo(RenderGroup.LocalBrickIdx(local), 0);
+            stagingWords[removedBase] = BrickRecordLayout.PackBrickInfo(slot, 0);
             removedStagingBase[removed] = removedBase;
 
             // A NaN min.x marks the AABB as an inactive primitive (DXR spec), so the freed slot
@@ -215,7 +229,7 @@ namespace Caelix.Rendering.RayQuery
 
         private unsafe void ProcessBrick(int3 key, bool isAdded, ref NativeArray<int> removedStagingBase)
         {
-            int3 local = RenderGroup.LocalBrick(key);
+            int3 local = grouping.LocalBrick(key);
 
             if (!data.TryBindBrick(SectorSlotId.Block, key, out Block* brick))
             {
@@ -227,7 +241,7 @@ namespace Caelix.Rendering.RayQuery
 
             VoxelNeighborhood neighborhood = data.OpenNeighborhood(key);
 
-            int localIdx = RenderGroup.LocalBrickIdx(local);
+            int localIdx = grouping.LocalBrickIdx(local);
 
             // Group-local block coordinates: the frame the instance's translation is built in.
             int3 brickBlockPos = BrickKey.ToBlockOrigin(local);
@@ -271,7 +285,7 @@ namespace Caelix.Rendering.RayQuery
                         if (rendererBrickId == -1)
                         {
                             // Claim this brick's renderer id
-                            isAdded = rendererBrickMap.AddBrick(local, out rendererBrickId, out bool requireExtension);
+                            isAdded = rendererBrickMap.AddBrickAt(localIdx, out rendererBrickId, out bool requireExtension);
                             if (requireExtension)
                             {
                                 aabbBuffer.Resize(rendererBrickMap.Capacity, NativeArrayOptions.UninitializedMemory);

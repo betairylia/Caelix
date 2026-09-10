@@ -5,6 +5,7 @@ using Unity.Jobs;
 using Unity.Mathematics;
 using UnityEngine;
 using Caelix.Client;
+using Caelix.Rendering.RayQuery;
 
 namespace Caelix.Rendering.Meshing
 {
@@ -135,7 +136,7 @@ namespace Caelix.Rendering.Meshing
                 if (fullUpload)
                 {
                     NativeArray<BrickChange> initial = RenderGroupChanges.BuildFullUploadChanges(view.Data);
-                    buckets = ChangeBuckets.Build(initial);
+                    buckets = ChangeBuckets.Build(initial, RenderGroup.Default);
                     initial.Dispose();
                 }
                 else
@@ -146,7 +147,7 @@ namespace Caelix.Rendering.Meshing
                         continue;
                     }
 
-                    buckets = ChangeBuckets.Build(changes);
+                    buckets = ChangeBuckets.Build(changes, RenderGroup.Default);
                 }
 
                 frameBuckets.Add(buckets);

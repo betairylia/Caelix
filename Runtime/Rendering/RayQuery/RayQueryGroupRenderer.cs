@@ -11,53 +11,6 @@ using Caelix.Utils;
 namespace Caelix.Rendering.RayQuery
 {
     /// <summary>
-    /// The renderer's own grouping of brick keys: one acceleration-structure instance covers a
-    /// cube of <see cref="BricksPerAxis"/> bricks per axis.
-    /// </summary>
-    /// <remarks>
-    /// The group size belongs to the renderer, not to storage. Shift 4 is fixed for now because
-    /// the brick info word packs the group-local brick index in 12 bits
-    /// (<c>BRICK_INFO_ABSOLUTE_INDEX_MASK 0xFFF</c> in <c>CaelixBrickTrace.hlsl</c>), so a larger
-    /// group needs a shader-side layout change too.
-    /// </remarks>
-    public static class RenderGroup
-    {
-        /// <summary>Bits a brick key is shifted right by to get its group key.</summary>
-        public const int Shift = 4;
-
-        /// <summary>Bricks along one axis of a group (16).</summary>
-        public const int BricksPerAxis = 1 << Shift;
-
-        /// <summary>Mask that extracts a brick's position inside its group (0-15 per axis).</summary>
-        public const int Mask = BricksPerAxis - 1;
-
-        /// <summary>Bricks in one group (16 * 16 * 16 = 4096).</summary>
-        public const int BricksInGroup = BricksPerAxis * BricksPerAxis * BricksPerAxis;
-
-        /// <summary>The group a brick key belongs to. Negative keys are handled.</summary>
-        public static int3 Of(int3 key) => key >> Shift;
-
-        /// <summary>Position of a brick inside its own group (0-15 per axis).</summary>
-        public static int3 LocalBrick(int3 key) => key & Mask;
-
-        /// <summary>Flat index of a group-local brick position, x-fastest. Matches the shader's decode.</summary>
-        public static int LocalBrickIdx(int3 local) => local.x | (local.y << Shift) | (local.z << (2 * Shift));
-
-        /// <summary>Group-local brick position of a flat index produced by <see cref="LocalBrickIdx"/>.</summary>
-        public static int3 LocalBrickPos(int localIdx)
-            => new int3(localIdx & Mask, (localIdx >> Shift) & Mask, localIdx >> (2 * Shift));
-
-        /// <summary>The lowest brick key of a group.</summary>
-        public static int3 FirstKey(int3 group) => group << Shift;
-
-        /// <summary>The highest brick key of a group, inclusive.</summary>
-        public static int3 LastKey(int3 group) => (group << Shift) + Mask;
-
-        /// <summary>Entity-local block position of a group's first block: the instance's translation.</summary>
-        public static int3 BlockOrigin(int3 group) => BrickKey.ToBlockOrigin(FirstKey(group));
-    }
-
-    /// <summary>
     /// Prepares one render group's data and keeps its acceleration-structure instance up to date.
     /// </summary>
     /// <remarks>
@@ -136,6 +89,9 @@ namespace Caelix.Rendering.RayQuery
         private readonly Material groupMaterial;
         private readonly int groupHashSeed;
         private readonly InstanceHandleLedger ledger;
+
+        /// <summary>The shape of this group: how many bricks it covers per axis, and how they index.</summary>
+        private readonly RenderGroup grouping;
 
         private NativeList<BrickRecordLayout.BrickAABB> hostAABBBuffer;
         private SparseBrickIdTable rendererBrickMap;
@@ -235,8 +191,11 @@ namespace Caelix.Rendering.RayQuery
 
         /// <summary>Gets the estimated VRAM usage in bytes: the AABB buffer plus this group's pool range.</summary>
         public ulong VRAMUsage =>
-            (ulong)(RenderGroup.BricksInGroup * 24 +
+            (ulong)((aabbBuffer?.count ?? 0) * 24 +
                     (poolHandle?.CapacityBricks ?? 0) * BrickRecordLayout.BRICK_DATA_LENGTH * 4);
+
+        /// <summary>Bytes the group's AABB buffer occupies, or 0 while it has none.</summary>
+        public long AabbVramBytes => (long)(aabbBuffer?.count ?? 0) * 24;
 
         private bool HostBufferInitialized => hostAABBBuffer.IsCreated;
 
@@ -249,12 +208,19 @@ namespace Caelix.Rendering.RayQuery
         /// Material handed to <see cref="RayTracingAABBsInstanceConfig"/>. The ray query path never
         /// runs its hit group, but the config requires one.
         /// </param>
+        /// <param name="ledger">Shared bookkeeping of the scene renderer's instance handles.</param>
+        /// <param name="grouping">
+        /// The group shape. Fixed for the renderer's life: the scene renderer drops every group and
+        /// re-uploads when its setting changes.
+        /// </param>
         public RayQueryGroupRenderer(
-            EntityView entity, int3 groupKey, Material material, InstanceHandleLedger ledger)
+            EntityView entity, int3 groupKey, Material material, InstanceHandleLedger ledger,
+            RenderGroup grouping)
         {
             GroupKey = groupKey;
             groupMaterial = material;
             this.ledger = ledger;
+            this.grouping = grouping;
             groupHashSeed = unchecked((int)ComputeGroupHashSeed(entity, groupKey));
         }
 
@@ -308,6 +274,7 @@ namespace Caelix.Rendering.RayQuery
                 start = start,
                 count = count,
                 groupKey = GroupKey,
+                grouping = grouping,
                 forceFullUpload = needsFullRebuild,
                 rendererBrickMap = rendererBrickMap,
                 aabbBuffer = hostAABBBuffer,
@@ -337,7 +304,7 @@ namespace Caelix.Rendering.RayQuery
             }
 
             hostAABBBuffer = new NativeList<BrickRecordLayout.BrickAABB>(0, Allocator.Persistent);
-            rendererBrickMap = SparseBrickIdTable.New(Allocator.Persistent);
+            rendererBrickMap = SparseBrickIdTable.New(grouping.BricksInGroup, Allocator.Persistent);
         }
 
         internal bool TryGetScheduledJobHandle(out JobHandle handle)
@@ -356,11 +323,12 @@ namespace Caelix.Rendering.RayQuery
         /// and re-packs every other range on it. Every group must therefore learn its final range
         /// before any of them writes.
         /// </remarks>
-        internal void ApplyCompletedRenderJob(CaelixBrickPool pool)
+        /// <returns>True when the AABB buffer was replaced this tick.</returns>
+        internal bool ApplyCompletedRenderJob(CaelixBrickPool pool)
         {
             if (!jobScheduled)
             {
-                return;
+                return false;
             }
 
             jobScheduled = false;
@@ -386,8 +354,11 @@ namespace Caelix.Rendering.RayQuery
                     aabbBuffer?.Dispose();
                 }
 
+                // Sized to the bricks the group actually holds, not to its full extent. Safe because
+                // every growth of the id table raises syncRecord (a new id sets isAdded, which sets
+                // boundsChanged), so a bigger table always arrives together with a reallocation.
                 aabbBuffer = new GraphicsBuffer(
-                    GraphicsBuffer.Target.Structured, RenderGroup.BricksInGroup, 24);
+                    GraphicsBuffer.Target.Structured, math.max(1, BrickBufferSize), 24);
 
                 // Invalidate the AABBconfig so RenderModifyAS recreates it against the new buffer.
                 AABBconfig.aabbCount = 0;
@@ -416,7 +387,7 @@ namespace Caelix.Rendering.RayQuery
                 // retries on every tick because an invalid handle reports capacity 0. Until one
                 // succeeds RenderModifyAS skips this group, so it is simply not drawn.
                 needsFullRebuild = true;
-                return;
+                return aabbRealloc;
             }
 
             needsFullRebuild = false;
@@ -426,6 +397,8 @@ namespace Caelix.Rendering.RayQuery
                 AABBconfig = default;
                 isDirty = true;
             }
+
+            return aabbRealloc;
         }
 
         /// <summary>
@@ -438,12 +411,15 @@ namespace Caelix.Rendering.RayQuery
         /// group has staged. See <see cref="CaelixBrickGpuOps"/> for why writing and dispatching
         /// per group hung the device.
         /// </remarks>
-        internal void UploadBricks(CaelixBrickPool pool)
+        /// <returns>Number of brick records staged.</returns>
+        internal int UploadBricks(CaelixBrickPool pool)
         {
             if (!stagingSlots.IsCreated)
             {
-                return;
+                return 0;
             }
+
+            int staged = stagingSlots.Length;
 
             if (stagingSlots.Length > 0 && poolHandle != null && poolHandle.IsValid)
             {
@@ -462,6 +438,7 @@ namespace Caelix.Rendering.RayQuery
             // StageScatter has copied the records into the frame staging buffer, so the lists go
             // back immediately rather than waiting for the flush.
             DisposeStaging();
+            return staged;
         }
 
         /// <summary>Releases the per-job staging lists.</summary>
@@ -478,7 +455,8 @@ namespace Caelix.Rendering.RayQuery
         /// Three outcomes: rebuild the instance when geometry changed, retrack it while the entity
         /// moves (or for the one frame its motion vectors must settle), otherwise do nothing.
         /// </remarks>
-        public void RenderModifyAS(
+        /// <returns>True when the instance was rebuilt (removed and re-added) this tick.</returns>
+        public bool RenderModifyAS(
             ref RayTracingAccelerationStructure AS,
             EntityView entity,
             int3 groupKey,
@@ -486,7 +464,7 @@ namespace Caelix.Rendering.RayQuery
         {
             Matrix4x4 objectToWorld =
                 entity.LocalToWorld *
-                Matrix4x4.Translate(RenderGroup.BlockOrigin(groupKey).ToVector3Int());
+                Matrix4x4.Translate(grouping.BlockOrigin(groupKey).ToVector3Int());
 
             // Set for the frame an entity flips to static (including the initial flip on a
             // born-static body). Collapsing prev onto the current transform zeroes the motion
@@ -563,6 +541,7 @@ namespace Caelix.Rendering.RayQuery
             isDirty = false;
 
             ReleaseStaleAabbBuffer(ref AS, rebuildsInstance);
+            return rebuildsInstance;
         }
 
         /// <summary>
