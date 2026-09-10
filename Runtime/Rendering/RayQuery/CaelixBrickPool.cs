@@ -91,6 +91,13 @@ namespace Caelix.Rendering.RayQuery
             /// <summary>Number of bricks reserved. Always a power of two, 0 when unallocated or freed.</summary>
             public int CapacityBricks { get; internal set; }
 
+            /// <summary>
+            /// Whoever holds this range, for the scene renderer to find its way back from a moved
+            /// handle to the group that has to republish its record. Set by the caller right after
+            /// an allocation; the pool only ever carries it, never reads it.
+            /// </summary>
+            public object Owner { get; set; }
+
             public bool IsValid => CapacityBricks > 0;
         }
 
@@ -119,6 +126,12 @@ namespace Caelix.Rendering.RayQuery
         }
 
         private readonly List<Page> pages = new();
+
+        /// <summary>
+        /// Handles whose <see cref="Handle.OffsetBricks"/> a compaction rewrote since the list was
+        /// last drained. Drained with <see cref="TakeMovedHandles"/>.
+        /// </summary>
+        private readonly List<Handle> moved = new();
 
         /// <summary>
         /// Cap on one page, in bricks. Clamped at construction so a page can never ask for more than
@@ -396,6 +409,31 @@ namespace Caelix.Rendering.RayQuery
         }
 
         /// <summary>
+        /// Appends every handle a compaction has moved since the last drain, then forgets them.
+        /// </summary>
+        /// <param name="destination">List the moved handles are appended to. Not cleared first.</param>
+        /// <remarks>
+        /// The scene renderer drains this once per tick, right after every group has settled its
+        /// range, and visits each moved handle's owner so that it republishes its instance record:
+        /// a group that is not visited would otherwise keep naming an offset the pool has since
+        /// handed to somebody else, and render another group's bricks.
+        /// <para>
+        /// A handle whose owner was freed in the meantime is still listed. The caller skips it by
+        /// testing <see cref="Handle.IsValid"/> — <see cref="Free"/> invalidates the handle, and no
+        /// two live handles are ever the same object.
+        /// </para>
+        /// </remarks>
+        public void TakeMovedHandles(List<Handle> destination)
+        {
+            if (destination != null)
+            {
+                destination.AddRange(moved);
+            }
+
+            moved.Clear();
+        }
+
+        /// <summary>
         /// Re-packs one page's live ranges into a new, usually larger buffer.
         /// </summary>
         /// <param name="page">The page to grow.</param>
@@ -435,6 +473,14 @@ namespace Caelix.Rendering.RayQuery
             {
                 ranges[rangeCount++] = new uint4(
                     (uint)handle.OffsetBricks, (uint)offset, (uint)handle.CapacityBricks, (uint)offset);
+
+                // A range that lands where it already was is not a move: its owner's published
+                // record still names the right offset and does not have to be visited.
+                if (handle.OffsetBricks != offset)
+                {
+                    moved.Add(handle);
+                }
+
                 handle.OffsetBricks = offset;
                 offset += handle.CapacityBricks;
             }
@@ -528,6 +574,7 @@ namespace Caelix.Rendering.RayQuery
             }
 
             pages.Clear();
+            moved.Clear();
 
             Ops?.Dispose();
             Ops = null;

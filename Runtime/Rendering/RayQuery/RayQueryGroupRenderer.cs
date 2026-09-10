@@ -183,6 +183,49 @@ namespace Caelix.Rendering.RayQuery
         public bool NeedsFullRebuild => needsFullRebuild;
 
         /// <summary>
+        /// True while the group carries unfinished state from an earlier tick and therefore has to
+        /// be visited again even when nothing changed.
+        /// </summary>
+        /// <remarks>
+        /// Three states: <see cref="needsFullRebuild"/> (the pool had no room, so every brick has to
+        /// be generated again), <see cref="isDirty"/> (an instance rebuild still waiting for pool
+        /// room) and a stale AABB buffer that no <see cref="RenderModifyAS"/> has released yet. A
+        /// group that reports false is idle, and the scene renderer does not visit it at all.
+        /// </remarks>
+        public bool HasPendingWork => needsFullRebuild || isDirty || staleAabbBuffer != null;
+
+        /// <summary>True between <see cref="RenderEmitJob"/> and <see cref="ApplyCompletedRenderJob"/>.</summary>
+        public bool HasScheduledJob => jobScheduled;
+
+        /// <summary>The view this group belongs to. Fixed for the renderer's life.</summary>
+        public EntityView View { get; }
+
+        /// <summary>True while the group holds an acceleration-structure instance.</summary>
+        internal bool HasRenderable => hasRenderable;
+
+        /// <summary>
+        /// True when the published instance record names the range the pool currently holds for this
+        /// group; a group with no range has nothing to publish and counts as matching.
+        /// </summary>
+        /// <remarks>
+        /// The invariant the idle-group skipping rests on: a group whose range moved must be visited
+        /// before the next trace, or it names bricks that now belong to somebody else.
+        /// </remarks>
+        internal bool PublishedRecordMatchesPool
+        {
+            get
+            {
+                if (poolHandle == null || !poolHandle.IsValid)
+                {
+                    return true;
+                }
+
+                return publishedBrickBase == poolHandle.OffsetBricks * BrickRecordLayout.BRICK_DATA_LENGTH
+                    && publishedPage == poolHandle.Page;
+            }
+        }
+
+        /// <summary>
         /// Gets the estimated host memory usage in bytes for this renderer's buffers: the AABB list
         /// only, because brick records are never mirrored on the host.
         /// </summary>
@@ -218,6 +261,7 @@ namespace Caelix.Rendering.RayQuery
             RenderGroup grouping)
         {
             GroupKey = groupKey;
+            View = entity;
             groupMaterial = material;
             this.ledger = ledger;
             this.grouping = grouping;
@@ -378,6 +422,13 @@ namespace Caelix.Rendering.RayQuery
                 // Reallocate carries the records the range already holds over to the new one, so a
                 // resize costs a GPU copy rather than a full regeneration.
                 poolHandle = pool.Reallocate(poolHandle, requestedCapacity);
+
+                // The pool hands a moved handle back to the scene renderer, which finds the group
+                // that has to republish its record through this back reference.
+                if (poolHandle != null && poolHandle.IsValid)
+                {
+                    poolHandle.Owner = this;
+                }
             }
 
             if (poolHandle == null || !poolHandle.IsValid)

@@ -67,6 +67,7 @@ namespace Caelix.Debugging
             public int instanceCount;
             public int groupCount;
             public int groupsEmitted;
+            public int groupsVisited;
             public int bricksStaged;
             public int aabbReallocs;
             public int instanceRebuilds;
@@ -155,6 +156,7 @@ namespace Caelix.Debugging
                 sample.instanceCount = r.instanceCount;
                 sample.groupCount = r.groupCount;
                 sample.groupsEmitted = r.groupsEmittedThisTick;
+                sample.groupsVisited = r.groupsVisitedThisTick;
                 sample.bricksStaged = r.bricksStagedThisTick;
                 sample.aabbReallocs = r.aabbReallocsThisTick;
                 sample.instanceRebuilds = r.instanceRebuildsThisTick;
@@ -231,6 +233,7 @@ namespace Caelix.Debugging
             MeanP95(sb, "mainThreadMs", Select(s => s.cpuMainThreadFrameTime)).Append(',');
             MeanP95(sb, "renderingMs", Select(s => s.renderingMs)).Append(',');
             MeanMax(sb, "groupsEmitted", Select(s => (double)s.groupsEmitted)).Append(',');
+            MeanMax(sb, "groupsVisited", Select(s => (double)s.groupsVisited)).Append(',');
             MeanMax(sb, "bricksStaged", Select(s => (double)s.bricksStaged)).Append(',');
             MeanMax(sb, "aabbReallocs", Select(s => (double)s.aabbReallocs)).Append(',');
             MeanMax(sb, "instanceRebuilds", Select(s => (double)s.instanceRebuilds)).Append(',');
@@ -270,6 +273,7 @@ namespace Caelix.Debugging
             Num(sb, "instanceCount", s.instanceCount).Append(',');
             Num(sb, "groupCount", s.groupCount).Append(',');
             Num(sb, "groupsEmitted", s.groupsEmitted).Append(',');
+            Num(sb, "groupsVisited", s.groupsVisited).Append(',');
             Num(sb, "bricksStaged", s.bricksStaged).Append(',');
             Num(sb, "aabbReallocs", s.aabbReallocs).Append(',');
             Num(sb, "instanceRebuilds", s.instanceRebuilds).Append(',');

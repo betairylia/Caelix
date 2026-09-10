@@ -73,6 +73,12 @@ namespace Caelix.Rendering.RayQuery
         /// <summary>Debug field: group render jobs this tick scheduled.</summary>
         public int groupsEmittedThisTick;
 
+        /// <summary>
+        /// Debug field: distinct groups this tick uploaded bricks for and updated the acceleration
+        /// structure with. A world where nothing changes visits none.
+        /// </summary>
+        public int groupsVisitedThisTick;
+
         /// <summary>Debug field: brick records this tick staged into the pool.</summary>
         public int bricksStagedThisTick;
 
@@ -85,7 +91,14 @@ namespace Caelix.Rendering.RayQuery
         /// <summary>Debug field: bytes the brick pool's page buffers occupy.</summary>
         public long poolVramBytes;
 
-        /// <summary>Debug field: bytes every group's AABB buffer occupies together.</summary>
+        /// <summary>
+        /// Debug field: bytes every group's AABB buffer occupies together.
+        /// </summary>
+        /// <remarks>
+        /// A running total, not a per-tick sum: an idle group is never visited, so there is nothing
+        /// to add it up from. Every place that creates, replaces or releases a group's AABB buffer
+        /// updates it by the difference.
+        /// </remarks>
         public long aabbVramBytes;
 
         private ClientWorld source;
@@ -116,6 +129,33 @@ namespace Caelix.Rendering.RayQuery
 
         /// <summary>Groups this tick decided to drop, collected while their dictionary is being read.</summary>
         private readonly List<(EntityView view, int3 groupKey)> groupRemovalScratch = new();
+
+        /// <summary>
+        /// Groups that carry unfinished state across ticks: waiting for pool room, or holding an
+        /// instance rebuild no tick has been able to run yet.
+        /// </summary>
+        /// <remarks>
+        /// Membership is refreshed for every group the tick visits, so a group leaves the set on the
+        /// tick its work completes. It is what lets a tick find the groups that still need a visit
+        /// without walking the group dictionaries.
+        /// </remarks>
+        private readonly HashSet<RayQueryGroupRenderer> pending = new();
+
+        /// <summary>This tick's visit list, in the order the groups were reached.</summary>
+        private readonly List<RayQueryGroupRenderer> visited = new();
+
+        /// <summary>The same groups as <see cref="visited"/>, for de-duplication.</summary>
+        /// <remarks>
+        /// A group can be reached twice in one tick — a job in pass 1 and a moved pool range in
+        /// pass 2a — and must be uploaded and re-tracked exactly once.
+        /// </remarks>
+        private readonly HashSet<RayQueryGroupRenderer> visitedSet = new();
+
+        /// <summary>Pool ranges a compaction moved this tick. Drained and cleared inside pass 2a.</summary>
+        private readonly List<CaelixBrickPool.Handle> movedScratch = new();
+
+        /// <summary>The groups of one view pass 2b works on. Rebuilt per view.</summary>
+        private readonly List<RayQueryGroupRenderer> viewVisitScratch = new();
 
         /// <summary>This tick's bucketed change lists, one per view that had work. Disposed after pass 2a.</summary>
         private readonly List<(EntityView view, ChangeBuckets buckets)> frameBuckets = new();
@@ -280,6 +320,10 @@ namespace Caelix.Rendering.RayQuery
 
             groups.Clear();
 
+            // Every group went, so the visit bookkeeping and the AABB total start from nothing.
+            ForgetVisitState();
+            aabbVramBytes = 0;
+
             source = world != null && !world.IsDisposed ? world : null;
             if (source != null)
             {
@@ -306,12 +350,29 @@ namespace Caelix.Rendering.RayQuery
 
             foreach (var kvp in viewGroups)
             {
+                aabbVramBytes -= kvp.Value.AabbVramBytes;
+                pending.Remove(kvp.Value);
+                if (visitedSet.Remove(kvp.Value))
+                {
+                    visited.Remove(kvp.Value);
+                }
+
                 kvp.Value.MarkRemove();
                 kvp.Value.RemoveMe(ref _voxelScene, Instances, Pool);
             }
 
             viewGroups.Clear();
             groups.Remove(view);
+        }
+
+        /// <summary>Drops every group from the visit bookkeeping. For the paths where all of them go.</summary>
+        private void ForgetVisitState()
+        {
+            pending.Clear();
+            visited.Clear();
+            visitedSet.Clear();
+            movedScratch.Clear();
+            viewVisitScratch.Clear();
         }
 
         /// <summary>A re-enabled renderer starts from nothing, so it uploads the world in full.</summary>
@@ -335,16 +396,25 @@ namespace Caelix.Rendering.RayQuery
         /// are separate loops on purpose: 2a can grow a page, which replaces its buffer and moves
         /// every range on it, so no group may write its records before every group has settled its
         /// range.
+        /// <para>
+        /// Only the groups with work are visited, never the whole dictionaries: a group is reached
+        /// because this tick handed it a job, because it carries unfinished state
+        /// (<see cref="pending"/>), because its entity moves, or because a pool compaction moved its
+        /// range. Everything else is idle and costs nothing, which is what keeps a static world's
+        /// per-frame cost independent of its size.
+        /// </para>
         /// </remarks>
         public void Tick()
         {
             groupCount = 0;
             groupsEmittedThisTick = 0;
+            groupsVisitedThisTick = 0;
             bricksStagedThisTick = 0;
             aabbReallocsThisTick = 0;
             instanceRebuildsThisTick = 0;
             poolVramBytes = 0;
-            aabbVramBytes = 0;
+            visited.Clear();
+            visitedSet.Clear();
 
             // The grouping sizes every group renderer's brick map, AABB buffer and pool range, so a
             // new preset is applied by dropping them all. ReleaseResources unbinds the source and
@@ -406,7 +476,7 @@ namespace Caelix.Rendering.RayQuery
                 else
                 {
                     NativeArray<BrickChange>.ReadOnly changes = view.Data.Changes;
-                    if (changes.Length == 0 && !AnyGroupNeedsFullRebuild(viewGroups))
+                    if (changes.Length == 0 && !AnyPendingFullRebuild(view))
                     {
                         continue;
                     }
@@ -438,19 +508,23 @@ namespace Caelix.Rendering.RayQuery
 
                     renderer.RenderEmitJob(view.Data, sorted, buckets.GroupStarts[g], buckets.GroupCounts[g]);
                     CombineJob(renderer, ref renderJobs, ref hasRenderJobs);
+                    Visit(renderer);
                 }
 
                 // A group whose records the pool dropped has to regenerate everything, whether or
-                // not this cycle's changes name it.
-                foreach (var kvp in viewGroups)
+                // not this cycle's changes name it. Those groups are exactly the pending ones, so
+                // the set is walked instead of the view's dictionary.
+                foreach (RayQueryGroupRenderer group in pending)
                 {
-                    if (!kvp.Value.NeedsFullRebuild || bucketedGroups.Contains(kvp.Key))
+                    if (!ReferenceEquals(group.View, view) || !group.NeedsFullRebuild
+                        || bucketedGroups.Contains(group.GroupKey))
                     {
                         continue;
                     }
 
-                    kvp.Value.RenderEmitJob(view.Data, sorted, 0, 0);
-                    CombineJob(kvp.Value, ref renderJobs, ref hasRenderJobs);
+                    group.RenderEmitJob(view.Data, sorted, 0, 0);
+                    CombineJob(group, ref renderJobs, ref hasRenderJobs);
+                    Visit(group);
                 }
             }
 
@@ -461,30 +535,27 @@ namespace Caelix.Rendering.RayQuery
                 renderJobs.Complete();
             }
 
-            // Pass 2a: consume the finished jobs. May grow the pool.
+            // Pass 2a: consume the finished jobs of the groups this tick reached. May grow the pool.
             groupRemovalScratch.Clear();
-            for (int v = 0; v < views.Count; v++)
+            for (int i = 0; i < visited.Count; i++)
             {
-                EntityView view = views[v];
-                if (!groups.TryGetValue(view, out Dictionary<int3, RayQueryGroupRenderer> viewGroups))
+                RayQueryGroupRenderer group = visited[i];
+
+                // The AABB total is a running one, so it follows the buffer this call may replace.
+                long aabbBefore = group.AabbVramBytes;
+                if (group.ApplyCompletedRenderJob(Pool))
                 {
-                    continue;
+                    aabbReallocsThisTick++;
                 }
 
-                foreach (var kvp in viewGroups)
-                {
-                    if (kvp.Value.ApplyCompletedRenderJob(Pool))
-                    {
-                        aabbReallocsThisTick++;
-                    }
+                aabbVramBytes += group.AabbVramBytes - aabbBefore;
 
-                    // A group that renders nothing owns an instance, a pool range and a brick map
-                    // for no geometry. Dropping it here is what replaces the old sector-removal
-                    // subscription; it is recreated as soon as one of its bricks changes again.
-                    if (kvp.Value.RendererBrickCount == 0 && !kvp.Value.NeedsFullRebuild)
-                    {
-                        groupRemovalScratch.Add((view, kvp.Key));
-                    }
+                // A group that renders nothing owns an instance, a pool range and a brick map
+                // for no geometry. Dropping it here is what replaces the old sector-removal
+                // subscription; it is recreated as soon as one of its bricks changes again.
+                if (group.RendererBrickCount == 0 && !group.NeedsFullRebuild)
+                {
+                    groupRemovalScratch.Add((group.View, group.GroupKey));
                 }
             }
 
@@ -494,10 +565,45 @@ namespace Caelix.Rendering.RayQuery
                 if (!groups.TryGetValue(view, out Dictionary<int3, RayQueryGroupRenderer> viewGroups)) continue;
                 if (!viewGroups.TryGetValue(groupKey, out RayQueryGroupRenderer stale)) continue;
 
+                aabbVramBytes -= stale.AabbVramBytes;
+                pending.Remove(stale);
+                visitedSet.Remove(stale);
+
                 stale.MarkRemove();
                 stale.RemoveMe(ref _voxelScene, Instances, Pool);
                 viewGroups.Remove(groupKey);
             }
+
+            if (groupRemovalScratch.Count > 0)
+            {
+                // The removed groups are gone from visitedSet; one sweep takes them out of the visit
+                // list as well, so pass 2b cannot touch a disposed group.
+                CompactVisitList();
+            }
+
+            // A page that grew re-packed its live ranges, so every group whose range moved has to
+            // republish its record — including the ones that had no work of their own this tick.
+            Pool.TakeMovedHandles(movedScratch);
+            for (int i = 0; i < movedScratch.Count; i++)
+            {
+                CaelixBrickPool.Handle handle = movedScratch[i];
+
+                // A range freed since the move (its group was dropped above) is invalid, and its
+                // owner is no longer in the dictionaries.
+                if (!handle.IsValid || !(handle.Owner is RayQueryGroupRenderer owner))
+                {
+                    continue;
+                }
+
+                if (groups.TryGetValue(owner.View, out Dictionary<int3, RayQueryGroupRenderer> ownerGroups)
+                    && ownerGroups.TryGetValue(owner.GroupKey, out RayQueryGroupRenderer live)
+                    && ReferenceEquals(live, owner))
+                {
+                    Visit(owner);
+                }
+            }
+
+            movedScratch.Clear();
 
             // The group jobs read the sorted arrays, and pass 2a is the last point that could still
             // touch a job, so the bucket outputs go back here.
@@ -514,17 +620,33 @@ namespace Caelix.Rendering.RayQuery
                 EntityView view = views[v];
                 if (groups.TryGetValue(view, out Dictionary<int3, RayQueryGroupRenderer> viewGroups))
                 {
-                    foreach (var kvp in viewGroups)
+                    groupCount += viewGroups.Count;
+                    CollectViewVisits(view, viewGroups);
+
+                    for (int i = 0; i < viewVisitScratch.Count; i++)
                     {
-                        bricksStagedThisTick += kvp.Value.UploadBricks(Pool);
-                        if (kvp.Value.RenderModifyAS(ref _voxelScene, view, kvp.Key, Instances))
+                        RayQueryGroupRenderer group = viewVisitScratch[i];
+                        bricksStagedThisTick += group.UploadBricks(Pool);
+                        if (group.RenderModifyAS(ref _voxelScene, view, group.GroupKey, Instances))
                         {
                             instanceRebuildsThisTick++;
                         }
 
-                        groupCount++;
-                        aabbVramBytes += kvp.Value.AabbVramBytes;
+                        groupsVisitedThisTick++;
+
+                        // The one place membership is decided: a group that still carries work is
+                        // visited again next tick, one that finished it drops out of the set.
+                        if (group.HasPendingWork)
+                        {
+                            pending.Add(group);
+                        }
+                        else
+                        {
+                            pending.Remove(group);
+                        }
                     }
+
+                    viewVisitScratch.Clear();
                 }
 
                 // Every group of this view has consumed the reset; its motion vectors are settled.
@@ -550,6 +672,35 @@ namespace Caelix.Rendering.RayQuery
             poolLiveBricks = Pool.TotalLiveBricks;
             poolCapacityBricks = Pool.TotalCapacityBricks;
             poolVramBytes = (long)Pool.VRAMUsage;
+
+            // The visit list only means anything inside a tick. Dropped here as well as at the top,
+            // so a group despawning between two ticks has no list to be taken out of.
+            visited.Clear();
+            visitedSet.Clear();
+        }
+
+        /// <summary>Groups carrying unfinished state across ticks. A settled world reports zero.</summary>
+        internal int PendingGroupCount => pending.Count;
+
+        /// <summary>Finds one live group renderer, for the tests that inspect renderer state.</summary>
+        internal bool TryGetGroup(EntityView view, int3 groupKey, out RayQueryGroupRenderer group)
+        {
+            group = null;
+            return view != null
+                && groups.TryGetValue(view, out Dictionary<int3, RayQueryGroupRenderer> viewGroups)
+                && viewGroups.TryGetValue(groupKey, out group);
+        }
+
+        /// <summary>Every live group renderer over every view, for the tests.</summary>
+        internal IEnumerable<RayQueryGroupRenderer> AllGroups()
+        {
+            foreach (var viewGroups in groups)
+            {
+                foreach (var kvp in viewGroups.Value)
+                {
+                    yield return kvp.Value;
+                }
+            }
         }
 
         private Dictionary<int3, RayQueryGroupRenderer> GetOrCreateViewGroups(EntityView view)
@@ -563,11 +714,82 @@ namespace Caelix.Rendering.RayQuery
             return viewGroups;
         }
 
-        private static bool AnyGroupNeedsFullRebuild(Dictionary<int3, RayQueryGroupRenderer> viewGroups)
+        /// <summary>Adds a group to this tick's visit list, at most once.</summary>
+        private void Visit(RayQueryGroupRenderer group)
         {
-            foreach (var kvp in viewGroups)
+            if (visitedSet.Add(group))
             {
-                if (kvp.Value.NeedsFullRebuild) return true;
+                visited.Add(group);
+            }
+        }
+
+        /// <summary>Drops from <see cref="visited"/> whatever is no longer in <see cref="visitedSet"/>.</summary>
+        private void CompactVisitList()
+        {
+            int kept = 0;
+            for (int i = 0; i < visited.Count; i++)
+            {
+                if (visitedSet.Contains(visited[i]))
+                {
+                    visited[kept++] = visited[i];
+                }
+            }
+
+            visited.RemoveRange(kept, visited.Count - kept);
+        }
+
+        /// <summary>
+        /// Fills <see cref="viewVisitScratch"/> with the groups of one view pass 2b has to run.
+        /// </summary>
+        /// <remarks>
+        /// A moving entity retracks every instance it owns, so its whole dictionary is walked. A
+        /// static one only needs the groups this tick reached and the ones still carrying work; the
+        /// rest keep the transform, the record and the instance they already have.
+        /// </remarks>
+        private void CollectViewVisits(EntityView view, Dictionary<int3, RayQueryGroupRenderer> viewGroups)
+        {
+            viewVisitScratch.Clear();
+
+            if (!view.IsStatic || view.ShouldResetMotionVectors)
+            {
+                foreach (var kvp in viewGroups)
+                {
+                    viewVisitScratch.Add(kvp.Value);
+                }
+
+                return;
+            }
+
+            for (int i = 0; i < visited.Count; i++)
+            {
+                if (ReferenceEquals(visited[i].View, view))
+                {
+                    viewVisitScratch.Add(visited[i]);
+                }
+            }
+
+            foreach (RayQueryGroupRenderer group in pending)
+            {
+                if (ReferenceEquals(group.View, view) && !visitedSet.Contains(group))
+                {
+                    viewVisitScratch.Add(group);
+                }
+            }
+        }
+
+        /// <summary>True while some group of <paramref name="view"/> waits to be built again.</summary>
+        /// <remarks>
+        /// A group only ever sets that flag while it is visited, and every visited group's pending
+        /// membership is refreshed in the same tick, so the set holds all of them.
+        /// </remarks>
+        private bool AnyPendingFullRebuild(EntityView view)
+        {
+            foreach (RayQueryGroupRenderer group in pending)
+            {
+                if (ReferenceEquals(group.View, view) && group.NeedsFullRebuild)
+                {
+                    return true;
+                }
             }
 
             return false;
@@ -629,6 +851,8 @@ namespace Caelix.Rendering.RayQuery
             }
 
             groups.Clear();
+            ForgetVisitState();
+            aabbVramBytes = 0;
 
             _voxelScene?.Dispose();
             _voxelScene = null;
