@@ -399,7 +399,7 @@ namespace Caelix.Rendering.RayQuery
         /// <para>
         /// Only the groups with work are visited, never the whole dictionaries: a group is reached
         /// because this tick handed it a job, because it carries unfinished state
-        /// (<see cref="pending"/>), because its entity moves, or because a pool compaction moved its
+        /// (<see cref="pending"/>), because its entity is dynamic (or resets motion vectors), or because a pool compaction moved its
         /// range. Everything else is idle and costs nothing, which is what keeps a static world's
         /// per-frame cost independent of its size.
         /// </para>
@@ -742,7 +742,8 @@ namespace Caelix.Rendering.RayQuery
         /// Fills <see cref="viewVisitScratch"/> with the groups of one view pass 2b has to run.
         /// </summary>
         /// <remarks>
-        /// A moving entity retracks every instance it owns, so its whole dictionary is walked. A
+        /// A dynamic entity retracks every instance it owns on every tick, whether or not its transform
+        /// changed this tick, so its whole dictionary is walked (cost bounded by its group count). A
         /// static one only needs the groups this tick reached and the ones still carrying work; the
         /// rest keep the transform, the record and the instance they already have.
         /// </remarks>
