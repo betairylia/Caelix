@@ -201,6 +201,10 @@ namespace Caelix.Rendering.Meshing
             // A group that holds no brick any more draws nothing; dropping it here replaces the old
             // sector-map sweep. A region freed and recreated at the same coordinate inside one frame
             // arrives as Removed plus Updated entries, so its group is re-meshed rather than leaked.
+            // TODO (low priority, mesh fallback): removing a group's last brick then calling
+            // RegenerateAll() before Update() leaves its old mesh alive. Full upload emits only
+            // allocated bricks, so groupsWithRemovals misses the emptied group. Preserve removals
+            // during full upload or check existing groups once on regeneration.
             groupsToRemove.Clear();
             foreach (var kvp in groupRenderers)
             {
