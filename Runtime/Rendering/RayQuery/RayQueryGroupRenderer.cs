@@ -301,10 +301,11 @@ namespace Caelix.Rendering.RayQuery
         /// </param>
         /// <param name="start">Index of this group's first entry in <paramref name="sortedChanges"/>.</param>
         /// <param name="count">Number of entries that belong to this group.</param>
+        /// <param name="fullUpload">Read every current brick of the group, including changes from earlier frames.</param>
         public void RenderEmitJob(
-            VoxelEntityData data, NativeArray<BrickChange> sortedChanges, int start, int count)
+            VoxelEntityData data, NativeArray<BrickChange> sortedChanges, int start, int count, bool fullUpload = false)
         {
-            if (shouldRemove || (count <= 0 && !needsFullRebuild))
+            if (shouldRemove || (count <= 0 && !needsFullRebuild && !fullUpload))
             {
                 return;
             }
@@ -319,7 +320,7 @@ namespace Caelix.Rendering.RayQuery
                 count = count,
                 groupKey = GroupKey,
                 grouping = grouping,
-                forceFullUpload = needsFullRebuild,
+                forceFullUpload = needsFullRebuild || fullUpload,
                 rendererBrickMap = rendererBrickMap,
                 aabbBuffer = hostAABBBuffer,
                 stagingWords = new NativeList<int>(

@@ -63,6 +63,47 @@ handle's current offset and page against the ones its record names.
 
 ## Records live only on the GPU
 
+### Initial uploads across frames
+
+`CaelixRayQueryRenderer` queues a group's first upload instead of preparing every group's records
+on the frame an initial replica arrives. The Inspector's **Initial Upload** settings default to
+65,536 allocated bricks and 16 new groups per frame. Both limits apply across all entity views.
+The group limit also bounds new instance builds when the world contains many sparse groups.
+Groups finish as a unit; a group larger than the brick budget runs alone so the queue can progress.
+
+The queue stores only the entity view and group key. Admission happens before the render job
+allocates its temporary records. An admitted group reads its current allocated bricks, completes
+its job, stages its upload and publishes its ray-tracing instance in that tick. Existing groups
+continue to consume the normal change list. Loading therefore reveals the world progressively.
+
+This works both when the renderer observes the initial join and when it binds to a populated
+client world. Changes to a deferred group are coalesced by key: it reads current storage when
+admitted, even after the client has cleared earlier frame changes. Despawning a view cancels its
+queued keys before its storage is disposed. World changes, disable/re-enable and group-size changes
+discard the queue along with the old render resources and discover the new source again.
+
+`initialUploadGroupsPending`, `initialUploadGroupsThisTick` and `initialUploadBricksThisTick` expose
+progress; the last counts allocated input bricks before culling. `bricksStagedThisTick` still counts
+all staged output records, including ordinary updates. A raw record is 1,096 bytes, so the default
+brick budget represents at most 68.5 MiB of initial record payload per tick; list capacities, AABB
+buffers, upload staging and driver allocations add to that amount.
+
+The budget reduces simultaneous CPU render staging and new GPU work. It does not cap total process
+memory, replication queues, ordinary updates, pool-growth copies, the accumulated acceleration
+structure build or tracing cost. It is not a guarantee against a GPU timeout. Keep the existing
+batched scatter upload: splitting work across frames must not restore per-group write/dispatch
+buffer reuse.
+
+The small GPU-backed cases in `RayQueryIdleGroupTests` cover budgeted progress after `EndFrame`,
+late binding, deferred edits/removals and entity/world replacement. They do not establish peak
+memory or crash behavior for Epic Citadel 16K.
+
+Validation on 2026-09-11: Unity 6000.5.6f1 compilation succeeded; `RayQueryIdleGroupTests` (10),
+`RenderGroupRebuildTests` (6) and `MeshingRendererTests` (9) all passed with no skips. The large
+standalone demo was not launched and memory peaks were not measured.
+
+### Buffer ownership
+
 No sector keeps a host copy of its brick records. That copy used to be 1096 bytes per brick — about
 4 GB on the 8K San Miguel and 7 GB on the 16K citadel — and existed purely so that a record could be uploaded again whenever a buffer
 was replaced. `CaelixBrickGpuOps` (`Runtime/Rendering/CaelixBrickGpuOps.cs`, three kernels in

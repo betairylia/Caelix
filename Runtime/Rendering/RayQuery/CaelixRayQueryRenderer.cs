@@ -27,10 +27,9 @@ namespace Caelix.Rendering.RayQuery
     /// renderers reading the same client world would steal each other's reset.
     /// </para>
     /// <para>
-    /// A renderer bound after its world already exists still draws it: <see cref="SetSource"/>
-    /// raises a full-upload flag, and the next <see cref="Tick"/> builds its work from every
-    /// allocated brick instead of from the cycle's changes. That is what removed the old
-    /// "a renderer enabled mid-Play draws nothing" limitation.
+    /// A renderer bound after its world already exists still draws it: after <see cref="SetSource"/>,
+    /// the next tick discovers allocated groups and begins uploading them. Deferred groups
+    /// keep only their keys; their render data is generated from current storage when admitted.
     /// </para>
     /// </remarks>
     public class CaelixRayQueryRenderer : MonoBehaviour
@@ -54,6 +53,13 @@ namespace Caelix.Rendering.RayQuery
         [Header("Render Groups")]
         [SerializeField, Tooltip("Bricks per acceleration-structure instance. Changing it while running re-uploads the world.")]
         private RenderGroupSize groupSize = RenderGroupSize.Bricks16;
+
+        [Header("Initial Upload")]
+        [SerializeField, Min(1), Tooltip("Allocated bricks admitted for new render groups per frame. Whole groups finish together; one oversized group may run alone to guarantee progress.")]
+        private int initialUploadBricksPerFrame = 65536;
+
+        [SerializeField, Min(1), Tooltip("Maximum new render groups prepared per frame. Limits instance builds even when groups contain few bricks.")]
+        private int initialUploadGroupsPerFrame = 16;
 
         /// <summary>Debug field showing the current number of instances in the acceleration structure.</summary>
         [Header("Debug Utils")] public int instanceCount;
@@ -81,6 +87,15 @@ namespace Caelix.Rendering.RayQuery
 
         /// <summary>Debug field: brick records this tick staged into the pool.</summary>
         public int bricksStagedThisTick;
+
+        /// <summary>Debug field: new groups still waiting to generate their first render data.</summary>
+        public int initialUploadGroupsPending;
+
+        /// <summary>Debug field: new groups admitted by this tick's initial-upload budget.</summary>
+        public int initialUploadGroupsThisTick;
+
+        /// <summary>Debug field: allocated bricks in the new groups admitted this tick, before culling.</summary>
+        public int initialUploadBricksThisTick;
 
         /// <summary>Debug field: groups whose AABB buffer this tick replaced.</summary>
         public int aabbReallocsThisTick;
@@ -110,13 +125,22 @@ namespace Caelix.Rendering.RayQuery
         /// <summary>
         /// Set while the renderer still has to upload a world it did not watch being built: after
         /// binding a source, and after its resources were released. The next <see cref="Tick"/>
-        /// builds every view's work from <c>EnumerateBricks</c> rather than from the cycle's
-        /// changes, then clears it.
+        /// discovers every view's groups through <c>EnumerateBricks</c>, then clears it. The
+        /// initial-upload queue keeps that work alive after the flag and frame changes are cleared.
         /// </summary>
         private bool needsInitialUpload;
 
         /// <summary>Maps view → render group → renderer, so render state stays separate from entity data.</summary>
         private readonly Dictionary<EntityView, Dictionary<int3, RayQueryGroupRenderer>> groups = new();
+
+        /// <summary>
+        /// First uploads in discovery order. No voxel copies, native containers or renderer buffers
+        /// are retained here. View identity prevents a replacement entity inheriting old work.
+        /// </summary>
+        private readonly Queue<(EntityView view, int3 groupKey)> initialUploads = new();
+
+        /// <summary>Coalesces changes to groups that are already waiting for their first upload.</summary>
+        private readonly HashSet<(EntityView view, int3 groupKey)> queuedInitialUploads = new();
 
         /// <summary>Groups the current pass has emitted a bucketed job for. Cleared per view.</summary>
         private readonly HashSet<int3> bucketedGroups = new();
@@ -212,6 +236,23 @@ namespace Caelix.Rendering.RayQuery
         public RenderGroupSize GroupSize { get => groupSize; set => groupSize = value; }
 
         /// <summary>
+        /// Allocated-brick budget for first uploads. A group larger than the budget runs alone;
+        /// updates to already-created groups follow the normal change-list path.
+        /// </summary>
+        public int InitialUploadBricksPerFrame
+        {
+            get => initialUploadBricksPerFrame;
+            set => initialUploadBricksPerFrame = Mathf.Max(1, value);
+        }
+
+        /// <summary>Maximum groups admitted for first upload per tick. Tick is called once per frame.</summary>
+        public int InitialUploadGroupsPerFrame
+        {
+            get => initialUploadGroupsPerFrame;
+            set => initialUploadGroupsPerFrame = Mathf.Max(1, value);
+        }
+
+        /// <summary>
         /// True while every GPU resource the trace needs exists: between Awake/Tick and OnDisable. False
         /// in edit mode (no Awake) and while disabled, which is what keeps the G-buffer stage from
         /// dispatching against null buffers and logging "Property ... is not set" every frame.
@@ -284,8 +325,8 @@ namespace Caelix.Rendering.RayQuery
 
         /// <summary>Binds a replica and releases every group belonging to the previous one.</summary>
         /// <remarks>
-        /// The new world is uploaded in full on the next <see cref="Tick"/>: its bricks were
-        /// replicated before this renderer was looking, so its change list says nothing about them.
+        /// The next <see cref="Tick"/> discovers the new world's groups and begins their budgeted
+        /// upload. Its bricks may predate the renderer, so discovery cannot rely on its change list.
         /// </remarks>
         public void SetSource(ClientWorld world)
         {
@@ -343,6 +384,8 @@ namespace Caelix.Rendering.RayQuery
 
         private void OnViewDespawning(EntityView view)
         {
+            CancelInitialUploads(view);
+
             if (!groups.TryGetValue(view, out Dictionary<int3, RayQueryGroupRenderer> viewGroups))
             {
                 return;
@@ -368,6 +411,9 @@ namespace Caelix.Rendering.RayQuery
         /// <summary>Drops every group from the visit bookkeeping. For the paths where all of them go.</summary>
         private void ForgetVisitState()
         {
+            initialUploads.Clear();
+            queuedInitialUploads.Clear();
+            initialUploadGroupsPending = 0;
             pending.Clear();
             visited.Clear();
             visitedSet.Clear();
@@ -390,7 +436,8 @@ namespace Caelix.Rendering.RayQuery
         /// Performs one render update tick for all voxel entity views.
         /// </summary>
         /// <remarks>
-        /// Pass 1 buckets each view's changes by render group and emits one job per group. Pass 2a
+        /// Pass 1 queues new groups, admits their first uploads within the frame budget, and emits
+        /// normal change-list jobs for groups that already exist. Pass 2a
         /// consumes the finished jobs, settles every group's pool range and drops the groups that
         /// render nothing. Pass 2b writes bricks and updates the acceleration structure. 2a and 2b
         /// are separate loops on purpose: 2a can grow a page, which replaces its buffer and moves
@@ -410,6 +457,8 @@ namespace Caelix.Rendering.RayQuery
             groupsEmittedThisTick = 0;
             groupsVisitedThisTick = 0;
             bricksStagedThisTick = 0;
+            initialUploadGroupsThisTick = 0;
+            initialUploadBricksThisTick = 0;
             aabbReallocsThisTick = 0;
             instanceRebuildsThisTick = 0;
             poolVramBytes = 0;
@@ -458,32 +507,32 @@ namespace Caelix.Rendering.RayQuery
             IReadOnlyList<EntityView> views = source.Views;
             frameBuckets.Clear();
 
-            // Pass 1: bucket this cycle's changes and emit one job per touched render group.
+            // Pass 1: queue first uploads and emit normal updates for groups that already exist.
             for (int v = 0; v < views.Count; v++)
             {
                 EntityView view = views[v];
-                Dictionary<int3, RayQueryGroupRenderer> viewGroups = GetOrCreateViewGroups(view);
+                bool newView = !groups.TryGetValue(view, out Dictionary<int3, RayQueryGroupRenderer> viewGroups);
+                viewGroups ??= GetOrCreateViewGroups(view);
 
-                ChangeBuckets buckets;
-                if (needsInitialUpload)
+                if (needsInitialUpload || newView)
                 {
-                    // Nothing told this renderer about the bricks that arrived before it was
-                    // bound, so the work is synthesised from the storage itself.
-                    NativeArray<BrickChange> initial = RenderGroupChanges.BuildFullUploadChanges(view.Data);
-                    buckets = ChangeBuckets.Build(initial, grouping);
-                    initial.Dispose();
-                }
-                else
-                {
-                    NativeArray<BrickChange>.ReadOnly changes = view.Data.Changes;
-                    if (changes.Length == 0 && !AnyPendingFullRebuild(view))
+                    // Discover keys only. Building a whole-world change array or staging every
+                    // group's records here would retain the initial join's memory spike.
+                    foreach (int3 key in view.Data.EnumerateBricks())
                     {
-                        continue;
+                        QueueInitialUpload(view, grouping.Of(key));
                     }
 
-                    buckets = ChangeBuckets.Build(changes, grouping);
+                    continue;
                 }
 
+                NativeArray<BrickChange>.ReadOnly changes = view.Data.Changes;
+                if (changes.Length == 0 && !AnyPendingFullRebuild(view))
+                {
+                    continue;
+                }
+
+                ChangeBuckets buckets = ChangeBuckets.Build(changes, grouping);
                 frameBuckets.Add((view, buckets));
                 NativeArray<BrickChange> sorted = buckets.Sorted.AsArray();
 
@@ -502,8 +551,8 @@ namespace Caelix.Rendering.RayQuery
                             continue;
                         }
 
-                        renderer = new RayQueryGroupRenderer(view, groupKey, brickMat, ledger, grouping);
-                        viewGroups[groupKey] = renderer;
+                        QueueInitialUpload(view, groupKey);
+                        continue;
                     }
 
                     renderer.RenderEmitJob(view.Data, sorted, buckets.GroupStarts[g], buckets.GroupCounts[g]);
@@ -529,6 +578,11 @@ namespace Caelix.Rendering.RayQuery
             }
 
             needsInitialUpload = false;
+
+            // Jobs require a created array even for a full upload, which reads storage rather than
+            // change entries. It lives only until this tick has completed all of its jobs.
+            using var initialChanges = new NativeArray<BrickChange>(0, Allocator.TempJob);
+            EmitInitialUploadJobs(initialChanges, ref renderJobs, ref hasRenderJobs);
 
             if (hasRenderJobs)
             {
@@ -679,8 +733,83 @@ namespace Caelix.Rendering.RayQuery
             visitedSet.Clear();
         }
 
-        /// <summary>Groups carrying unfinished state across ticks. A settled world reports zero.</summary>
+        /// <summary>Existing groups carrying unfinished state across ticks, excluding queued first uploads.</summary>
         internal int PendingGroupCount => pending.Count;
+
+        private void QueueInitialUpload(EntityView view, int3 groupKey)
+        {
+            if (groups[view].ContainsKey(groupKey) || !queuedInitialUploads.Add((view, groupKey)))
+            {
+                return;
+            }
+
+            initialUploads.Enqueue((view, groupKey));
+            initialUploadGroupsPending = initialUploads.Count;
+        }
+
+        /// <summary>
+        /// Admits whole groups before allocating any staging buffers. Count current allocated
+        /// bricks, because a deferred group's data can change after its discovery frame ends.
+        /// </summary>
+        private void EmitInitialUploadJobs(
+            NativeArray<BrickChange> emptyChanges, ref JobHandle renderJobs, ref bool hasRenderJobs)
+        {
+            int brickBudget = Mathf.Max(1, initialUploadBricksPerFrame);
+            int groupBudget = Mathf.Max(1, initialUploadGroupsPerFrame);
+            while (initialUploads.Count > 0 && initialUploadGroupsThisTick < groupBudget)
+            {
+                (EntityView view, int3 groupKey) = initialUploads.Peek();
+                int brickCount = 0;
+                foreach (int3 unused in view.Data.EnumerateBricks(grouping.FirstKey(groupKey), grouping.LastKey(groupKey)))
+                {
+                    brickCount++;
+                }
+
+                // Always admit the first group, even if a user selected a smaller budget than it
+                // needs. Otherwise that group could block the queue forever.
+                if (initialUploadGroupsThisTick > 0 && brickCount > brickBudget - initialUploadBricksThisTick)
+                {
+                    break;
+                }
+
+                initialUploads.Dequeue();
+                queuedInitialUploads.Remove((view, groupKey));
+                if (brickCount == 0)
+                {
+                    continue;
+                }
+
+                var renderer = new RayQueryGroupRenderer(view, groupKey, brickMat, ledger, grouping);
+                groups[view].Add(groupKey, renderer);
+                renderer.RenderEmitJob(view.Data, emptyChanges, 0, 0, fullUpload: true);
+                CombineJob(renderer, ref renderJobs, ref hasRenderJobs);
+                Visit(renderer);
+                initialUploadGroupsThisTick++;
+                initialUploadBricksThisTick += brickCount;
+            }
+
+            initialUploadGroupsPending = initialUploads.Count;
+        }
+
+        /// <summary>Remove a departing view's keys before its native storage is disposed.</summary>
+        private void CancelInitialUploads(EntityView view)
+        {
+            int count = initialUploads.Count;
+            for (int i = 0; i < count; i++)
+            {
+                var upload = initialUploads.Dequeue();
+                if (ReferenceEquals(upload.view, view))
+                {
+                    queuedInitialUploads.Remove(upload);
+                }
+                else
+                {
+                    initialUploads.Enqueue(upload);
+                }
+            }
+
+            initialUploadGroupsPending = initialUploads.Count;
+        }
 
         /// <summary>Finds one live group renderer, for the tests that inspect renderer state.</summary>
         internal bool TryGetGroup(EntityView view, int3 groupKey, out RayQueryGroupRenderer group)

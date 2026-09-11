@@ -184,5 +184,189 @@ namespace Caelix.Tests
 
             Assert.That(groups, Is.EqualTo(rig.Renderer.groupCount));
         }
+
+        /// <summary>First uploads survive EndFrame without retaining its native change arrays.</summary>
+        [TestCase(false)]
+        [TestCase(true)]
+        public void InitialUpload_BrickBudgetDrainsAcrossFrames(bool bindBeforeJoin)
+        {
+            if (!SystemInfo.supportsInlineRayTracing) Assert.Ignore("Inline ray tracing is required.");
+            using var rig = new Rig("ray-query-streamed-join-test");
+            rig.Renderer.InitialUploadBricksPerFrame = 3;
+            if (bindBeforeJoin) rig.StepAndRender();
+
+            for (int group = 0; group < 3; group++)
+            {
+                rig.World.SetBlock(rig.Guid, new int3(group * 128 + 17, 17, 17), new Block(0x8001));
+                rig.World.SetBlock(rig.Guid, new int3(group * 128 + 25, 17, 17), new Block(0x8001));
+            }
+
+            rig.StepAndRender();
+            for (int frame = 0; frame < 3; frame++)
+            {
+                if (frame > 0) rig.RenderIdleFrame();
+                Assert.That(rig.InstanceCount, Is.EqualTo(frame + 1));
+                Assert.That(rig.Renderer.initialUploadGroupsPending, Is.EqualTo(2 - frame));
+                Assert.That(rig.Renderer.initialUploadGroupsThisTick, Is.EqualTo(1));
+                Assert.That(rig.Renderer.initialUploadBricksThisTick, Is.EqualTo(2));
+                Assert.That(rig.Renderer.bricksStagedThisTick, Is.EqualTo(2));
+                AssertEveryGroupPublishesItsRange(rig);
+                foreach (RayQueryGroupRenderer group in rig.Renderer.AllGroups())
+                {
+                    Assert.That(group.HasScheduledJob, Is.False, "no job or TempJob data crosses frames");
+                }
+            }
+
+            rig.RenderIdleFrame();
+            Assert.That(rig.Renderer.groupsVisitedThisTick, Is.Zero);
+            Assert.That(rig.Renderer.initialUploadBricksThisTick, Is.Zero);
+        }
+
+        [Test]
+        public void InitialUpload_GroupBudgetLimitsSparseInstances()
+        {
+            if (!SystemInfo.supportsInlineRayTracing) Assert.Ignore("Inline ray tracing is required.");
+            using var rig = new Rig("ray-query-group-budget-test");
+            rig.Renderer.InitialUploadGroupsPerFrame = 1;
+            AddSparseGroups(rig, 3);
+
+            rig.StepAndRender();
+            Assert.That(rig.InstanceCount, Is.EqualTo(1));
+            Assert.That(rig.Renderer.initialUploadGroupsPending, Is.EqualTo(2));
+            rig.RenderIdleFrame();
+            Assert.That(rig.InstanceCount, Is.EqualTo(2));
+            Assert.That(rig.Renderer.instanceRebuildsThisTick, Is.EqualTo(1));
+            Assert.That(rig.Renderer.initialUploadGroupsPending, Is.EqualTo(1));
+        }
+
+        [Test]
+        public void InitialUpload_GroupLargerThanBrickBudgetMakesProgressAlone()
+        {
+            if (!SystemInfo.supportsInlineRayTracing) Assert.Ignore("Inline ray tracing is required.");
+            using var rig = new Rig("ray-query-oversized-upload-test");
+            rig.Renderer.InitialUploadBricksPerFrame = 1;
+            for (int group = 0; group < 2; group++)
+            {
+                rig.World.SetBlock(rig.Guid, new int3(group * 128 + 17, 17, 17), new Block(0x8001));
+                rig.World.SetBlock(rig.Guid, new int3(group * 128 + 25, 17, 17), new Block(0x8001));
+            }
+
+            rig.StepAndRender();
+            Assert.That(rig.Renderer.initialUploadGroupsThisTick, Is.EqualTo(1));
+            Assert.That(rig.Renderer.initialUploadBricksThisTick, Is.EqualTo(2));
+            Assert.That(rig.Renderer.initialUploadGroupsPending, Is.EqualTo(1));
+            rig.RenderIdleFrame();
+            Assert.That(rig.InstanceCount, Is.EqualTo(2));
+            Assert.That(rig.Renderer.initialUploadGroupsPending, Is.Zero);
+        }
+
+        [Test]
+        public void InitialUpload_DeferredGroupReadsReplacementStorage()
+        {
+            if (!SystemInfo.supportsInlineRayTracing) Assert.Ignore("Inline ray tracing is required.");
+            using var rig = new Rig("ray-query-deferred-change-test");
+            rig.Renderer.InitialUploadGroupsPerFrame = 1;
+            AddSparseGroups(rig, 3);
+            rig.StepAndRender();
+
+            EntityView view = rig.Renderer.Source.Views[0];
+            int3 deferred = FindDeferredGroup(rig, view, 3);
+            rig.World.GetEntity(rig.Guid).RemoveRegion(deferred);
+            int3 origin = rig.Renderer.Grouping.BlockOrigin(deferred);
+            rig.World.SetBlock(rig.Guid, origin + new int3(41, 17, 17), new Block(0x8001));
+            rig.World.SetBlock(rig.Guid, origin + new int3(49, 17, 17), new Block(0x8001));
+            rig.StepAndRender();
+            rig.RenderIdleFrame();
+
+            Assert.That(rig.InstanceCount, Is.EqualTo(3));
+            Assert.That(rig.Renderer.initialUploadGroupsPending, Is.Zero, "updates do not enqueue a group twice");
+            Assert.That(rig.Renderer.TryGetGroup(view, deferred, out RayQueryGroupRenderer group), Is.True);
+            Assert.That(group.RendererBrickCount, Is.EqualTo(2), "the original brick was removed while queued");
+            AssertEveryGroupPublishesItsRange(rig);
+        }
+
+        [Test]
+        public void InitialUpload_RemovedRegionIsNotPublished()
+        {
+            if (!SystemInfo.supportsInlineRayTracing) Assert.Ignore("Inline ray tracing is required.");
+            using var rig = new Rig("ray-query-deferred-removal-test");
+            rig.Renderer.InitialUploadGroupsPerFrame = 1;
+            AddSparseGroups(rig, 3);
+            rig.StepAndRender();
+            EntityView view = rig.Renderer.Source.Views[0];
+            int3 deferred = FindDeferredGroup(rig, view, 3);
+            rig.World.GetEntity(rig.Guid).RemoveRegion(deferred);
+            rig.StepAndRender();
+            rig.RenderIdleFrame();
+
+            Assert.That(rig.InstanceCount, Is.EqualTo(2));
+            Assert.That(rig.Renderer.initialUploadGroupsPending, Is.Zero);
+            Assert.That(rig.Renderer.TryGetGroup(view, deferred, out _), Is.False);
+        }
+
+        [Test]
+        public void InitialUpload_EntityReplacementCancelsOldKeys()
+        {
+            if (!SystemInfo.supportsInlineRayTracing) Assert.Ignore("Inline ray tracing is required.");
+            using var rig = new Rig("ray-query-deferred-entity-test");
+            rig.Renderer.InitialUploadGroupsPerFrame = 1;
+            AddSparseGroups(rig, 3);
+            rig.StepAndRender();
+
+            rig.World.RemoveEntity(rig.Guid);
+            rig.World.CreateEntity(rig.Guid, RigidTransform.identity, isStatic: true);
+            rig.World.SetBlock(rig.Guid, new int3(657, 17, 17), new Block(0x8001));
+            rig.StepAndRender();
+
+            Assert.That(rig.Renderer.initialUploadGroupsPending, Is.Zero);
+            Assert.That(rig.InstanceCount, Is.EqualTo(1));
+            EntityView view = rig.Renderer.Source.Views[0];
+            Assert.That(rig.Renderer.TryGetGroup(view, new int3(5, 0, 0), out _), Is.True);
+        }
+
+        [Test]
+        public void InitialUpload_WorldRemovalCancelsQueueAndRebindDiscoversAgain()
+        {
+            if (!SystemInfo.supportsInlineRayTracing) Assert.Ignore("Inline ray tracing is required.");
+            using var rig = new Rig("ray-query-deferred-world-test");
+            rig.Renderer.InitialUploadGroupsPerFrame = 1;
+            AddSparseGroups(rig, 3);
+            rig.StepAndRender();
+            Assert.That(rig.Renderer.initialUploadGroupsPending, Is.EqualTo(2));
+
+            rig.Server.RemoveWorld(rig.World);
+            rig.Server.Step();
+            rig.Client.Receive();
+            Assert.That(rig.Renderer.Source, Is.Null);
+            Assert.That(rig.Renderer.initialUploadGroupsPending, Is.Zero);
+            Assert.That(rig.InstanceCount, Is.Zero);
+
+            CaelixWorld replacement = rig.Server.CreateWorld(CaelixWorldConfig.Default());
+            replacement.CreateEntity(rig.Guid, RigidTransform.identity, isStatic: true);
+            replacement.SetBlock(rig.Guid, new int3(17), new Block(0x8001));
+            rig.StepAndRender();
+            Assert.That(rig.InstanceCount, Is.EqualTo(1));
+            Assert.That(rig.Renderer.initialUploadGroupsPending, Is.Zero);
+        }
+
+        private static void AddSparseGroups(Rig rig, int count)
+        {
+            for (int group = 0; group < count; group++)
+            {
+                rig.World.SetBlock(rig.Guid, new int3(group * 128 + 17, 17, 17), new Block(0x8001));
+            }
+        }
+
+        private static int3 FindDeferredGroup(Rig rig, EntityView view, int count)
+        {
+            for (int group = 0; group < count; group++)
+            {
+                var key = new int3(group, 0, 0);
+                if (!rig.Renderer.TryGetGroup(view, key, out _)) return key;
+            }
+
+            Assert.Fail("Expected a group waiting for its first upload.");
+            return default;
+        }
     }
 }
