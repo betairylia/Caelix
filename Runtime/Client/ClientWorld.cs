@@ -250,9 +250,9 @@ namespace Caelix.Client
         /// </summary>
         public void PropagateForRender()
         {
-            const DirtyFlags renderFlags =
-                DirtyFlags.Geometry | DirtyFlags.GeometryWithLocalNeighbor |
-                DirtyFlags.BlockBrickAdded | DirtyFlags.BlockBrickRemoved;
+            const BrickUpdateFlags renderFlags =
+                BrickUpdateFlags.Geometry | BrickUpdateFlags.GeometryWithLocalNeighbor |
+                BrickUpdateFlags.BlockBrickAdded | BrickUpdateFlags.BlockBrickRemoved;
 
             JobHandle dirtyPropagationHandle = default;
 

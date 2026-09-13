@@ -25,10 +25,10 @@ namespace Caelix.Rendering.Meshing
         private readonly int chunkSize;
         private readonly Material material;
 
-        private const DirtyFlags MeshUpdateFlags =
-            DirtyFlags.BlockBrickAdded |
-            DirtyFlags.BlockBrickRemoved |
-            DirtyFlags.GeometryWithLocalNeighbor;
+        private const BrickUpdateFlags MeshUpdateFlags =
+            BrickUpdateFlags.BlockBrickAdded |
+            BrickUpdateFlags.BlockBrickRemoved |
+            BrickUpdateFlags.GeometryWithLocalNeighbor;
 
         /// <summary>
         /// Blocks along one axis of a render group (16 bricks x 8 blocks = 128). The mesh renderer

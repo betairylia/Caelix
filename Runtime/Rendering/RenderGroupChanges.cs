@@ -101,8 +101,8 @@ namespace Caelix.Rendering
     internal struct ChangeBuckets : IDisposable
     {
         /// <summary>Require-update bits that make a brick worth a render job.</summary>
-        private const DirtyFlags RenderFlags =
-            DirtyFlags.BlockBrickAdded | DirtyFlags.GeometryWithLocalNeighbor;
+        private const BrickUpdateFlags RenderFlags =
+            BrickUpdateFlags.BlockBrickAdded | BrickUpdateFlags.GeometryWithLocalNeighbor;
 
         public NativeArray<BrickChange> Source;
         public NativeList<BrickChange> Sorted;
@@ -134,7 +134,7 @@ namespace Caelix.Rendering
             for (int i = 0; i < count; i++)
             {
                 BrickChange change = changes[i];
-                if (change.Kind == ChangeKind.Removed || (change.RequiredFlags & RenderFlags) != 0)
+                if (change.Kind == ChangeKind.Removed || (change.RequireUpdateFlags & RenderFlags) != 0)
                 {
                     buckets.Source[kept++] = change;
                 }
@@ -195,8 +195,8 @@ namespace Caelix.Rendering
                 {
                     Key = key,
                     Kind = ChangeKind.Updated,
-                    SourceFlags = DirtyFlags.None,
-                    RequiredFlags = DirtyFlags.BlockBrickAdded | DirtyFlags.GeometryWithLocalNeighbor
+                    DirtyFlags = BrickUpdateFlags.None,
+                    RequireUpdateFlags = BrickUpdateFlags.BlockBrickAdded | BrickUpdateFlags.GeometryWithLocalNeighbor
                 };
             }
 

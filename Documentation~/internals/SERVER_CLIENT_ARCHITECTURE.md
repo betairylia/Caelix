@@ -183,12 +183,12 @@ the renderer is what makes it possible.
 - **Delta detection is the change list.** `VoxelEntityData.Changes`, published
   after alien propagation and cleared by `EndTick`, is what replication reads.
   A `Removed` entry becomes a `Remove` record; an `Updated` entry whose
-  `SourceFlags` meet `BrickReplication.ReplicationDirtyMask` (`Geometry`,
+  `DirtyFlags` meet `BrickReplication.ReplicationDirtyMask` (`Geometry`,
   `BlockBrickAdded`, `BlockBrickRemoved` — the Block slot is the only writer that
   sets `Geometry`) becomes an `Update` record. Records keep change-list order, so
   a key removed and recreated in one tick reaches the client as Remove then
   Update. `SlotReplicate`, a bit set by writes to other replicated slots, is a
-  possible later extension; it is not an existing `DirtyFlags` member.
+  possible later extension; it is not an existing `BrickUpdateFlags` member.
   `VoxelEntityData.AddSectorAt` marks every allocated brick of an attached
   storage unit `BlockBrickAdded | Geometry | GeometryWithLocalNeighbor`, because
   a generator or importer that hands over pre-filled storage would otherwise

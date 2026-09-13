@@ -154,7 +154,7 @@ namespace Caelix.Tests
         /// <summary>
         /// Finds a <see cref="ChangeKind.Removed"/> entry for <paramref name="removedKey"/> before an
         /// <see cref="ChangeKind.Updated"/> entry for <paramref name="updatedKey"/> that carries
-        /// <see cref="DirtyFlags.BlockBrickAdded"/>. The order is the contract: a consumer applies
+        /// <see cref="BrickUpdateFlags.BlockBrickAdded"/>. The order is the contract: a consumer applies
         /// change entries in list order.
         /// </summary>
         private static void AssertRemovedBeforeUpdated(EntityView view, int3 removedKey, int3 updatedKey)
@@ -169,7 +169,7 @@ namespace Caelix.Tests
                 }
 
                 if (updated < 0 && change.Kind == ChangeKind.Updated && math.all(change.Key == updatedKey) &&
-                    (change.SourceFlags & DirtyFlags.BlockBrickAdded) != DirtyFlags.None)
+                    (change.DirtyFlags & BrickUpdateFlags.BlockBrickAdded) != BrickUpdateFlags.None)
                 {
                     updated = i;
                 }
@@ -329,9 +329,9 @@ namespace Caelix.Tests
             rig.Client.Receive(); // apply messages
             rig.Client.PrepareRender(); // propagate render flags; EndFrame not yet called
 
-            DirtyFlags require = view.Data.GetRequiredFlags(new int3(1, 1, 1));
-            Assert.That(require & DirtyFlags.GeometryWithLocalNeighbor, Is.Not.EqualTo(DirtyFlags.None));
-            Assert.That(require & DirtyFlags.GeneralAutomata, Is.EqualTo(DirtyFlags.None));
+            BrickUpdateFlags require = view.Data.GetRequiredFlags(new int3(1, 1, 1));
+            Assert.That(require & BrickUpdateFlags.GeometryWithLocalNeighbor, Is.Not.EqualTo(BrickUpdateFlags.None));
+            Assert.That(require & BrickUpdateFlags.GeneralAutomata, Is.EqualTo(BrickUpdateFlags.None));
             Assert.That(CountRequiredBricks(view.Data, RendererFlags), Is.Not.Zero,
                 "the renderer has work to pick up");
 
@@ -1060,8 +1060,8 @@ namespace Caelix.Tests
             rig.Client.World.TryGetView(EntityA, out EntityView view);
             // The brick facing the removed region has to re-render.
             Assert.That(
-                view.Data.GetRequiredFlags(new int3(15, 4, 4)) & DirtyFlags.GeometryWithLocalNeighbor,
-                Is.Not.EqualTo(DirtyFlags.None));
+                view.Data.GetRequiredFlags(new int3(15, 4, 4)) & BrickUpdateFlags.GeometryWithLocalNeighbor,
+                Is.Not.EqualTo(BrickUpdateFlags.None));
             AssertBlockSlotsEqual(rig.World.GetEntity(EntityA), view.Data);
             Assert.That(view.Data.HasRegion(new int3(1, 0, 0)), Is.False);
         }
@@ -1283,8 +1283,8 @@ namespace Caelix.Tests
         /// <c>AddEmptySectorAt</c> — has nothing to replicate and never reaches the client.
         /// </summary>
         /// <summary>Require-update bits that make a brick worth a render job.</summary>
-        private const DirtyFlags RendererFlags =
-            DirtyFlags.GeometryWithLocalNeighbor | DirtyFlags.BlockBrickAdded | DirtyFlags.BlockBrickRemoved;
+        private const BrickUpdateFlags RendererFlags =
+            BrickUpdateFlags.GeometryWithLocalNeighbor | BrickUpdateFlags.BlockBrickAdded | BrickUpdateFlags.BlockBrickRemoved;
 
         /// <summary>Allocated bricks of one region.</summary>
         private static int CountBricksInRegion(VoxelEntityData data, int3 regionPos)
@@ -1300,7 +1300,7 @@ namespace Caelix.Tests
         }
 
         /// <summary>Bricks whose require-update flags meet <paramref name="mask"/>.</summary>
-        private static int CountRequiredBricks(VoxelEntityData data, DirtyFlags mask)
+        private static int CountRequiredBricks(VoxelEntityData data, BrickUpdateFlags mask)
         {
             var bricks = new Unity.Collections.NativeList<RequiredBrick>(16, Unity.Collections.Allocator.TempJob);
             data.CollectRequiredBricks(default, mask, includeEmpty: false, bricks);
@@ -1309,10 +1309,10 @@ namespace Caelix.Tests
             return count;
         }
 
-        /// <summary>True while any allocated brick still carries source dirty flags.</summary>
+        /// <summary>True while any allocated brick still carries dirty flags.</summary>
         private static bool AnyBrickDirty(VoxelEntityData data)
         {
-            foreach (BrickSourceFlags unused in data.EnumerateBrickSourceFlags(DirtyFlags.All, dirtyOnly: true))
+            foreach (BrickDirtyFlags unused in data.EnumerateBrickDirtyFlags(BrickUpdateFlags.All, dirtyOnly: true))
             {
                 return true;
             }

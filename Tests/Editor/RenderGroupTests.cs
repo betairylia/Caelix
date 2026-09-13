@@ -295,7 +295,7 @@ namespace Caelix.Tests
             {
                 data.SetBlock(new int3(1, 1, 1), new Block(1));          // brick (0,0,0)
                 data.SetBlock(new int3(200, 200, 200), new Block(1));    // brick (25,25,25)
-                data.PropagateDirtyFlags(DirtyFlags.All).Complete();
+                data.PropagateDirtyFlags(BrickUpdateFlags.All).Complete();
                 data.BuildChangeList();
 
                 NativeArray<BrickChange>.ReadOnly changes = data.Changes;
@@ -366,8 +366,8 @@ namespace Caelix.Tests
                 {
                     Key = keys[i],
                     Kind = ChangeKind.Updated,
-                    SourceFlags = DirtyFlags.Geometry,
-                    RequiredFlags = DirtyFlags.GeometryWithLocalNeighbor
+                    DirtyFlags = BrickUpdateFlags.Geometry,
+                    RequireUpdateFlags = BrickUpdateFlags.GeometryWithLocalNeighbor
                 };
             }
 

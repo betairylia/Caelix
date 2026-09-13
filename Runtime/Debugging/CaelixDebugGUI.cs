@@ -712,7 +712,7 @@ public class CaelixDebugGUI : MonoBehaviour
         // not have to hold storage; drawn last so it wins where both apply.
         var dirty = new NativeList<RequiredBrick>(64, Allocator.TempJob); // TempJob: the collector runs a job
         data.CollectRequiredBricks(
-            default, DirtyFlags.GeometryWithLocalNeighbor, includeEmpty: true, dirty);
+            default, BrickUpdateFlags.GeometryWithLocalNeighbor, includeEmpty: true, dirty);
         for (int i = 0; i < dirty.Length; i++)
         {
             int3 key = dirty[i].Key;

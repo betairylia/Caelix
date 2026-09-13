@@ -190,18 +190,18 @@ namespace Caelix.Tests
             }
         }
 
-        [TestCase(DirtyFlags.BlockBrickAdded)]
-        [TestCase(DirtyFlags.BlockBrickRemoved)]
-        [TestCase(DirtyFlags.GeometryWithLocalNeighbor)]
-        public void RendererRequireUpdateFlagsInvalidateChunk(DirtyFlags flags)
+        [TestCase(BrickUpdateFlags.BlockBrickAdded)]
+        [TestCase(BrickUpdateFlags.BlockBrickRemoved)]
+        [TestCase(BrickUpdateFlags.GeometryWithLocalNeighbor)]
+        public void RendererRequireUpdateFlagsInvalidateChunk(BrickUpdateFlags flags)
         {
             Assert.That(GroupMeshRenderer.RequiresRemesh((ushort)flags), Is.True);
         }
 
-        [TestCase(DirtyFlags.None)]
-        [TestCase(DirtyFlags.GeneralAutomata)]
-        [TestCase(DirtyFlags.Geometry)]
-        public void NonRendererRequireUpdateFlagsDoNotInvalidateChunk(DirtyFlags flags)
+        [TestCase(BrickUpdateFlags.None)]
+        [TestCase(BrickUpdateFlags.GeneralAutomata)]
+        [TestCase(BrickUpdateFlags.Geometry)]
+        public void NonRendererRequireUpdateFlagsDoNotInvalidateChunk(BrickUpdateFlags flags)
         {
             Assert.That(GroupMeshRenderer.RequiresRemesh((ushort)flags), Is.False);
         }

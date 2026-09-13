@@ -393,7 +393,7 @@ namespace Caelix
         }
 
         /// <summary>Host authoring helper. Runtime propagation is driven by the server tick.</summary>
-        public JobHandle PropagateDirtyFlags(DirtyFlags flags = DirtyFlags.All, bool async = false)
+        public JobHandle PropagateDirtyFlags(BrickUpdateFlags flags = BrickUpdateFlags.All, bool async = false)
         {
             return RequireServerData().PropagateDirtyFlags(flags, async);
         }

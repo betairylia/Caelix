@@ -46,7 +46,7 @@ namespace Caelix.Simulation
     /// names its own brick key and its operation, so nothing here knows how bricks are grouped in
     /// storage. A full entity contributes every allocated brick; a delta entity contributes its
     /// change list — a <see cref="ChangeKind.Removed"/> entry becomes a <see cref="BrickOp.Remove"/>
-    /// record, an updated entry whose source flags meet
+    /// record, an updated entry whose dirty flags meet
     /// <see cref="BrickReplication.ReplicationDirtyMask"/> becomes a <see cref="BrickOp.Update"/>.
     /// Records keep change-list order, so a key removed and recreated in one tick reaches the client
     /// as Remove then Update.
@@ -460,7 +460,7 @@ namespace Caelix.Simulation
                         {
                             Bricks.Add(new BrickWork { Entity = e, Key = change.Key, Op = BrickOp.Remove });
                         }
-                        else if ((change.SourceFlags & BrickReplication.ReplicationDirtyMask) != 0)
+                        else if ((change.DirtyFlags & BrickReplication.ReplicationDirtyMask) != 0)
                         {
                             Bricks.Add(new BrickWork { Entity = e, Key = change.Key, Op = BrickOp.Update });
                         }

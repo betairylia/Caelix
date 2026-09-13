@@ -86,7 +86,7 @@ namespace Caelix.Tests
             scope.Data.EnsureRegion(int3.zero);
             scope.Data.SetBlock(new int3(1, 1, 1), new Block(5));
             scope.Data.SetBlock(new int3(17, 1, 1), new Block(5));
-            scope.Data.PropagateDirtyFlags(DirtyFlags.All).Complete();
+            scope.Data.PropagateDirtyFlags(BrickUpdateFlags.All).Complete();
             scope.Data.BuildChangeList();
 
             NativeArray<BrickChange> changes = CopyChanges(scope.Data);
@@ -127,7 +127,7 @@ namespace Caelix.Tests
             scope.Data.EnsureRegion(int3.zero);
             scope.Data.SetBlock(new int3(1, 1, 1), new Block(5));
             scope.Data.SetBlock(new int3(17, 1, 1), new Block(5));
-            scope.Data.PropagateDirtyFlags(DirtyFlags.All).Complete();
+            scope.Data.PropagateDirtyFlags(BrickUpdateFlags.All).Complete();
             scope.Data.BuildChangeList();
 
             NativeArray<BrickChange> changes = CopyChanges(scope.Data);
@@ -170,7 +170,7 @@ namespace Caelix.Tests
             // Regions are 128 blocks per axis, so y 800 lies in region y index 6.
             scope.Data.EnsureRegion(new int3(0, 6, 0));
             scope.Data.SetBlock(new int3(1, 801, 1), new Block(5));
-            scope.Data.PropagateDirtyFlags(DirtyFlags.All).Complete();
+            scope.Data.PropagateDirtyFlags(BrickUpdateFlags.All).Complete();
             scope.Data.BuildChangeList();
 
             var empty = new NativeArray<BrickChange>(1, Allocator.TempJob);

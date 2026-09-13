@@ -31,7 +31,7 @@ namespace Caelix.Simulation
         public bool doAlienPropagation;
 
         /// <summary>Flags a moving (non-static) entity's bricks hand to their alien neighbors.</summary>
-        public DirtyFlags alienMotionDirtyMask;
+        public BrickUpdateFlags alienMotionDirtyMask;
 
         /// <summary>Query every allocated brick of every non-static entity, not only the dirty ones.</summary>
         public bool alienIncludeMovingBricks;
@@ -51,7 +51,7 @@ namespace Caelix.Simulation
                 physics = PhysicsWorldSettings.Default,
                 replicatedSlotMask = BrickReplication.DefaultReplicatedSlotMask,
                 doAlienPropagation = false,
-                alienMotionDirtyMask = DirtyFlags.GeneralAutomata,
+                alienMotionDirtyMask = BrickUpdateFlags.GeneralAutomata,
                 alienIncludeMovingBricks = true,
                 dragTimeoutSeconds = 0.5f,
             };
@@ -648,7 +648,7 @@ namespace Caelix.Simulation
                 for (int i = 0; i < entityKeys.Length; i++)
                 {
                     entities[entityKeys[i]].CollectRequiredBricks(
-                        entityKeys[i], DirtyFlags.All, includeEmpty: true,
+                        entityKeys[i], BrickUpdateFlags.All, includeEmpty: true,
                         automataTickBuf.BricksRequiredUpdate);
                 }
             }
@@ -706,7 +706,7 @@ namespace Caelix.Simulation
                     for (int i = 0; i < entityKeys.Length; i++)
                     {
                         VoxelEntityData e = entities[entityKeys[i]];
-                        handle = JobHandle.CombineDependencies(handle, e.PropagateDirtyFlags(DirtyFlags.All, true));
+                        handle = JobHandle.CombineDependencies(handle, e.PropagateDirtyFlags(BrickUpdateFlags.All, true));
 
                         // INVARIANT (load-bearing): the propagation phase may only ADD storage to an
                         // entity — it must never free or relocate what already exists — because the
@@ -777,7 +777,7 @@ namespace Caelix.Simulation
                 {
                     var request = BrickOverlapQueryBuilder.Build(ref Data, new BrickOverlapQuerySettings
                     {
-                        FlagsToPropagate = DirtyFlags.All,
+                        FlagsToPropagate = BrickUpdateFlags.All,
                         MotionDirtyMask = Config.alienMotionDirtyMask,
                         IncludeMovingBodies = Config.alienIncludeMovingBricks
                     });

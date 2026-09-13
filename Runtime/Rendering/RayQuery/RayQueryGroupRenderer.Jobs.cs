@@ -111,8 +111,8 @@ namespace Caelix.Rendering.RayQuery
                         continue;
                     }
 
-                    bool isAdded = (change.RequiredFlags & DirtyFlags.BlockBrickAdded) != 0;
-                    bool needRebuilt = (change.RequiredFlags & DirtyFlags.GeometryWithLocalNeighbor) != 0;
+                    bool isAdded = (change.RequireUpdateFlags & BrickUpdateFlags.BlockBrickAdded) != 0;
+                    bool needRebuilt = (change.RequireUpdateFlags & BrickUpdateFlags.GeometryWithLocalNeighbor) != 0;
                     if (!isAdded && !needRebuilt)
                     {
                         continue;
