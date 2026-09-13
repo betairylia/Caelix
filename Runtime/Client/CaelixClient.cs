@@ -209,16 +209,17 @@ namespace Caelix.Client
             {
                 try
                 {
-                    while (channel.TryReceive(out byte[] message))
+                    while (channel.TryReceiveLease(out ReceivedMessage message))
                     {
                         try
                         {
-                            Apply(message);
+                            Apply(ref message);
                         }
                         catch (Exception exception)
                         {
                             Debug.LogException(exception);
                         }
+                        finally { message.Dispose(); }
                     }
                 }
                 finally
@@ -252,9 +253,9 @@ namespace Caelix.Client
             }
         }
 
-        private void Apply(byte[] message)
+        private void Apply(ref ReceivedMessage message)
         {
-            var reader = new NetMessageReader(message);
+            var reader = new NetMessageReader(message.Buffer, message.Length);
             NetHeader header = NetHeader.Read(ref reader);
             // All observable messages are ordering barriers: callbacks and lifecycle handlers
             // must see preceding voxel writes, and may replace or free their storage.
@@ -331,7 +332,7 @@ namespace Caelix.Client
                     // Unknown entity: the whole message is dropped; nothing reads the payload.
                     if (GetOrCreateWorld(header.WorldId).TryGetView(m.Guid, out EntityView view))
                     {
-                        brickReceiveBatch.Add(view.Data, message, reader.Position, m.BrickCount);
+                        brickReceiveBatch.Add(view.Data, ref message, reader.Position, m.BrickCount);
                         ClientWorld.MarkBricksApplied(view);
                     }
 

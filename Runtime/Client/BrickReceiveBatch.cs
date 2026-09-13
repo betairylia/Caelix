@@ -28,6 +28,7 @@ namespace Caelix.Client
 
         private readonly BrickBatchApplier applier = new();
         private readonly List<GCHandle> pins = new();
+        private readonly List<ReceivedMessage> messages = new();
         private long pinnedBytes;
 
         /// <summary>
@@ -35,20 +36,23 @@ namespace Caelix.Client
         /// first record byte inside <paramref name="message"/>; the array is pinned until the next
         /// <see cref="Flush"/> returns.
         /// </summary>
-        public void Add(in VoxelEntityData data, byte[] message, int payloadOffset, int brickCount)
+        public void Add(in VoxelEntityData data, ref ReceivedMessage message, int payloadOffset, int brickCount)
         {
-            if (pins.Count > 0 && (pinnedBytes + message.Length > MaxPinnedBytes || pins.Count >= MaxMessages))
+            if (pins.Count > 0 && (pinnedBytes + message.Buffer.Length > MaxPinnedBytes || pins.Count >= MaxMessages))
             {
                 Flush();
             }
 
-            var pin = GCHandle.Alloc(message, GCHandleType.Pinned);
+            var pin = GCHandle.Alloc(message.Buffer, GCHandleType.Pinned);
             pins.Add(pin);
-            pinnedBytes += message.Length;
+            pinnedBytes += message.Buffer.Length;
+            int payloadLength = message.Length - payloadOffset;
+            messages.Add(message);
+            message = default; // this batch now owns the lease, even if decoding throws
             applier.Add(
                 in data,
                 (byte*)pin.AddrOfPinnedObject() + payloadOffset,
-                message.Length - payloadOffset,
+                payloadLength,
                 brickCount);
         }
 
@@ -74,6 +78,8 @@ namespace Caelix.Client
                 // Flush is the lifetime fence for the pinned input.
                 foreach (GCHandle pin in pins) pin.Free();
                 pins.Clear();
+                foreach (ReceivedMessage message in messages) message.Dispose();
+                messages.Clear();
                 pinnedBytes = 0;
             }
         }

@@ -34,12 +34,14 @@ TickSimulate
   fix the entity/body set for this tick
   begin automata writes on every entity with work on an automata channel
   collect the bricks with automata-channel work (geometry-only bricks are skipped) and build the read context
+  prepare the physics BVH and bind alien entity candidates per required brick
   run automata hooks and complete their jobs
   end automata writes (commits the pending buffers)
   clear consumed requireUpdate flags
   propagate local dirty flags (may add neighboring sectors)
   refresh Block occupancy masks and body properties
   apply forces and simulate physics
+  synchronize collision poses before the post-physics overlap query
   propagate alien influence using the stepped poses, if enabled
 Replicate
   publish entity state and changed bricks; drain world events
@@ -49,6 +51,14 @@ EndTick
 
 Worlds share the server's clock. The current loop completes simulation,
 replication, and end-of-tick work for one world before moving to the next world.
+
+The pre-voxel query expands source brick bounds by one voxel and stores candidate
+entity indices in reusable buffers. It shares the physics BVH with the post-physics
+query, while each stage produces its own results. All entities participating in
+alien reads must have bodies. Mass, occupancy, collision data and forces are still
+prepared after snapshot commits. See the
+[shared BVH contract](SERVER_CLIENT_ARCHITECTURE.md#automata-and-the-shared-physics-bvh)
+for stage lifetimes and ordering.
 
 Local propagation runs before physics. Cross-entity (alien) propagation runs after
 physics, using the overlap graph at the stepped poses. Alien propagation marks
@@ -118,5 +128,11 @@ Several server ticks can arrive before one client frame.
 - [Brick collection](../../Runtime/Simulation/Utils/CollectBrickJob.cs)
 - [Core enumerators and current collector limitation](https://github.com/betairylia/Caelix-Core/blob/main/Documentation~/reference/enumerators.md)
 - [Replication tests](../../Tests/Editor/ReplicationTests.cs), [Core propagation scenarios](https://github.com/betairylia/Caelix-Core/blob/main/Tests/Editor/DirtyPropagationScenarioTests.cs)
+- [Automata candidate and stage-order tests](../../Tests/Editor/AutomataEntityQueryTests.cs)
 
-These phases were reviewed from source. Unity tests were not rerun for this page.
+The original phase review was source-only. The shared-BVH changes were validated
+in Titania's connected Unity 6000.5.6f1 Editor on 2026-09-13: compilation passed and
+all six `AutomataEntityQueryTests` cases passed. The full EditMode suite passed
+433 of 434 tests; the unchanged `PackedMaterialShaderTests` emission expectation
+does not include the shader's `0.1` exposure multiplier. Play Mode and profiling
+remain manual validation.

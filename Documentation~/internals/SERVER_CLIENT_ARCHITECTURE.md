@@ -102,6 +102,31 @@ Rejected alternatives, and why:
 - PhysX is gone: no `Rigidbody`, no `UnityPhysicsCollider`, no
   `TemporaryCharacterCollider`, no `VoxelBody.physicsEnabled`.
 
+### Automata and the shared physics BVH
+
+After the topology boundary, entity/body membership, staticness and transforms stay
+fixed until physics. When simulation bricks require work, `PrepareSpatialQueries`
+refreshes collider storage views and body mappings, then builds the existing physics
+BVH from current poses and storage bounds. Every entity participating in alien reads
+must have a body. This preparation does not compute mass or apply forces.
+
+`CollectAutomataCandidates` queries each source entity's aggregate required-brick
+bounds, then narrows the returned entities per brick. Each source brick expands by
+one voxel in local space before its bounds are transformed. No target brick keys are
+enumerated. Reusable candidate indices and `RequiredBrick.AlienCandidateRange`
+preserve the existing alien-view priority independently of BVH traversal order.
+`AutomataReader` resolves blocks and metadata local-first through that range, using
+a `BrickCursor` within the read phase. Recreate readers after snapshot commits or
+storage mutation.
+
+After automata commits snapshots, normal dirty propagation, occupancy, collision
+data, mass properties and forces are prepared. Physics refreshes collider storage
+views again and rebuilds the static tree only if its bounds changed since spatial
+preparation; ordinary WireWorld state changes preserve these bounds. The dynamic
+tree is prepared for motion. Post-physics alien propagation keeps its own overlap
+results and synchronizes the collision world with the resulting poses before
+querying, including when simulation-time synchronization was disabled.
+
 ## 4. Authoring without a bake step
 
 `VoxelEntity` handles authoring and client view binding. `VoxelBody` supplies
@@ -323,9 +348,15 @@ A freed brick index keeps `BlockBrickRemoved | GeometryWithLocalNeighbor` dirty
 with every direction set. Propagation reads the flag arrays by index and never
 asks whether the brick still exists, so the 26 neighbours are re-rendered.
 
-The channel transfers ownership of received arrays. `BrickReceiveBatch` pins those
-arrays until its jobs complete, without staging another payload copy. It flushes
-at 64 MiB or 1,024 messages; a single oversized message runs alone. These limits
+`LocalChannel` copies sends into pooled buffers and transfers their ownership through
+`ReceivedMessage`. Its logical `Length` is separate from array capacity. The pool
+retains at most two arrays per size bucket up to 64 MiB; larger messages remain valid
+but are not retained for reuse. Legacy `INetChannel` implementations still work through
+an adapter, and legacy array receives return independent, exactly sized arrays.
+
+`BrickReceiveBatch` pins received buffers until its jobs complete, then releases the
+pins before returning the leases. It flushes at 64 MiB of actual array capacity or
+1,024 messages; a single oversized message runs alone. These limits
 bound retained apply input, not the channel inbox. Every non-brick message, creation
 of an unknown world (which raises a callback), and the end of `Receive` completes
 pending writes before observation or storage replacement. No apply job survives

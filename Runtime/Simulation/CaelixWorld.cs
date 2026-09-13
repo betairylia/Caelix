@@ -175,6 +175,7 @@ namespace Caelix.Simulation
 
         private AutomataStageInputs automataTickBuf;
         private NativeList<AlienEntityView> alienEntityViews;
+        private NativeList<int> alienCandidateIndices;
         private bool disposed;
         private long nextEntityInstanceId;
         private readonly Dictionary<Guid128, long> entityInstances = new();
@@ -195,6 +196,7 @@ namespace Caelix.Simulation
 
             automataTickBuf.BricksRequiredUpdate = new NativeList<RequiredBrick>(Allocator.Persistent);
             alienEntityViews = new NativeList<AlienEntityView>(Allocator.Persistent);
+            alienCandidateIndices = new NativeList<int>(Allocator.Persistent);
 
             Physics = new VoxelPhysicsWorld(config.physics);
             AutomataStage = new TickStage<AutomataStageInputs>();
@@ -217,6 +219,7 @@ namespace Caelix.Simulation
             Data.VoxelBodies.Dispose();
             automataTickBuf.BricksRequiredUpdate.Dispose();
             alienEntityViews.Dispose();
+            alienCandidateIndices.Dispose();
             AutomataStage.Dispose();
             Physics.Dispose();
         }
@@ -680,6 +683,14 @@ namespace Caelix.Simulation
             using (s_BuildAlienReadContextMarker.Auto())
             {
                 BuildAlienReadContext();
+                alienCandidateIndices.Clear();
+                if (automataTickBuf.BricksRequiredUpdateCount > 0 && !BlockEncoding.PackedSceneColor)
+                {
+                    Physics.PrepareSpatialQueries(ref Data);
+                    Physics.CollectAutomataCandidates(automataTickBuf.BricksRequiredUpdate,
+                        alienEntityViews.AsArray(), alienCandidateIndices);
+                }
+                automataTickBuf.ReadContext.AlienQuery.CandidateIndices = alienCandidateIndices.AsArray();
             }
 
             JobHandle tickHandle;

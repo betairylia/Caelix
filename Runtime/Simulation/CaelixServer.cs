@@ -306,10 +306,10 @@ namespace Caelix.Simulation
             {
                 ServerConnection connection = connections[c];
                 if (!connection.IsConnected) continue;
-                byte[] message;
+                ReceivedMessage message;
                 while (includeCommands
-                    ? connection.Channel.TryReceive(out message)
-                    : connection.Channel.TryReceive(IsQuery, out message))
+                    ? connection.Channel.TryReceiveLease(out message)
+                    : connection.Channel.TryReceiveLease(IsQuery, out message))
                 {
                     try
                     {
@@ -319,13 +319,14 @@ namespace Caelix.Simulation
                     {
                         Debug.LogException(exception);
                     }
+                    finally { message.Dispose(); }
                 }
             }
         }
 
-        private void Dispatch(ServerConnection connection, byte[] message)
+        private void Dispatch(ServerConnection connection, ReceivedMessage message)
         {
-            var reader = new NetMessageReader(message);
+            var reader = new NetMessageReader(message.Buffer, message.Length);
             NetHeader header = NetHeader.Read(ref reader);
             if (header.WorldId == NetHeader.NoWorld)
             {
