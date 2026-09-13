@@ -904,6 +904,16 @@ namespace Caelix.Simulation
         /// <summary>Saves every entity of this world (except those excluded from save) to a <c>.cxw</c> file.</summary>
         public void Save(string path)
         {
+            Save(path, WorldRecord.None);
+        }
+
+        /// <summary>
+        /// Saves every entity of this world (except those excluded from save) plus the given
+        /// world-level record (player pose) to a <c>.cxw</c> file. The world does not track a
+        /// player pose itself; the game supplies it.
+        /// </summary>
+        public void Save(string path, in WorldRecord world)
+        {
             var records = new List<EntitySaveRecord>(Data.VoxelEntities.Count);
             foreach (var kvp in Data.VoxelEntities)
             {
@@ -919,16 +929,17 @@ namespace Caelix.Simulation
                 records.Add(new EntitySaveRecord(kvp.Key, kvp.Value, hasBody, linearVelocity, angularVelocity));
             }
 
-            WorldSaver.Save(path, records);
+            WorldSaver.Save(path, records, in world);
         }
 
         /// <summary>
         /// Loads every entity stored in a <c>.cxw</c> file into this world. An entity whose guid
-        /// already exists is replaced.
+        /// already exists is replaced. Returns the file's world-level record (player pose); the
+        /// world does not apply it, the game does.
         /// </summary>
-        public void Load(string path)
+        public WorldRecord Load(string path)
         {
-            WorldLoader.Load(path, this);
+            return WorldLoader.Load(path, this);
         }
 
         bool IWorldLoadTarget.TryCreateEntity(in EntityRecord record, out VoxelEntityData data)

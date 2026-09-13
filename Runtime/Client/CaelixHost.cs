@@ -7,6 +7,7 @@ using UnityEditor;
 using UnityEngine;
 using Unity.Profiling;
 using Caelix.Client;
+using Caelix.IO;
 using Caelix.Net;
 using Caelix.Rendering.Meshing;
 using Caelix.Rendering.RayQuery;
@@ -398,14 +399,23 @@ namespace Caelix
 
         #region Save / Load
 
-        /// <summary>Saves the server world to a <c>.cxw</c> file at <paramref name="path"/>.</summary>
+        /// <summary>Saves the server world to a <c>.cxw</c> file at <paramref name="path"/> without a player pose.</summary>
         public void Save(string path)
+        {
+            Save(path, WorldRecord.None);
+        }
+
+        /// <summary>
+        /// Saves the server world plus a world-level record (player pose) to a <c>.cxw</c> file at
+        /// <paramref name="path"/>. The host does not know the player; the game passes the pose in.
+        /// </summary>
+        public void Save(string path, in WorldRecord world)
         {
             EnsureInitialized();
             if (!IsCurrent || !initialized)
                 throw new InvalidOperationException("Save/load requires an enabled, initialized host that owns the singleton slot.");
             path = EnsureWorldSaveExtension(path);
-            World.Save(path);
+            World.Save(path, in world);
         }
 
         [InspectorButton("Save World", PlayModeOnly = true)]
@@ -424,16 +434,19 @@ namespace Caelix
 
         /// <summary>
         /// Loads every entity stored in the <c>.cxw</c> file at <paramref name="path"/> into the
-        /// server world. The client spawns view objects for them on the next tick.
+        /// server world. The client spawns view objects for them on the next tick. Returns the
+        /// file's world-level record (player pose) for the game to apply; <see cref="WorldRecord.None"/>
+        /// for files older than format v7.
         /// </summary>
-        public void Load(string path)
+        public WorldRecord Load(string path)
         {
             EnsureInitialized();
             if (!IsCurrent || !initialized)
                 throw new InvalidOperationException("Save/load requires an enabled, initialized host that owns the singleton slot.");
             path = EnsureWorldSaveExtension(path);
-            World.Load(path);
+            WorldRecord world = World.Load(path);
             Debug.Log($"Loaded Caelix world from {path}", this);
+            return world;
         }
 
         [InspectorButton("Choose Save/Load Path")]
