@@ -199,7 +199,7 @@ namespace Caelix.Tests
         }
 
         [TestCase(BrickUpdateFlags.None)]
-        [TestCase(BrickUpdateFlags.GeneralAutomata)]
+        [TestCase(BrickUpdateFlags.Automata0)]
         [TestCase(BrickUpdateFlags.Geometry)]
         public void NonRendererRequireUpdateFlagsDoNotInvalidateChunk(BrickUpdateFlags flags)
         {

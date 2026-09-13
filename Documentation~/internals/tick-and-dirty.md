@@ -32,8 +32,8 @@ then processes each world in this order:
 ```text
 TickSimulate
   fix the entity/body set for this tick
-  begin automata writes on every entity with required work
-  collect required brick positions and build the read context
+  begin automata writes on every entity with work on an automata channel
+  collect the bricks with automata-channel work (geometry-only bricks are skipped) and build the read context
   run automata hooks and complete their jobs
   end automata writes (commits the pending buffers)
   clear consumed requireUpdate flags
@@ -59,10 +59,15 @@ local propagation, existing storage pointers must stay valid until its jobs fini
 
 1. Make a change through a world/sector setter at the appropriate boundary.
    Do not replace it with raw slot-memory writes that skip dirty bookkeeping.
-2. Let the world run its propagation phases. Block writes generate the configured
-   Block-change flags; other slot writes generate GeneralAutomata work.
+2. Let the world run its propagation phases. Every Block write raises the engine's
+   geometry bits. The simulation bits (`Automata0`..`Automata11`) come from the
+   writer's explicit mask, or, for a setter called without one, from the
+   application's `AutomataDefaults` tables (Block: previous and replacement id;
+   other slots: one default per slot). `AutomataBrick.SetDirty(mask)` raises
+   simulation bits without a write.
 3. In the next automata stage, consume `BricksRequiredUpdate` — a
-   `NativeList<RequiredBrick>` keyed by BRICK KEY — and read through
+   `NativeList<RequiredBrick>` keyed by BRICK KEY; every hook gets the same list and
+   selects its own channel by `RequiredBrick.Flags` inside its job — and read through
    `AutomataReadContext`: `ctx.OpenBrick(brick)` gives an `AutomataBrick` and
    `ctx.CreateReader(brick, access)` an alien-aware `AutomataReader`. Every
    coordinate is an ENTITY-LOCAL block position; writes stay inside the work brick.

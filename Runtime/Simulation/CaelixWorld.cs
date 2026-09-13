@@ -51,7 +51,7 @@ namespace Caelix.Simulation
                 physics = PhysicsWorldSettings.Default,
                 replicatedSlotMask = BrickReplication.DefaultReplicatedSlotMask,
                 doAlienPropagation = false,
-                alienMotionDirtyMask = BrickUpdateFlags.GeneralAutomata,
+                alienMotionDirtyMask = BrickUpdateFlags.Automata0,
                 alienIncludeMovingBricks = true,
                 dragTimeoutSeconds = 0.5f,
             };
@@ -103,7 +103,22 @@ namespace Caelix.Simulation
         public struct AutomataStageInputs
         {
             public NativeHashMap<Guid128, VoxelEntityData> VoxelEntities;
+
+            /// <summary>
+            /// Every brick with a simulation bit (<see cref="BrickUpdateFlags.AutomataMask"/>) pending,
+            /// including flagged positions that hold no brick yet. Each hook selects its own records by
+            /// testing <see cref="RequiredBrick.Flags"/> against its channel (and
+            /// <see cref="RequiredBrick.IsAllocated"/> if it cannot work on empty positions) at the top
+            /// of its job. Bricks with geometry-only work are not in the list.
+            /// </summary>
             public NativeList<RequiredBrick> BricksRequiredUpdate;
+
+            /// <summary>
+            /// <c>BricksRequiredUpdate.Length</c>, read by the world before the stage runs. Test this
+            /// to skip an empty tick: once an earlier hook has scheduled a job over the list, reading
+            /// its length on the main thread is a safety violation.
+            /// </summary>
+            public int BricksRequiredUpdateCount;
             public AutomataReadContext ReadContext;
         }
 
@@ -633,11 +648,16 @@ namespace Caelix.Simulation
             //  DON'T add/remove entities, toggle isStatic, move transforms
             /////////////////////////////////////////////////////////////////////////
 
+            // Only simulation bits schedule automata work. A sector or brick with geometry-only
+            // work gets no snapshot copy and no record; each hook picks its own channel out of
+            // the list inside its job.
+            const BrickUpdateFlags automataMask = BrickUpdateFlags.AutomataMask;
+
             using (s_BeginAutomataWritesMarker.Auto())
             {
                 for (int i = 0; i < entityKeys.Length; i++)
                 {
-                    entities[entityKeys[i]].BeginAutomataWrites();
+                    entities[entityKeys[i]].BeginAutomataWrites(automataMask);
                 }
             }
 
@@ -648,9 +668,13 @@ namespace Caelix.Simulation
                 for (int i = 0; i < entityKeys.Length; i++)
                 {
                     entities[entityKeys[i]].CollectRequiredBricks(
-                        entityKeys[i], BrickUpdateFlags.All, includeEmpty: true,
+                        entityKeys[i], automataMask, includeEmpty: true,
                         automataTickBuf.BricksRequiredUpdate);
                 }
+
+                // Read once here: a hook must not touch the list's length after an earlier hook
+                // scheduled a job over it.
+                automataTickBuf.BricksRequiredUpdateCount = automataTickBuf.BricksRequiredUpdate.Length;
             }
 
             using (s_BuildAlienReadContextMarker.Auto())

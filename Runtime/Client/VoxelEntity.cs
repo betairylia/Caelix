@@ -392,6 +392,22 @@ namespace Caelix
             RequireServerData().SetSlot(slotId, pos, value);
         }
 
+        /// <summary>
+        /// Writes a block raising exactly <paramref name="simulationFlags"/> instead of the
+        /// <see cref="AutomataDefaults"/> rules. Host mode only: a client command carries no mask.
+        /// </summary>
+        public void SetBlock(int3 pos, Block b, BrickUpdateFlags simulationFlags)
+        {
+            RequireServerData().SetBlock(pos, b, simulationFlags);
+        }
+
+        /// <summary>Explicit-mask slot write into server data. Host mode only.</summary>
+        public void SetSlot<T>(SectorSlotId slotId, int3 pos, T value, BrickUpdateFlags simulationFlags)
+            where T : unmanaged, IEquatable<T>
+        {
+            RequireServerData().SetSlot(slotId, pos, value, simulationFlags);
+        }
+
         /// <summary>Host authoring helper. Runtime propagation is driven by the server tick.</summary>
         public JobHandle PropagateDirtyFlags(BrickUpdateFlags flags = BrickUpdateFlags.All, bool async = false)
         {

@@ -85,7 +85,7 @@ namespace Caelix
         public bool doAlienPropagation = false;
 
         [Tooltip("Flags a moving (non-static) entity's bricks hand to their alien neighbors.")]
-        [SerializeField] private BrickUpdateFlags alienMotionDirtyMask = BrickUpdateFlags.GeneralAutomata;
+        [SerializeField] private BrickUpdateFlags alienMotionDirtyMask = BrickUpdateFlags.Automata0;
 
         [Tooltip("Query every allocated brick of every non-static entity, not only the dirty ones. " +
                  "This is the heaviest input the graph can get; keep it on to benchmark motion.")]
@@ -220,6 +220,7 @@ namespace Caelix
                 if (!Mathf.Approximately(Time.fixedDeltaTime, step))
                 {
                     Time.fixedDeltaTime = step;
+                    Time.maximumDeltaTime = step;
                 }
             }
 

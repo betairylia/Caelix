@@ -71,6 +71,48 @@ enumerators are appropriate for occupied-only algorithms once their masks are
 current. Automata cannot generally assume a mask reflects edits made just before
 the stage; rules that create cells also need to consider empty positions.
 
+## Pick your channel out of the list
+
+Require-update bits 0-11 are application channels (`BrickUpdateFlags.Automata0` ..
+`Automata11`); the engine gives them no meaning. Name the ones you use in your own
+code. The stage collects every brick with any channel bit pending (bricks with
+geometry-only work are not in the list) and hands the same list to every hook. A
+hook selects its own records at the top of its job:
+
+```csharp
+public const BrickUpdateFlags Channel = BrickUpdateFlags.Automata3;
+
+public void Execute(int index)                 // IJobParallelForDefer over inputs.BricksRequiredUpdate
+{
+    RequiredBrick brick = bricks[index];
+    if ((brick.Flags & Channel) == 0) return;  // another channel's work
+    if (!brick.IsAllocated) return;            // drop this line only if your rule grows into empty space
+    ...
+}
+```
+
+In the managed hook, test `inputs.BricksRequiredUpdateCount == 0` to skip
+scheduling on an empty tick, and return the incoming `chained` handle so later
+hooks keep their dependency. Never read the list's `Length` there: an earlier hook
+may already have scheduled a job over the list. The hook runs every tick even
+when the list is empty, so per-tick bookkeeping (draining queues, advancing a
+seed) stays deterministic.
+
+Writes name their channel. `access.SetBlock(pos, block, Channel)` and
+`access.SetSlot(slot, pos, value, Channel)` raise exactly that channel (plus the
+engine's geometry bookkeeping) and never consult the default tables. To be
+scheduled again next tick without changing a voxel, call
+`access.SetDirty(Channel)`; it marks the whole center brick dirty on that channel.
+If a rule must wake another automaton (a new electron head next to grass), OR that
+automaton's channel into the write that creates the trigger, and only then.
+
+Generic writes without a mask (player edits, importers) use the application's
+`AutomataDefaults` tables: a Block write raises `Blocks[previous.id] | Blocks[value.id]`,
+any other slot raises its slot default. Fill the tables once before the first
+generic write and the first tick; a `RuntimeInitializeOnLoadMethod` is the usual
+place. A generator that writes inert geometry passes `BrickUpdateFlags.None`
+explicitly so the air rule does not wake every automaton across a whole terrain.
+
 ## Read and write correctly
 
 - `BrickOrigin` and the reader's input positions are sector-local voxel coordinates.

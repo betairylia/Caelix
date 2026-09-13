@@ -331,7 +331,7 @@ namespace Caelix.Tests
 
             BrickUpdateFlags require = view.Data.GetRequiredFlags(new int3(1, 1, 1));
             Assert.That(require & BrickUpdateFlags.GeometryWithLocalNeighbor, Is.Not.EqualTo(BrickUpdateFlags.None));
-            Assert.That(require & BrickUpdateFlags.GeneralAutomata, Is.EqualTo(BrickUpdateFlags.None));
+            Assert.That(require & BrickUpdateFlags.Automata0, Is.EqualTo(BrickUpdateFlags.None));
             Assert.That(CountRequiredBricks(view.Data, RendererFlags), Is.Not.Zero,
                 "the renderer has work to pick up");
 
