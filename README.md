@@ -2,6 +2,8 @@
 
 **This repository is in an early research and experimental stage. Expect massive API changes.**
 
+I'm sorry that the current docs are very sloppy. Later I will write some proper docs by myself.
+
 <img width="480" height="560" align="center" alt="silly-bird-loop" src="https://github.com/user-attachments/assets/4e62968c-d537-4bd5-be48-49b1a0201753" />
 
 ---
