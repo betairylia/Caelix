@@ -18,13 +18,9 @@ the client holds a replica for rendering and tools. `CaelixHost` runs both local
 | Understand earlier decisions and measurements | [Historical documents](archive/index.md) |
 | Write or maintain a page | [Documentation guide](documentation-guide.md) |
 
-New contributors should read Get started, the storage model, and the tick page
-in that order. Before changing replication, also read the server/client contract
-and message guide. Historical reports retain their original evidence and are
-marked separately from newly checked introductions.
-
-Cross-repository links target `main`; new Core pages become available there after
-its documentation change is merged. Local source links follow the checked-out branch.
+Start with Get started. Read the owning contract before changing a subsystem.
+Cross-repository links target `main` and may await merging; local source links
+follow this checkout.
 
 ## Source and validation
 

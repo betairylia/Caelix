@@ -57,6 +57,14 @@ operations. Load replaces the entities named by the file and retains unrelated
 live entities. It is not a queued client edit. Reacquire data after replacement;
 a persistent GUID does not mean the underlying allocation is unchanged.
 
+`host.Save(path, in worldRecord)` includes optional player pose.
+`host.Load(path)` returns the record for the game to apply; `Save(path)` supplies
+`WorldRecord.None`. Current saves use version 8: version 7 added player pose,
+version 8 identifies application automata channels. Before loading older saves,
+configure `AutomataDefaults.LegacyGeneralAutomataFlags` to map pending legacy
+work to your channels. Save APIs were source-reviewed against Caelix `3d013d8`
+and Core `881efac3` on 2026-09-16.
+
 ## Author a traditional game with voxel objects
 
 For a “Unity, but voxel” workflow, place `VoxelEntity` components and authoring
@@ -81,22 +89,18 @@ edits and before applying forces. Use `client.AddForce` with
 `client.SetDrag` / `ReleaseDrag` for client input. Server code can inspect `world.TryGetBody`
 and change velocity through `world.SetBodyVelocity`.
 
-`VoxelEntity` keeps the host authoring helpers used by importers and generators,
-including slot/sector writes and allocated-brick refresh. Its unused record-copy,
-dirty-clear, voxel-collection, and explicit transform-sync wrappers have been
-removed. Server systems use `CaelixWorld` and `VoxelEntityData`; presentation reads
-`EntityView.Data`. The server owns simulation propagation and dirty lifetimes;
-`ClientWorld` owns the Geometry work needed by renderers.
+Server systems use `CaelixWorld` and `VoxelEntityData`; presentation reads
+`EntityView.Data`.
 
-`BodyProperties_UpdateOnServerTicksWithoutClientFrames` checks mass/inertia updates
-before any client frame, the absence of client `PhysicsInfo` storage and body
-components, and replicated body add/remove state.
-`AuthoredBody_ClientForcesWaitForServerStep` checks queued client forces and
-authored body removal. These are local Host checks.
-All 271 EditMode tests passed with this cleanup on 2026-09-06 using Unity
-6000.5.6f1 in the isolated Titania project.
-After restoring the component force wrappers, all 51 targeted lifecycle, Host,
-replication, meshing, and channel tests passed; the Host test calls `VoxelBody.AddForce`.
+<details>
+<summary>Historical component validation</summary>
+
+On 2026-09-06, the isolated Titania project (Unity 6000.5.6f1) passed 271 EditMode
+tests for the component cleanup. After restoring force wrappers, 51 targeted
+lifecycle, Host, replication, meshing, and channel tests passed. The Host test
+calls `VoxelBody.AddForce`. These results were not rerun for this documentation edit.
+
+</details>
 
 Keep presentation behavior on the Unity side, and resolve simulation targets by
 world ID and entity GUID. Use [registered events](commands-and-events.md) to trigger

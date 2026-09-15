@@ -2,6 +2,8 @@
 
 Status: Current implementation. Checked against Caelix `253d632` and Core
 `e5ead50` on 2026-09-06.
+Automata collection and commit order rechecked against Caelix `3d013d8` and
+Core `881efac3` on 2026-09-16 (source only).
 
 A tick consumes scheduled voxel work, commits changes, runs physics, and publishes
 replication. Dirty propagation schedules affected bricks for further work.
@@ -75,12 +77,10 @@ local propagation, existing storage pointers must stay valid until its jobs fini
    application's `AutomataDefaults` tables (Block: previous and replacement id;
    other slots: one default per slot). `AutomataBrick.SetDirty(mask)` raises
    simulation bits without a write.
-3. In the next automata stage, consume `BricksRequiredUpdate` — a
-   `NativeList<RequiredBrick>` keyed by BRICK KEY; every hook gets the same list and
-   selects its own channel by `RequiredBrick.Flags` inside its job — and read through
-   `AutomataReadContext`: `ctx.OpenBrick(brick)` gives an `AutomataBrick` and
-   `ctx.CreateReader(brick, access)` an alien-aware `AutomataReader`. Every
-   coordinate is an ENTITY-LOCAL block position; writes stay inside the work brick.
+3. In the next stage, each hook filters the shared `NativeList<RequiredBrick>`
+   by `RequiredBrick.Flags`. Open access with `ctx.OpenBrick(brick)` and a reader
+   with `ctx.CreateReader(brick, access)`. Keys use entity-local brick units;
+   reader/writer positions use entity-local block units. Write inside the work brick.
 4. Let the stage complete; `EndAutomataWrites` commits the pending buffers. Do not
    clear flags inside a hook.
 
@@ -125,7 +125,7 @@ Several server ticks can arrive before one client frame.
 - [World tick](../../Runtime/Simulation/CaelixWorld.cs): `TickSimulate`, `EndTick`
 - [Server driver](../../Runtime/Simulation/CaelixServer.cs): `Tick`, `Step`, `ProcessQueries`
 - [Host frame](../../Runtime/Client/CaelixHost.cs): `FixedUpdate`, `Update`
-- [Brick collection](../../Runtime/Simulation/Utils/CollectBrickJob.cs)
+- [Brick collection](https://github.com/betairylia/Caelix-Core/blob/main/Runtime/VoxelEntityData.Bricks.cs)
 - [Core enumerators and current collector limitation](https://github.com/betairylia/Caelix-Core/blob/main/Documentation~/reference/enumerators.md)
 - [Replication tests](../../Tests/Editor/ReplicationTests.cs), [Core propagation scenarios](https://github.com/betairylia/Caelix-Core/blob/main/Tests/Editor/DirtyPropagationScenarioTests.cs)
 - [Automata candidate and stage-order tests](../../Tests/Editor/AutomataEntityQueryTests.cs)
