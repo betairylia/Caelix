@@ -247,8 +247,10 @@ disabled. CAGI is deferred.
 2. Select the URP renderer asset and run **Tools > Caelix > GI Prototypes > Install On Selected
    Renderer**. This adds the prototype feature, assigns its shaders, and disables the existing
    regular/budget Caelix features on that asset.
-3. Open **Caelix GI Prototypes > Settings** and select **Approach**. Start with the default
-   resolution scale of `0.5`, one sample per pixel, and four scattering events.
+3. Open **Caelix GI Prototypes** and select **Approach**. The Inspector shows only that approach's
+   controls and remembers a separate set of values for each approach, including the common tracing
+   controls. **Apply Recommended Defaults** resets only the selected approach. Existing assets
+   keep their current values until reset; an approach's first selection uses its recommended values.
 4. Enter Play Mode with a world encoded for the active material mode. Stop Play Mode before
    changing approaches. For packed saves, enable `CAELIX_PACKED_SCENE_COLOR` in both Core's
    `BlockEncoding.cs` and `Shaders/def/CaelixMaterialConfig.hlsl`.
@@ -260,7 +262,9 @@ off-axis and stereo projections are outside this prototype.
 
 Keep resolution, samples, bounces, sky intensity, camera position, and scene state fixed between
 runs. **Accumulation Frames = 1** shows each frame's estimator without the common image average;
-larger values average a stationary camera and restart on camera movement. Warm caches separately
+larger values average a stationary camera and restart on camera movement. Subpixel jitter can hit
+different voxel faces within one pixel; this does not invalidate the stationary pixel average.
+Scene, material and lighting invalidation still reset it. Warm caches separately
 from cold runs. Equal sample counts do not imply equal ray counts: cache training and emitter
 visibility add work. Measure GPU time and image error rather than assuming equal cost.
 
@@ -305,7 +309,8 @@ to avoid overflow from half-float storage. The original `RayPayload` layout is u
 - NAADF adds one 64-byte candidate and a 16-byte fallback image per pixel, plus two sets of
   16-byte bucket metadata and eight 32-byte samples per 8x8 tile.
 - Face caches cost 192 bytes per slot, including keys, two histories, and accumulation. The
-  default 65536 slots costs 12 MiB; storage is independent of the world's total face count.
+  recommended radiance cache uses 1048576 slots (192 MiB); the guiding defaults use 65536 slots
+  (12 MiB). Storage is independent of the world's total face count.
   A full hash table falls back to tracing. Old entries expire according to **Cache Max Age**.
 - Emission mode adds 32 bytes per allocated renderer brick slot and a sum tree with
   `2 * nextPowerOfTwo(brickCount)` floats, plus 80 bytes per render group. Sparse brick-map holes
@@ -331,11 +336,57 @@ Implementation: [feature and settings](../../../Runtime/Rendering/GiPrototypes),
 [cache tests](../../../Tests/Editor/GiCacheTests.cs), and
 [resampling tests](../../../Tests/Editor/GiResamplingTests.cs).
 
-Validation on 2026-10-04 for the `astra/gi-prototypes` working tree: Unity 6000.5.6f1
-compilation passed; 62 focused GI Edit Mode tests and 11 renderer lifecycle/upload tests passed.
-The GPU fixtures exercise all six approaches, BSDF sampling/PDF agreement, cache and reservoir
-history, HDR presentation, and actual depth attachments. Full-scene Play Mode appearance,
-camera-depth integration with post effects, and performance comparisons remain manual checks.
+### Bistro comparison and defaults
+
+The 2026-10-04 comparison used Unity 6000.5.6f1, DX12, RTX 5080, packed Bistro 4096, and one
+stationary street view. The game view was 2560x1440 with GI at 1280x720. All rows below use
+**1 sample per pixel**, four scattering events, sky intensity 1, and 64-frame image accumulation.
+Each approach was selected before entering Play Mode and allowed to warm. GPU times are means
+from 118 valid samples over 120 frames of the GI pass. Storage counts prototype allocations only,
+excluding the voxel scene, acceleration structure, and URP targets.
+
+| Approach | GI GPU ms | GI storage MiB | Linear RGB RMSE |
+|---|---:|---:|---:|
+| Reference Path Tracing | 2.52 | 158.2 | 0.0140 |
+| Restir Gi | 5.07 | 341.0 | 0.0161 |
+| Naadf Inspired | 4.54 | 236.0 | 0.0161 |
+| Face Radiance Cache, 1048576 slots | 7.75 | 350.2 | 0.0131 |
+| Face Path Guiding, 65536 slots | 4.07 | 170.2 | 0.0146 |
+| Brick Emission Path Guiding, 65536 slots | 9.10 | 208.3 | 0.0127 |
+
+Error is measured from linear HDR output before UI composition against a separate 1-spp reference
+with 256-frame accumulation and the same bounce limit. Pixels with reference luminance outside
+0.001 to 1 are excluded so bright emitters cannot dominate the metric. The reference retains noise
+and truncates longer paths; these figures are a comparison for this view, not converged ground truth
+or an equal-time benchmark. Movement, other viewpoints, and material stress scenes need separate
+visual checks.
+
+- Common recommended values: resolution scale `0.5`, samples `1`, max bounces `4`, sky intensity `1`,
+  accumulation frames `64`. Accumulation restarts during camera movement.
+- ReSTIR/NAADF: spatial samples `4`, radius `8`, history frames `2`. ReSTIR max reservoir count `8`.
+  These reduce the patches and darkening seen with radius 24/history 8. Remaining mean luminance
+  was about 90% of reference for ReSTIR and 82% for NAADF; the sampled right wall was about 79% and
+  70%. Their biased reuse still needs a correctness pass before drawing performance conclusions.
+- Face radiance cache: capacity `1048576`, history samples `64`, minimum samples `4`, max age `120`.
+  Increasing capacity from 65536 to 1048576 reduced RMSE from 0.0145 to 0.0131, while increasing
+  GI time from 4.73 to 7.75 ms and storage from 170.2 to 350.2 MiB. Mean lighting was about 2%
+  brighter than the finite reference; the cached tail can include longer transport paths.
+- Both guiding modes: capacity `65536`, history samples `64`, minimum samples `4`, max age `120`,
+  guiding strength `0.5`. A 1048576-entry face guiding run used 350.2 MiB and 5.02 ms with RMSE
+  0.0151, so the larger table did not improve this view. Brick emission's larger cache was not tested.
+
+Face caching and brick emission guiding should approach similar illumination. Their distinction
+is the estimator: the former reuses diffuse radiance at secondary faces; the latter traces fresh
+guided paths and explicitly samples emitters. In this view brick emission gave the lowest measured
+error but cost substantially more than the reference tracer. The current face guiding implementation
+did not establish an advantage over reference tracing.
+
+This review fixed two implementation defects: a conditional expression executed both cache path
+estimators and polluted their histories, and face-identity rejection repeatedly reset stationary
+pixel accumulation under jitter. GPU regression tests reproduce both cases. Unity compilation and
+82 focused GI Edit Mode tests passed, including settings serialization and Undo/Redo, all six
+approaches, BSDF sampling/PDF agreement, cache/reservoir history, HDR presentation, and depth
+attachments. The earlier 11 renderer lifecycle/upload tests were not rerun in this visual review.
 
 ## One scene renderer at a time
 

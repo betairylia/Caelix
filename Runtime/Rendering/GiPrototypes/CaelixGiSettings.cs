@@ -21,16 +21,27 @@ namespace Caelix.Rendering.GiPrototypes
         [Range(1, 16)] public int samplesPerPixel = 1;
         [Range(0, 12)] public int maxBounces = 4;
         [Min(0)] public float skyIntensity = 1f;
-        [Range(1, 256)] public int accumulationFrames = 32;
+        [Range(1, 256)] public int accumulationFrames = 64;
         [Range(1, 16)] public int spatialSamples = 4;
-        [Range(1, 64)] public int spatialRadius = 24;
-        [Range(1, 32)] public int reservoirHistoryFrames = 8;
-        [Range(1, 256)] public int maxReservoirCount = 32;
+        [Range(1, 64)] public int spatialRadius = 8;
+        [Range(1, 32)] public int reservoirHistoryFrames = 2;
+        [Range(1, 256)] public int maxReservoirCount = 8;
         [Range(1024, 1048576)] public int cacheCapacity = 65536;
         [Range(1, 1024)] public int cacheHistorySamples = 64;
         [Range(1, 64)] public int cacheMinSamples = 4;
         [Range(1, 1024)] public int cacheMaxAge = 120;
         [Range(0f, 0.95f)] public float guidingStrength = 0.5f;
+
+        public static CaelixGiSettings Recommended(CaelixGiApproach approach)
+        {
+            if (!Enum.IsDefined(typeof(CaelixGiApproach), approach))
+                throw new ArgumentOutOfRangeException(nameof(approach));
+            return new CaelixGiSettings
+            {
+                approach = approach,
+                cacheCapacity = approach == CaelixGiApproach.FaceRadianceCache ? 1048576 : 65536
+            };
+        }
 
         public CaelixGiSettings ValidatedCopy()
         {
@@ -56,5 +67,6 @@ namespace Caelix.Rendering.GiPrototypes
 
         public bool UsesCache => approach >= CaelixGiApproach.FaceRadianceCache;
         public bool UsesReservoirs => approach == CaelixGiApproach.RestirGi || approach == CaelixGiApproach.NaadfInspired;
+        public bool UsesGuiding => approach == CaelixGiApproach.FacePathGuiding || approach == CaelixGiApproach.BrickEmissionPathGuiding;
     }
 }

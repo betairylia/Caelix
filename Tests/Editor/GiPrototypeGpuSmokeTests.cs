@@ -404,6 +404,32 @@ namespace Caelix.Tests
             }
         }
 
+        [TestCase(CaelixGiApproach.FaceRadianceCache)]
+        [TestCase(CaelixGiApproach.FacePathGuiding)]
+        [TestCase(CaelixGiApproach.BrickEmissionPathGuiding)]
+        public void CacheKernelsOnlyTrainTheirSelectedEstimator(CaelixGiApproach approach)
+        {
+            using var fixture = new Fixture(approach, true, 2);
+            fixture.Render();
+            var request = AsyncGPUReadback.Request(fixture.State.NextCacheHistory);
+            request.WaitForCompletion();
+            Assert.That(request.hasError, Is.False);
+            var words = request.GetData<uint>();
+            uint guideSamples = 0;
+            for (int slot = 0; slot < fixture.State.Settings.cacheCapacity; ++slot)
+            {
+                uint radianceCountBits = words[slot * 16 + 3];
+                uint guideCount = words[slot * 16 + 14];
+                guideSamples += guideCount;
+                if (approach == CaelixGiApproach.FaceRadianceCache)
+                    Assert.That(guideCount, Is.Zero, "Radiance caching must not also trace and train the guiding estimator.");
+                else
+                    Assert.That(radianceCountBits, Is.Zero, "Guiding must not also train the radiance estimator.");
+            }
+            if (approach != CaelixGiApproach.FaceRadianceCache)
+                Assert.That(guideSamples, Is.GreaterThan(0), "The selected guiding estimator must run.");
+        }
+
         private static void AssertColors(Color[] pixels, Color expected)
         {
             Assert.That(pixels.Length, Is.EqualTo(Size * Size));

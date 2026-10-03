@@ -9,29 +9,93 @@ namespace Caelix.EditorTools
     [CustomEditor(typeof(CaelixGiPrototypeFeature))]
     public sealed class CaelixGiPrototypeEditor : UnityEditor.Editor
     {
+        private SerializedProperty settings;
+        private SerializedProperty[] shaders;
+        private bool showShaders;
+
+        private void OnEnable()
+        {
+            settings = serializedObject.FindProperty("settings");
+            shaders = new[]
+            {
+                serializedObject.FindProperty("referenceShader"),
+                serializedObject.FindProperty("resamplingShader"),
+                serializedObject.FindProperty("cacheShader"),
+                serializedObject.FindProperty("cachePathShader"),
+                serializedObject.FindProperty("emissionShader"),
+                serializedObject.FindProperty("resolveShader"),
+                serializedObject.FindProperty("presentShader"),
+                serializedObject.FindProperty("depthCopyShader")
+            };
+        }
+
         public override void OnInspectorGUI()
         {
             serializedObject.Update();
+            var feature = (CaelixGiPrototypeFeature)target;
             using (new EditorGUI.DisabledScope(EditorApplication.isPlayingOrWillChangePlaymode))
             {
-                EditorGUILayout.PropertyField(serializedObject.FindProperty("settings"), true);
-                EditorGUILayout.PropertyField(serializedObject.FindProperty("referenceShader"));
-                EditorGUILayout.PropertyField(serializedObject.FindProperty("resamplingShader"));
-                EditorGUILayout.PropertyField(serializedObject.FindProperty("cacheShader"));
-                EditorGUILayout.PropertyField(serializedObject.FindProperty("cachePathShader"));
-                EditorGUILayout.PropertyField(serializedObject.FindProperty("emissionShader"));
-                EditorGUILayout.PropertyField(serializedObject.FindProperty("resolveShader"));
-                EditorGUILayout.PropertyField(serializedObject.FindProperty("presentShader"));
-                EditorGUILayout.PropertyField(serializedObject.FindProperty("depthCopyShader"));
+                var approach = (CaelixGiApproach)EditorGUILayout.EnumPopup("Approach", feature.settings.approach);
+                if (approach != feature.settings.approach)
+                {
+                    serializedObject.ApplyModifiedProperties();
+                    Undo.RecordObject(feature, "Change GI approach");
+                    feature.SelectApproach(approach);
+                    EditorUtility.SetDirty(feature);
+                    serializedObject.Update();
+                }
+
+                EditorGUILayout.Space();
+                EditorGUILayout.LabelField("Tracing", EditorStyles.boldLabel);
+                DrawSetting("resolutionScale");
+                DrawSetting("samplesPerPixel");
+                DrawSetting("maxBounces");
+                DrawSetting("skyIntensity");
+                DrawSetting("accumulationFrames");
+
+                if (feature.settings.UsesReservoirs)
+                {
+                    EditorGUILayout.Space();
+                    EditorGUILayout.LabelField("Sample Reuse", EditorStyles.boldLabel);
+                    DrawSetting("spatialSamples");
+                    DrawSetting("spatialRadius");
+                    DrawSetting("reservoirHistoryFrames");
+                    if (approach == CaelixGiApproach.RestirGi) DrawSetting("maxReservoirCount");
+                }
+                if (feature.settings.UsesCache)
+                {
+                    EditorGUILayout.Space();
+                    EditorGUILayout.LabelField("Face Cache", EditorStyles.boldLabel);
+                    DrawSetting("cacheCapacity");
+                    DrawSetting("cacheHistorySamples");
+                    DrawSetting("cacheMinSamples");
+                    DrawSetting("cacheMaxAge");
+                }
+                if (feature.settings.UsesGuiding) DrawSetting("guidingStrength");
+
+                EditorGUILayout.Space();
+                if (GUILayout.Button("Apply Recommended Defaults"))
+                {
+                    serializedObject.ApplyModifiedProperties();
+                    Undo.RecordObject(feature, "Reset GI approach settings");
+                    feature.ApplyRecommendedSettings();
+                    EditorUtility.SetDirty(feature);
+                    serializedObject.Update();
+                }
+
+                showShaders = EditorGUILayout.Foldout(showShaders, "Shader References", true);
+                if (showShaders)
+                    foreach (var shader in shaders) EditorGUILayout.PropertyField(shader);
             }
             serializedObject.ApplyModifiedProperties();
-            var feature = (CaelixGiPrototypeFeature)target;
             if (Application.isPlaying)
             {
                 EditorGUILayout.LabelField("Active approach", feature.ActiveApproach.ToString());
                 EditorGUILayout.LabelField("Allocated GPU storage", $"{feature.AllocatedBytes / (1024.0 * 1024.0):F1} MiB");
             }
         }
+
+        private void DrawSetting(string name) => EditorGUILayout.PropertyField(settings.FindPropertyRelative(name));
     }
 
     [InitializeOnLoad]

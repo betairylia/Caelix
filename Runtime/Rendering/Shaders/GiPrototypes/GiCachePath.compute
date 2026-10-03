@@ -238,7 +238,11 @@ void GiCachePathMain(uint2 pixel, uint mode)
     [loop] for (uint sampleIndex = 0u; sampleIndex < samples; ++sampleIndex)
     {
         uint rng = GiSeed(pixel, sampleIndex);
-        radiance += mode == 0u ? GiRadianceCachedPath(primary, ray, rng) : GiGuidedPath(primary, ray, mode == 2u, rng);
+        // HLSL conditional expressions can evaluate both operands, including cache writes.
+        if (mode == 0u)
+            radiance += GiRadianceCachedPath(primary, ray, rng);
+        else
+            radiance += GiGuidedPath(primary, ray, mode == 2u, rng);
     }
     g_GiOutputColor[pixel] = float4(GiSanitize(radiance / float(samples)), 1.0f);
 }

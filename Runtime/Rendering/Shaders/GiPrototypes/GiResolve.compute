@@ -21,12 +21,10 @@ RWTexture2D<float4> g_GiResolvedColor;
 void GiResolve(uint3 id : SV_DispatchThreadID)
 {
     if (any(id.xy >= g_GiResolution)) return;
-    uint index = id.x + id.y * g_GiResolution.x;
-    GiResolveSurface current = g_GiSurfaces[index];
-    GiResolveSurface previous = g_GiPreviousSurfaces[index];
     float4 color = float4(g_GiRawColor[id.xy].rgb, 1.0);
-    if (g_GiAccumulationValid != 0u && current.flags == previous.flags
-        && all(current.faceKey == previous.faceKey) && current.materialId == previous.materialId)
+    // The CPU validates the stationary camera and scene. Jitter intentionally samples
+    // different subpixel faces, so face identity must not restart the pixel average.
+    if (g_GiAccumulationValid != 0u)
     {
         float4 history = g_GiPreviousColor[id.xy];
         float count = min(history.a, float(max(1u, g_GiAccumulationLimit) - 1u));

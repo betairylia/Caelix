@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using Caelix.Rendering.RayQuery;
 using UnityEngine;
 using UnityEngine.Rendering;
@@ -18,6 +19,9 @@ namespace Caelix.Rendering.GiPrototypes
         public Shader presentShader;
         public Shader depthCopyShader;
 
+        [SerializeField, HideInInspector]
+        private List<CaelixGiSettings> approachSettings = new();
+
         [System.NonSerialized]
         private CaelixGiSettings capturedSettings;
         private CaelixGiPrototypePass pass;
@@ -27,6 +31,32 @@ namespace Caelix.Rendering.GiPrototypes
 
         public CaelixGiApproach ActiveApproach => capturedSettings?.approach ?? settings.approach;
         public long AllocatedBytes => pass?.AllocatedBytes ?? 0;
+
+        /// <summary>Stores the outgoing values and restores the selected approach's values.</summary>
+        public void SelectApproach(CaelixGiApproach approach)
+        {
+            if (Application.isPlaying)
+                throw new System.InvalidOperationException("Configure GI prototypes before entering Play Mode.");
+            if (!System.Enum.IsDefined(typeof(CaelixGiApproach), approach))
+                throw new System.ArgumentOutOfRangeException(nameof(approach));
+            if (settings.approach == approach) return;
+
+            approachSettings ??= new List<CaelixGiSettings>();
+            int outgoing = approachSettings.FindIndex(value => value != null && value.approach == settings.approach);
+            if (outgoing >= 0) approachSettings[outgoing] = settings.ValidatedCopy();
+            else approachSettings.Add(settings.ValidatedCopy());
+            var saved = approachSettings.Find(value => value != null && value.approach == approach);
+            settings = saved?.ValidatedCopy() ?? CaelixGiSettings.Recommended(approach);
+            ResetSession();
+        }
+
+        public void ApplyRecommendedSettings()
+        {
+            if (Application.isPlaying)
+                throw new System.InvalidOperationException("Configure GI prototypes before entering Play Mode.");
+            settings = CaelixGiSettings.Recommended(settings.approach);
+            ResetSession();
+        }
 
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
         internal static void BeginSession()

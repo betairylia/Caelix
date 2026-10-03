@@ -67,7 +67,7 @@ namespace Caelix.Tests
         [TestCase(true, 4)]
         [TestCase(false, 4)]
         [TestCase(true, 1)]
-        public void ResolveValidatesSurfaceIdentityAndPreservesFloat32Hdr(bool valid, int limit)
+        public void ResolveAccumulatesStationaryPixelSamplesAndPreservesFloat32Hdr(bool valid, int limit)
         {
             const int count = 8;
             using var state = new CaelixGiResources(count, 1, new CaelixGiSettings());
@@ -117,8 +117,8 @@ namespace Caelix.Tests
                 Color[] result = Read(state.ResolvedColor.rt);
                 for (int i = 0; i < count; ++i)
                 {
-                    bool matching = i == 0 || i >= 5;
-                    float weight = valid && matching ? Mathf.Min(history[i].a, limit - 1) : 0;
+                    // Jitter may sample another face, material, or sky inside this same static pixel.
+                    float weight = valid ? Mathf.Min(history[i].a, limit - 1) : 0;
                     Color expected = (raw[i] + history[i] * weight) / (weight + 1);
                     expected.a = weight + 1;
                     AssertColor(result[i], expected);

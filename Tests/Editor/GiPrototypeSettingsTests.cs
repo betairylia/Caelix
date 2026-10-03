@@ -7,6 +7,113 @@ namespace Caelix.Tests
     public class GiPrototypeSettingsTests
     {
         [Test]
+        public void ApproachValuesSurviveSwitchingAndSerialization()
+        {
+            var feature = ScriptableObject.CreateInstance<CaelixGiPrototypeFeature>();
+            var restored = ScriptableObject.CreateInstance<CaelixGiPrototypeFeature>();
+            try
+            {
+                var approaches = (CaelixGiApproach[])System.Enum.GetValues(typeof(CaelixGiApproach));
+                var expected = new string[approaches.Length];
+                foreach (var approach in approaches)
+                {
+                    feature.SelectApproach(approach);
+                    int index = (int)approach;
+                    feature.settings.samplesPerPixel = index + 1;
+                    feature.settings.accumulationFrames = 20 + index;
+                    feature.settings.maxBounces = index;
+                    feature.settings.skyIntensity = 0.5f + index;
+                    feature.settings.cacheCapacity = 1024 * (index + 1);
+                    feature.settings.spatialRadius = 10 + index;
+                    feature.settings.guidingStrength = index * 0.1f;
+                    expected[index] = JsonUtility.ToJson(feature.settings);
+                }
+                JsonUtility.FromJsonOverwrite(JsonUtility.ToJson(feature), restored);
+                foreach (var approach in approaches)
+                {
+                    restored.SelectApproach(approach);
+                    Assert.That(JsonUtility.ToJson(restored.settings), Is.EqualTo(expected[(int)approach]), approach.ToString());
+                }
+            }
+            finally
+            {
+                feature.ResetSession(); restored.ResetSession();
+                Object.DestroyImmediate(feature); Object.DestroyImmediate(restored);
+            }
+        }
+
+        [Test]
+        public void ExistingAssetValuesAreKeptAndResetAffectsOnlySelectedApproach()
+        {
+            var feature = ScriptableObject.CreateInstance<CaelixGiPrototypeFeature>();
+            try
+            {
+                feature.settings.approach = CaelixGiApproach.BrickEmissionPathGuiding;
+                feature.settings.cacheCapacity = 262144;
+                feature.settings.accumulationFrames = 19;
+                feature.SelectApproach(CaelixGiApproach.FaceRadianceCache);
+                feature.settings.cacheCapacity = 524288;
+                feature.ApplyRecommendedSettings();
+                Assert.That(JsonUtility.ToJson(feature.settings),
+                    Is.EqualTo(JsonUtility.ToJson(CaelixGiSettings.Recommended(CaelixGiApproach.FaceRadianceCache))));
+                feature.SelectApproach(CaelixGiApproach.BrickEmissionPathGuiding);
+                Assert.That(feature.settings.cacheCapacity, Is.EqualTo(262144));
+                Assert.That(feature.settings.accumulationFrames, Is.EqualTo(19));
+                var values = feature.settings;
+                feature.SelectApproach(CaelixGiApproach.BrickEmissionPathGuiding);
+                Assert.That(feature.settings, Is.SameAs(values));
+            }
+            finally { feature.ResetSession(); Object.DestroyImmediate(feature); }
+        }
+
+        [Test]
+        public void ApproachSelectionSupportsUndoAndRedo()
+        {
+            var feature = ScriptableObject.CreateInstance<CaelixGiPrototypeFeature>();
+            try
+            {
+                feature.settings.maxBounces = 9;
+                UnityEditor.Undo.RecordObject(feature, "Test GI selection");
+                feature.SelectApproach(CaelixGiApproach.FacePathGuiding);
+                UnityEditor.Undo.FlushUndoRecordObjects();
+                UnityEditor.Undo.PerformUndo();
+                Assert.That(feature.settings.approach, Is.EqualTo(CaelixGiApproach.ReferencePathTracing));
+                Assert.That(feature.settings.maxBounces, Is.EqualTo(9));
+                UnityEditor.Undo.PerformRedo();
+                Assert.That(feature.settings.approach, Is.EqualTo(CaelixGiApproach.FacePathGuiding));
+                feature.SelectApproach(CaelixGiApproach.ReferencePathTracing);
+                Assert.That(feature.settings.maxBounces, Is.EqualTo(9));
+            }
+            finally
+            {
+                UnityEditor.Undo.ClearUndo(feature);
+                feature.ResetSession(); Object.DestroyImmediate(feature);
+            }
+        }
+
+        [TestCase(CaelixGiApproach.ReferencePathTracing, false, false, false)]
+        [TestCase(CaelixGiApproach.RestirGi, true, false, false)]
+        [TestCase(CaelixGiApproach.NaadfInspired, true, false, false)]
+        [TestCase(CaelixGiApproach.FaceRadianceCache, false, true, false)]
+        [TestCase(CaelixGiApproach.FacePathGuiding, false, true, true)]
+        [TestCase(CaelixGiApproach.BrickEmissionPathGuiding, false, true, true)]
+        public void RecommendedDefaultsUseOneSampleAndRelevantControls(CaelixGiApproach approach,
+            bool reservoirs, bool cache, bool guiding)
+        {
+            var settings = CaelixGiSettings.Recommended(approach);
+            Assert.That(settings.approach, Is.EqualTo(approach));
+            Assert.That(settings.samplesPerPixel, Is.EqualTo(1));
+            Assert.That(settings.accumulationFrames, Is.EqualTo(64));
+            Assert.That(settings.cacheCapacity,
+                Is.EqualTo(approach == CaelixGiApproach.FaceRadianceCache ? 1048576 : 65536));
+            Assert.That(settings.UsesReservoirs, Is.EqualTo(reservoirs));
+            Assert.That(settings.UsesCache, Is.EqualTo(cache));
+            Assert.That(settings.UsesGuiding, Is.EqualTo(guiding));
+            Assert.That(JsonUtility.ToJson(settings.ValidatedCopy()), Is.EqualTo(JsonUtility.ToJson(settings)));
+            Assert.That(CaelixGiSettings.Recommended(approach), Is.Not.SameAs(settings));
+        }
+
+        [Test]
         public void SelectionAndSettingsRemainFrozenWithinSession()
         {
             var feature = ScriptableObject.CreateInstance<CaelixGiPrototypeFeature>();
