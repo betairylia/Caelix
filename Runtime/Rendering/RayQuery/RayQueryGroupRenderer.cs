@@ -517,6 +517,7 @@ namespace Caelix.Rendering.RayQuery
             Matrix4x4 objectToWorld =
                 entity.LocalToWorld *
                 Matrix4x4.Translate(grouping.BlockOrigin(groupKey).ToVector3Int());
+            GiSceneChanged = !hasPreviousObjectToWorld || objectToWorld != previousObjectToWorld;
 
             // Set for the frame an entity flips to static (including the initial flip on a
             // born-static body). Collapsing prev onto the current transform zeroes the motion
@@ -547,6 +548,7 @@ namespace Caelix.Rendering.RayQuery
             // acceleration structure.
             bool rangeMoved = hasPool && (brickBaseWords != publishedBrickBase || brickPage != publishedPage);
             bool republishesRecord = rangeMoved && hasRenderable;
+            GiSceneChanged |= rebuildsInstance || republishesRecord;
 
             if (rebuildsInstance || retracksInstance || republishesRecord)
             {
@@ -594,6 +596,19 @@ namespace Caelix.Rendering.RayQuery
 
             ReleaseStaleAabbBuffer(ref AS, rebuildsInstance);
             return rebuildsInstance;
+        }
+
+        internal bool GiSceneChanged { get; private set; }
+
+        internal bool TryGetGiGroup(CaelixRayQueryInstanceTable table,
+            out Matrix4x4 transform, out int page, out int brickBase, out int brickCount, out uint token)
+        {
+            transform = previousObjectToWorld;
+            page = publishedPage;
+            brickBase = publishedBrickBase;
+            brickCount = BrickBufferSize;
+            token = instanceSlot >= 0 ? table.GetLifetimeToken(instanceSlot) : 0;
+            return hasRenderable && PublishedRecordMatchesPool && token != 0 && brickCount > 0;
         }
 
         /// <summary>

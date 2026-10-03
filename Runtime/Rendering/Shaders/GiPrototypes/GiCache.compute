@@ -1,0 +1,59 @@
+#pragma kernel ClearGiCache
+#pragma kernel ResolveGiCache
+#pragma target 5.0
+#pragma use_dxc
+
+#include "GiCache.hlsl"
+
+[numthreads(64, 1, 1)]
+void ClearGiCache(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= g_GiCacheCapacity) return;
+    g_GiCacheKeys[id.x] = (GiCacheKey)0;
+    g_GiCacheAccum[id.x] = (GiCacheAccumulation)0;
+    // Dispatch once for each history buffer when initializing or invalidating.
+    g_GiCacheNextHistory[id.x] = (GiCacheHistory)0;
+}
+
+[numthreads(64, 1, 1)]
+void ResolveGiCache(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= g_GiCacheCapacity) return;
+    uint slot = id.x;
+    GiCacheHistory h = g_GiCacheHistory[slot];
+    GiCacheAccumulation a = g_GiCacheAccum[slot];
+    uint radianceCount = min(a.irradianceCount, GI_CACHE_FRAME_SAMPLES);
+    uint guideCount = min(a.guideCount, GI_CACHE_FRAME_SAMPLES);
+    if (radianceCount > 0u)
+    {
+        float previousCount = min(h.irradiance.w, float(max(1u, g_GiCacheHistoryLimit)));
+        if (g_GiCacheFrame - h.age.x > g_GiCacheMaxAge) previousCount = 0.0f;
+        float denominator = previousCount + float(radianceCount);
+        h.irradiance.xyz = (h.irradiance.xyz * previousCount + float3(a.irradiance) / GI_CACHE_FIXED_SCALE) / denominator;
+        h.irradiance.w = min(denominator, float(max(1u, g_GiCacheHistoryLimit)));
+        h.age.x = g_GiCacheFrame;
+    }
+    if (guideCount > 0u)
+    {
+        float previousCount = float(min(h.age.z, max(1u, g_GiCacheHistoryLimit)));
+        if (g_GiCacheFrame - h.age.y > g_GiCacheMaxAge) previousCount = 0.0f;
+        float denominator = previousCount + float(guideCount);
+        [unroll] for (uint bin = 0u; bin < 8u; ++bin)
+        {
+            float previous = bin < 4u ? h.guide0[bin] : h.guide1[bin - 4u];
+            float next = (previous * previousCount + float(a.guide[bin]) / GI_CACHE_FIXED_SCALE) / denominator;
+            if (bin < 4u) h.guide0[bin] = next;
+            else h.guide1[bin - 4u] = next;
+        }
+        h.age.y = g_GiCacheFrame;
+        h.age.z = min(uint(denominator), max(1u, g_GiCacheHistoryLimit));
+    }
+    if (g_GiCacheKeys[slot].state != 2u ||
+        (g_GiCacheFrame - max(h.age.x, h.age.y) > g_GiCacheMaxAge && radianceCount == 0u && guideCount == 0u))
+    {
+        g_GiCacheKeys[slot] = (GiCacheKey)0;
+        h = (GiCacheHistory)0;
+    }
+    g_GiCacheNextHistory[slot] = h;
+    g_GiCacheAccum[slot] = (GiCacheAccumulation)0;
+}

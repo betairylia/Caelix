@@ -33,6 +33,7 @@ namespace Caelix.Rendering.RayQuery
         /// </summary>
         public uint page;
 
+        /// <summary>Unique allocation lifetime used by sparse GI face keys. Matches HLSL pad1.</summary>
         public uint pad1;
 
         /// <summary>Size of one record in bytes; the structured buffer's stride.</summary>
@@ -66,6 +67,9 @@ namespace Caelix.Rendering.RayQuery
         private readonly Stack<int> freeSlots = new();
         private int highWater;
         private bool dirty;
+        private static uint nextLifetimeToken;
+
+        public uint GetLifetimeToken(int slot) => host[slot].pad1;
 
         public CaelixRayQueryInstanceTable()
         {
@@ -75,19 +79,16 @@ namespace Caelix.Rendering.RayQuery
         /// <summary>Reserves a slot, reusing a freed one when possible.</summary>
         public int Allocate()
         {
-            if (freeSlots.Count > 0)
-            {
-                dirty = true;
-                return freeSlots.Pop();
-            }
-
-            if (highWater >= Capacity)
+            if (freeSlots.Count == 0 && highWater >= Capacity)
             {
                 Grow(Capacity * 2);
             }
 
+            int slot = freeSlots.Count > 0 ? freeSlots.Pop() : highWater++;
+            if (++nextLifetimeToken == 0) ++nextLifetimeToken;
+            host[slot].pad1 = nextLifetimeToken;
             dirty = true;
-            return highWater++;
+            return slot;
         }
 
         /// <summary>Returns a slot and zeroes its record, so a stale transform cannot be read.</summary>
@@ -117,7 +118,8 @@ namespace Caelix.Rendering.RayQuery
                 prevRow3 = prevObjectToWorld.GetRow(3),
                 brickBase = (uint)brickBaseWords,
                 hashSeed = hashSeed,
-                page = (uint)page
+                page = (uint)page,
+                pad1 = host[slot].pad1
             };
 
             dirty = true;

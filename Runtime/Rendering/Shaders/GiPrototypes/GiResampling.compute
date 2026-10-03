@@ -1,0 +1,431 @@
+#pragma target 5.0
+#pragma use_dxc
+#pragma require inlineraytracing Int64
+#pragma multi_compile _ CAELIX_GROUP_3_3_3 CAELIX_GROUP_5_5_5 CAELIX_GROUP_4_7_4
+#pragma kernel GiGenerateCandidates
+#pragma kernel GiRestirTemporal
+#pragma kernel GiRestirSpatial
+#pragma kernel GiNaadfBuildBuckets
+#pragma kernel GiNaadfSpatial
+#pragma kernel CaelixBakeMaterialsAlbedo
+#pragma kernel CaelixBakeMaterialsEmission
+#pragma kernel CaelixBakeMaterialsScalars
+
+#include "GiCommon.hlsl"
+#include "GiResamplingData.hlsl"
+
+RWStructuredBuffer<GiReservoir> g_GiCandidates;
+RWStructuredBuffer<GiReservoir> g_GiTemporalReservoirs;
+StructuredBuffer<GiReservoir> g_GiReservoirHistory;
+RWStructuredBuffer<GiReservoir> g_GiReservoirOutput;
+StructuredBuffer<GiSurface> g_GiPreviousSurfaces;
+RWTexture2D<float4> g_GiFallback;
+
+RWStructuredBuffer<GiSampleBucket> g_GiBuckets;
+StructuredBuffer<GiSampleBucket> g_GiPreviousBuckets;
+RWStructuredBuffer<GiCompressedSample> g_GiBucketSamples;
+StructuredBuffer<GiCompressedSample> g_GiPreviousBucketSamples;
+
+uint g_GiResetHistory;
+uint g_GiNaadfHistoryValid;
+uint g_GiSpatialSamples;
+uint g_GiSpatialRadius;
+uint g_GiMaxHistoryFrames;
+uint g_GiMaxReservoirCount;
+float4x4 g_GiPreviousWorldToCamera;
+float2 g_GiPreviousJitter;
+
+uint GiRsIndex(uint2 pixel)
+{
+    return pixel.x + pixel.y * g_GiResolution.x;
+}
+
+uint2 GiRsBucketDimensions()
+{
+    return (g_GiResolution + GI_BUCKET_WIDTH - 1u) / GI_BUCKET_WIDTH;
+}
+
+bool GiRsReusable(GiSurface surface)
+{
+    if (!GiHasHit(surface) || !IsOpaque(int(surface.materialId)) || g_GiMaxBounces == 0u)
+        return false;
+    GiBsdf bsdf = GiMakeBsdf(surface, 0u);
+    return !GiIsDelta(bsdf) || any(GiDiffuseReflectance(bsdf) > 0.0f);
+}
+
+float3 GiRsResponse(GiSurface surface, GiReservoir sample, out float3 direction, out float jacobian)
+{
+    jacobian = GiRsJacobian(sample, surface.position, direction);
+    if ((sample.flags & GI_RESERVOIR_VALID) == 0u || jacobian <= 0.0f)
+        return 0.0f;
+    float3 f;
+    float pdf;
+    float3 wo = normalize(g_GiCameraPosition - surface.position);
+    GiEvaluate(GiMakeBsdf(surface, 0u), surface.normal, wo, direction, f, pdf);
+    return GiRsFinite(f * abs(dot(surface.normal, direction)) * sample.radiance);
+}
+
+bool GiRsVisible(GiSurface surface, GiReservoir sample)
+{
+    bool sky = (sample.flags & GI_RESERVOIR_SKY) != 0u;
+    float3 direction = sky ? sample.position : normalize(sample.position - surface.position);
+    RayDesc ray = GiRayFromSurface(surface, direction);
+    if (!sky)
+    {
+        float3 segment = sample.position - ray.Origin;
+        float distance = length(segment);
+        if (distance < 2.0f * K_RAY_ORIGIN_PUSH_OFF)
+            return false;
+        ray.Direction = segment / distance;
+        ray.TMax = max(0.0f, distance - K_RAY_ORIGIN_PUSH_OFF);
+    }
+    GiSurface obstruction;
+    return !GiTrace(ray, obstruction);
+}
+
+void GiRsUpdate(inout GiReservoir reservoir, inout float weightSum,
+    GiReservoir candidate, float target, float weight, uint count, inout uint rng)
+{
+    uint newCount = reservoir.count + count;
+    if (weight > 0.0f && !isnan(weight) && !isinf(weight))
+    {
+        weightSum += weight;
+        if (GiRandom(rng) * weightSum < weight)
+        {
+            reservoir = candidate;
+            reservoir.target = target;
+        }
+    }
+    reservoir.count = newCount;
+}
+
+void GiRsFinalize(inout GiReservoir reservoir, float weightSum, float3 receiver)
+{
+    reservoir.sourcePosition = receiver;
+    reservoir.weight = reservoir.target > 0.0f && reservoir.count > 0u
+        ? weightSum / (float(reservoir.count) * reservoir.target) : 0.0f;
+    if (reservoir.weight <= 0.0f || isnan(reservoir.weight) || isinf(reservoir.weight))
+    {
+        reservoir.weight = 0.0f;
+        reservoir.flags = 0u;
+    }
+}
+
+// Keep the secondary Lambertian component and emission in the reused estimate.
+// Its directional remainder shares the traced continuation but stays at the
+// original pixel. Reconnection therefore never assumes glass or GGX is diffuse.
+GiReservoir GiRsInitialSample(GiSurface primary, float3 wo, inout uint rng, out float3 remainder)
+{
+    GiReservoir candidate = (GiReservoir)0;
+    candidate.count = 1u;
+    candidate.sourcePosition = primary.position;
+    candidate.frame = g_GiFrameIndex;
+    remainder = 0.0f;
+    GiBsdf primaryBsdf = GiMakeBsdf(primary, 0u);
+    GiBsdfSample first = GiSample(primaryBsdf, primary.normal, wo, rng);
+    if (first.pdf <= 0.0f || !any(first.weight > 0.0f))
+        return candidate;
+
+    RayDesc firstRay = GiRayFromSurface(primary, first.direction);
+    if (first.delta != 0u)
+    {
+        remainder = first.weight * GiTracePath(firstRay, 0u, rng, g_GiMaxBounces - 1u);
+        return candidate;
+    }
+
+    GiSurface secondary;
+    candidate.flags = GI_RESERVOIR_VALID;
+    candidate.weight = rcp(first.pdf);
+    if (!GiTrace(firstRay, secondary))
+    {
+        candidate.flags |= GI_RESERVOIR_SKY;
+        candidate.position = first.direction;
+        candidate.packedNormal = CaelixPackWorldNormal(-first.direction);
+        candidate.radiance = GiSky(first.direction);
+        return candidate;
+    }
+
+    candidate.position = secondary.position;
+    float3 secondaryNormal = dot(secondary.normal, -first.direction) >= 0.0f ? secondary.normal : -secondary.normal;
+    candidate.packedNormal = CaelixPackWorldNormal(secondaryNormal);
+    GiBsdf secondaryBsdf = GiMakeBsdf(secondary, 0u);
+    candidate.radiance = secondaryBsdf.emission;
+    if (g_GiMaxBounces < 2u)
+        return candidate;
+
+    GiBsdfSample second = GiSample(secondaryBsdf, secondary.normal, -first.direction, rng);
+    if (second.pdf <= 0.0f || !any(second.weight > 0.0f))
+        return candidate;
+    uint medium = GiNextMedium(secondaryBsdf, second, 0u);
+    float3 continuation = GiTracePath(GiRayFromSurface(secondary, second.direction), medium, rng, g_GiMaxBounces - 2u);
+    float3 diffuseWeight = 0.0f;
+    if (second.delta == 0u && second.transmission == 0u)
+        diffuseWeight = GiDiffuseReflectance(secondaryBsdf)
+            * (max(0.0f, dot(secondaryNormal, second.direction)) / (GI_PI * second.pdf));
+    candidate.radiance += diffuseWeight * continuation;
+    remainder = first.weight * max(0.0f, second.weight - diffuseWeight) * continuation;
+    candidate.radiance = GiRsFinite(candidate.radiance);
+    return candidate;
+}
+
+[numthreads(8, 8, 1)]
+void GiGenerateCandidates(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint2 pixel = dispatchId.xy;
+    if (any(pixel >= g_GiResolution)) return;
+    _CaelixLaunchIndex = pixel;
+    uint index = GiRsIndex(pixel);
+    GiSurface surface = g_GiSurfaces[index];
+    RayDesc cameraRay = GiCameraRay(pixel, g_GiJitter);
+    GiReservoir reservoir = (GiReservoir)0;
+    float3 fallback = GiHasHit(surface) ? GiMakeBsdf(surface, 0u).emission : GiSky(cameraRay.Direction);
+    uint sampleCount = max(1u, g_GiSamplesPerPixel);
+    if (GiRsReusable(surface))
+    {
+        float weightSum = 0.0f;
+        float3 directionalRemainder = 0.0f;
+        for (uint sampleIndex = 0u; sampleIndex < sampleCount; ++sampleIndex)
+        {
+            uint rng = GiSeed(pixel, sampleIndex);
+            float3 remainder;
+            GiReservoir candidate = GiRsInitialSample(surface, -cameraRay.Direction, rng, remainder);
+            float3 direction;
+            float jacobian;
+            float3 response = GiRsResponse(surface, candidate, direction, jacobian);
+            float target = GiRsLuminance(response);
+            GiRsUpdate(reservoir, weightSum, candidate, target, target * candidate.weight, 1u, rng);
+            directionalRemainder += GiRsFinite(remainder);
+        }
+        GiRsFinalize(reservoir, weightSum, surface.position);
+        fallback += directionalRemainder / float(sampleCount);
+    }
+    else if (GiHasHit(surface) && g_GiMaxBounces > 0u)
+    {
+        fallback = 0.0f;
+        for (uint sampleIndex = 0u; sampleIndex < sampleCount; ++sampleIndex)
+        {
+            uint rng = GiSeed(pixel, sampleIndex);
+            fallback += GiTraceFromSurface(surface, -cameraRay.Direction, 0u, rng, g_GiMaxBounces);
+        }
+        fallback /= float(sampleCount);
+    }
+    g_GiCandidates[index] = reservoir;
+    g_GiFallback[pixel] = float4(GiRsFinite(fallback), 1.0f);
+}
+
+bool GiRsPreviousPixel(GiSurface surface, out uint2 pixel)
+{
+    pixel = 0u;
+    float3 view = mul(g_GiPreviousWorldToCamera, float4(surface.previousPosition, 1.0f)).xyz;
+    if (view.z >= -1e-5f) return false;
+    float2 ndc = view.xy / (-view.z * float2(g_GiAspect * g_GiZoom, g_GiZoom));
+    int2 projected = int2(floor((ndc * 0.5f + 0.5f) * g_GiResolution - g_GiPreviousJitter));
+    if (any(projected < 0) || any(projected >= int2(g_GiResolution))) return false;
+    pixel = uint2(projected);
+    GiSurface previous = g_GiPreviousSurfaces[GiRsIndex(pixel)];
+    return GiHasHit(previous) && all(previous.faceKey == surface.faceKey)
+        && previous.materialId == surface.materialId && dot(previous.normal, surface.normal) > 0.95f;
+}
+
+bool GiRsTemporalHistory(GiSurface surface, out GiReservoir previous)
+{
+    previous = (GiReservoir)0;
+    uint2 previousPixel;
+    if (g_GiResetHistory != 0u || !GiRsPreviousPixel(surface, previousPixel))
+        return false;
+    previous = g_GiReservoirHistory[GiRsIndex(previousPixel)];
+    return g_GiFrameIndex - previous.frame < max(1u, g_GiMaxHistoryFrames);
+}
+
+void GiRsMerge(inout GiReservoir result, inout float sum, GiSurface surface,
+    GiReservoir candidate, inout uint rng)
+{
+    uint count = min(candidate.count, max(1u, g_GiMaxReservoirCount));
+    float3 direction;
+    float jacobian;
+    float3 response = GiRsResponse(surface, candidate, direction, jacobian);
+    float target = GiRsLuminance(response);
+    float weight = target * candidate.weight * float(count) * jacobian;
+    GiRsUpdate(result, sum, candidate, target, weight, count, rng);
+}
+
+[numthreads(8, 8, 1)]
+void GiRestirTemporal(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint2 pixel = dispatchId.xy;
+    if (any(pixel >= g_GiResolution)) return;
+    _CaelixLaunchIndex = pixel;
+    uint index = GiRsIndex(pixel);
+    GiSurface surface = g_GiSurfaces[index];
+    GiReservoir result = (GiReservoir)0;
+    float weightSum = 0.0f;
+    uint rng = GiSeed(pixel, 0xf15a34u);
+    if (GiRsReusable(surface))
+    {
+        GiRsMerge(result, weightSum, surface, g_GiCandidates[index], rng);
+        GiReservoir previous;
+        if (GiRsTemporalHistory(surface, previous))
+            GiRsMerge(result, weightSum, surface, previous, rng);
+        GiRsFinalize(result, weightSum, surface.position);
+    }
+    g_GiTemporalReservoirs[index] = result;
+}
+
+bool GiRsNeighbor(uint2 pixel, inout uint rng, out uint2 neighbor)
+{
+    float angle = GiRandom(rng) * (2.0f * GI_PI);
+    float radius = sqrt(GiRandom(rng)) * float(g_GiSpatialRadius);
+    int2 coord = int2(pixel) + int2(round(float2(cos(angle), sin(angle)) * radius));
+    neighbor = uint2(max(coord, 0));
+    return all(coord >= 0) && all(coord < int2(g_GiResolution));
+}
+
+[numthreads(8, 8, 1)]
+void GiRestirSpatial(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint2 pixel = dispatchId.xy;
+    if (any(pixel >= g_GiResolution)) return;
+    _CaelixLaunchIndex = pixel;
+    uint index = GiRsIndex(pixel);
+    GiSurface surface = g_GiSurfaces[index];
+    GiReservoir result = (GiReservoir)0;
+    float3 indirect = 0.0f;
+    if (GiRsReusable(surface))
+    {
+        uint rng = GiSeed(pixel, 0xeae91u);
+        float weightSum = 0.0f;
+        GiRsMerge(result, weightSum, surface, g_GiTemporalReservoirs[index], rng);
+        for (uint i = 0u; i < g_GiSpatialSamples; ++i)
+        {
+            uint2 neighbor;
+            if (!GiRsNeighbor(pixel, rng, neighbor) || all(neighbor == pixel)) continue;
+            GiSurface neighborSurface = g_GiSurfaces[GiRsIndex(neighbor)];
+            if (!GiRsReusable(neighborSurface) || dot(surface.normal, neighborSurface.normal) < 0.95f) continue;
+            GiRsMerge(result, weightSum, surface, g_GiTemporalReservoirs[GiRsIndex(neighbor)], rng);
+        }
+        GiRsFinalize(result, weightSum, surface.position);
+        if (result.weight > 0.0f)
+        {
+            float3 direction;
+            float jacobian;
+            float3 response = GiRsResponse(surface, result, direction, jacobian);
+            if (GiRsVisible(surface, result)) indirect = response * result.weight;
+            else result.weight = 0.0f;
+        }
+        result.count = min(result.count, max(1u, g_GiMaxReservoirCount));
+    }
+    g_GiReservoirOutput[index] = result;
+    g_GiOutputColor[pixel] = float4(GiRsFinite(g_GiFallback[pixel].rgb + indirect), 1.0f);
+}
+
+void GiRsBucketInsert(inout GiCompressedSample retained[GI_BUCKET_SAMPLES],
+    GiCompressedSample sample, float weight, inout float totalLit, inout uint rng)
+{
+    if (weight <= 0.0f) return;
+    totalLit += weight;
+    [unroll]
+    for (uint i = 0u; i < GI_BUCKET_SAMPLES; ++i)
+        if (GiRandom(rng) * totalLit < weight) retained[i] = sample;
+}
+
+// NAADF-inspired adaptation: uniform lit samples in 8x8 buckets, compressed
+// radiance, explicit lit/unlit ratio, bounded history, then spatial RIS. Temporal
+// buckets are retained only for an unchanged camera; this is not the reference's
+// full sample reprojection or its sample-leveling and mirror-chain machinery.
+[numthreads(1, 1, 1)]
+void GiNaadfBuildBuckets(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint2 bucketPixel = dispatchId.xy;
+    uint2 dimensions = GiRsBucketDimensions();
+    if (any(bucketPixel >= dimensions)) return;
+    uint bucketIndex = bucketPixel.x + bucketPixel.y * dimensions.x;
+    uint rng = GiSeed(bucketPixel, 0xc0de31u);
+    GiCompressedSample retained[GI_BUCKET_SAMPLES];
+    [unroll]
+    for (uint i = 0u; i < GI_BUCKET_SAMPLES; ++i) retained[i] = (GiCompressedSample)0;
+    GiSampleBucket bucket = (GiSampleBucket)0;
+    float totalLit = 0.0f;
+    for (uint y = 0u; y < GI_BUCKET_WIDTH; ++y)
+    {
+        for (uint x = 0u; x < GI_BUCKET_WIDTH; ++x)
+        {
+            uint2 pixel = bucketPixel * GI_BUCKET_WIDTH + uint2(x, y);
+            if (any(pixel >= g_GiResolution)) continue;
+            GiReservoir candidate = g_GiCandidates[GiRsIndex(pixel)];
+            if (candidate.count == 0u) continue;
+            bucket.totalCount += 1.0f;
+            if (candidate.weight <= 0.0f || (candidate.flags & GI_RESERVOIR_VALID) == 0u) continue;
+            GiCompressedSample compressed = GiRsCompress(candidate);
+            if (compressed.packedRadiance == 0u) continue;
+            GiRsBucketInsert(retained, compressed, 1.0f, totalLit, rng);
+        }
+    }
+    bucket.age = 1u;
+    if (g_GiResetHistory == 0u && g_GiNaadfHistoryValid != 0u && bucket.totalCount > 0.0f)
+    {
+        GiSampleBucket previous = g_GiPreviousBuckets[bucketIndex];
+        float maxPrevious = float(max(1u, g_GiMaxHistoryFrames) - 1u) * bucket.totalCount;
+        float historyScale = min(1.0f, maxPrevious / max(previous.totalCount, 1.0f));
+        bucket.totalCount += previous.totalCount * historyScale;
+        bucket.age = min(previous.age + 1u, max(1u, g_GiMaxHistoryFrames));
+        uint stored = min(previous.storedCount, GI_BUCKET_SAMPLES);
+        float representedLit = previous.litCount * historyScale / float(max(1u, stored));
+        for (uint i = 0u; i < stored; ++i)
+            GiRsBucketInsert(retained, g_GiPreviousBucketSamples[bucketIndex * GI_BUCKET_SAMPLES + i], representedLit, totalLit, rng);
+    }
+    bucket.litCount = totalLit;
+    bucket.storedCount = totalLit > 0.0f ? GI_BUCKET_SAMPLES : 0u;
+    g_GiBuckets[bucketIndex] = bucket;
+    [unroll]
+    for (uint i = 0u; i < GI_BUCKET_SAMPLES; ++i)
+        g_GiBucketSamples[bucketIndex * GI_BUCKET_SAMPLES + i] = retained[i];
+}
+
+[numthreads(8, 8, 1)]
+void GiNaadfSpatial(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint2 pixel = dispatchId.xy;
+    if (any(pixel >= g_GiResolution)) return;
+    _CaelixLaunchIndex = pixel;
+    GiSurface surface = g_GiSurfaces[GiRsIndex(pixel)];
+    float3 indirect = 0.0f;
+    if (GiRsReusable(surface))
+    {
+        uint rng = GiSeed(pixel, 0xd1ff05u);
+        uint2 dimensions = GiRsBucketDimensions();
+        uint count = 0u;
+        float weightSum = 0.0f;
+        float selectedTarget = 0.0f;
+        float3 selectedResponse = 0.0f;
+        GiReservoir selected = (GiReservoir)0;
+        for (uint i = 0u; i < max(1u, g_GiSpatialSamples); ++i)
+        {
+            uint2 neighbor = pixel;
+            if (i != 0u && !GiRsNeighbor(pixel, rng, neighbor)) continue;
+            uint2 bucketPixel = neighbor / GI_BUCKET_WIDTH;
+            uint bucketIndex = bucketPixel.x + bucketPixel.y * dimensions.x;
+            GiSampleBucket bucket = g_GiBuckets[bucketIndex];
+            if (bucket.totalCount <= 0.0f) continue;
+            count++;
+            if (bucket.storedCount == 0u || bucket.litCount <= 0.0f) continue;
+            uint slot = min(uint(GiRandom(rng) * bucket.storedCount), bucket.storedCount - 1u);
+            GiReservoir candidate = GiRsDecompress(g_GiBucketSamples[bucketIndex * GI_BUCKET_SAMPLES + slot]);
+            float3 direction;
+            float jacobian;
+            float3 response = GiRsResponse(surface, candidate, direction, jacobian)
+                * (jacobian * bucket.litCount / bucket.totalCount);
+            float target = GiRsLuminance(response);
+            if (target <= 0.0f) continue;
+            weightSum += target;
+            if (GiRandom(rng) * weightSum < target)
+            {
+                selected = candidate;
+                selectedResponse = response;
+                selectedTarget = target;
+            }
+        }
+        if (selectedTarget > 0.0f && count > 0u && GiRsVisible(surface, selected))
+            indirect = selectedResponse * (weightSum / (float(count) * selectedTarget));
+    }
+    g_GiOutputColor[pixel] = float4(GiRsFinite(g_GiFallback[pixel].rgb + indirect), 1.0f);
+}

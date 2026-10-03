@@ -99,12 +99,38 @@ namespace Caelix.Tests
             Assert.That(rig.Renderer.groupsVisitedThisTick, Is.EqualTo(2), "both groups are visited");
             Assert.That(rig.InstanceCount, Is.EqualTo(2));
 
+            uint revision = rig.Renderer.GiSceneRevision;
             rig.RenderIdleFrame();
+            Assert.That(rig.Renderer.GiSceneRevision, Is.EqualTo(revision), "idle GI history remains valid");
             Assert.That(rig.Renderer.groupsEmittedThisTick, Is.Zero, "nothing changed, so nothing is emitted");
             Assert.That(rig.Renderer.groupsVisitedThisTick, Is.Zero, "an idle group is not visited at all");
             Assert.That(rig.Renderer.PendingGroupCount, Is.Zero, "no group carries work across the tick");
             Assert.That(rig.InstanceCount, Is.EqualTo(2), "the instances stay in the structure");
             Assert.That(rig.Renderer.groupCount, Is.EqualTo(2), "both groups are still live");
+        }
+
+        [Test]
+        public void GiHistoryRevisionTracksEditsMotionAndSourceReplacement()
+        {
+            if (!SystemInfo.supportsInlineRayTracing) Assert.Ignore("Inline ray tracing is required.");
+            using var rig = new Rig("gi-history-revision-test");
+            rig.World.SetBlock(rig.Guid, new int3(1, 1, 1), new Block(0x8001));
+            rig.StepAndRender();
+            uint initial = rig.Renderer.GiSceneRevision;
+
+            rig.World.SetBlock(rig.Guid, new int3(1, 1, 1), new Block(0x8002));
+            rig.StepAndRender();
+            Assert.That(rig.Renderer.GiSceneRevision, Is.GreaterThan(initial));
+            uint edited = rig.Renderer.GiSceneRevision;
+
+            rig.World.SetEntityStatic(rig.Guid, false);
+            rig.World.SetEntityTransform(rig.Guid, new RigidTransform(quaternion.RotateY(0.4f), new float3(2, 3, 4)));
+            rig.StepAndRender();
+            Assert.That(rig.Renderer.GiSceneRevision, Is.GreaterThan(edited));
+            uint moved = rig.Renderer.GiSceneRevision;
+
+            rig.Renderer.SetSource(null);
+            Assert.That(rig.Renderer.GiSceneRevision, Is.GreaterThan(moved));
         }
 
         /// <summary>

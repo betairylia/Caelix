@@ -220,6 +220,11 @@ namespace Caelix.Rendering.RayQuery
         /// <summary>False until the G-buffer stage has recorded the bake into <see cref="MaterialTable"/>.</summary>
         public bool MaterialsBaked { get; set; }
 
+        /// <summary>Conservative invalidation for prototype lighting histories and GPU light weights.</summary>
+        public uint GiSceneRevision { get; private set; }
+
+        public void InvalidateGiHistory() => GiSceneRevision++;
+
         /// <summary>Current frame ID for rendering. Incremented each <see cref="Tick"/>.</summary>
         public uint frameId { get; private set; }
 
@@ -334,6 +339,7 @@ namespace Caelix.Rendering.RayQuery
             {
                 return;
             }
+            InvalidateGiHistory();
 
             if (source != null)
             {
@@ -384,6 +390,7 @@ namespace Caelix.Rendering.RayQuery
 
         private void OnViewDespawning(EntityView view)
         {
+            InvalidateGiHistory();
             CancelInitialUploads(view);
 
             if (!groups.TryGetValue(view, out Dictionary<int3, RayQueryGroupRenderer> viewGroups))
@@ -630,6 +637,7 @@ namespace Caelix.Rendering.RayQuery
 
             if (groupRemovalScratch.Count > 0)
             {
+                InvalidateGiHistory();
                 // The removed groups are gone from visitedSet; one sweep takes them out of the visit
                 // list as well, so pass 2b cannot touch a disposed group.
                 CompactVisitList();
@@ -685,6 +693,7 @@ namespace Caelix.Rendering.RayQuery
                         {
                             instanceRebuildsThisTick++;
                         }
+                        if (group.GiSceneChanged) InvalidateGiHistory();
 
                         groupsVisitedThisTick++;
 
@@ -710,6 +719,8 @@ namespace Caelix.Rendering.RayQuery
             // One batched write of every record staged above. Per-group dispatches would ask the
             // driver for one staging copy of the buffer each — see CaelixBrickGpuOps.
             Pool.Ops.FlushScatter();
+            // Material-only edits upload records without rebuilding an RTAS instance.
+            if (bricksStagedThisTick > 0) InvalidateGiHistory();
 
             Instances.Flush();
 
@@ -960,6 +971,7 @@ namespace Caelix.Rendering.RayQuery
         /// <summary>Releases all GPU resources.</summary>
         private void ReleaseResources()
         {
+            InvalidateGiHistory();
             // Unbinds the events and retires every group while the pool and the table are still
             // alive; whatever the renderer draws next has to be uploaded in full.
             SetSource(null);

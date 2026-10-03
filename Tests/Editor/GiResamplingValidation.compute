@@ -1,0 +1,111 @@
+#pragma target 5.0
+#pragma use_dxc
+#pragma kernel InitializeResamplingInputs
+#pragma kernel InspectResamplingHistory
+#pragma kernel InspectResamplingBucket
+#pragma kernel ValidateResamplingMath
+
+// Exercise the same functions and bucket implementation used by the renderer.
+// These validation entry points do not trace rays or need a scene RTAS.
+#include "../../Runtime/Rendering/Shaders/GiPrototypes/GiResampling.compute"
+
+RWStructuredBuffer<GiSurface> g_TestPreviousSurfaces;
+RWStructuredBuffer<float4> g_TestResamplingResults;
+uint g_TestLitCount;
+uint g_TestPreviousFrame;
+uint g_TestHistoryCase;
+
+[numthreads(8, 8, 1)]
+void InitializeResamplingInputs(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= g_GiResolution)) return;
+    uint index = GiRsIndex(id.xy);
+    GiSurface surface = (GiSurface)0;
+    surface.position = float3(0, 0, -2);
+    surface.previousPosition = surface.position;
+    surface.normal = float3(0, 0, 1);
+    surface.materialId = 0xffffu;
+    surface.faceKey = uint2(123u, 456u);
+    surface.flags = 1u;
+    surface.depth = 2.0f;
+    if (g_TestHistoryCase == 4u) surface.previousPosition.x = 3.0f;
+    if (g_TestHistoryCase == 5u) surface.previousPosition.z = 2.0f;
+    g_GiSurfacesOut[index] = surface;
+    if (g_TestHistoryCase == 1u) surface.faceKey.x++;
+    if (g_TestHistoryCase == 2u) surface.normal = -surface.normal;
+    if (g_TestHistoryCase == 3u) surface.materialId--;
+    g_TestPreviousSurfaces[index] = surface;
+
+    GiReservoir sample = (GiReservoir)0;
+    sample.sourcePosition = float3(0, 0, -2);
+    sample.position = float3(0, 0, 1);
+    sample.packedNormal = CaelixPackWorldNormal(float3(0, 0, -1));
+    sample.count = 1u;
+    sample.frame = g_TestPreviousFrame;
+    if (index < g_TestLitCount)
+    {
+        sample.flags = GI_RESERVOIR_VALID | GI_RESERVOIR_SKY;
+        sample.radiance = float3(4, 2, 1);
+        sample.weight = 2.0f;
+    }
+    g_GiCandidates[index] = sample;
+}
+
+[numthreads(1, 1, 1)]
+void InspectResamplingHistory(uint3 id : SV_DispatchThreadID)
+{
+    GiReservoir previous;
+    bool valid = GiRsTemporalHistory(g_GiSurfaces[0], previous);
+    g_TestResamplingResults[0] = float4(valid ? 1.0f : 0.0f, previous.count, previous.frame, 0);
+}
+
+[numthreads(1, 1, 1)]
+void InspectResamplingBucket(uint3 id : SV_DispatchThreadID)
+{
+    GiSampleBucket bucket = g_GiBuckets[0];
+    float3 estimate = 0.0f;
+    for (uint i = 0u; i < bucket.storedCount; ++i)
+        estimate += GiRsDecompress(g_GiBucketSamples[i]).radiance;
+    if (bucket.storedCount > 0u)
+        estimate *= bucket.litCount / (bucket.totalCount * float(bucket.storedCount));
+    g_TestResamplingResults[0] = float4(estimate, bucket.storedCount);
+    g_TestResamplingResults[1] = float4(bucket.totalCount, bucket.litCount, bucket.age, 0);
+}
+
+[numthreads(1, 1, 1)]
+void ValidateResamplingMath(uint3 id : SV_DispatchThreadID)
+{
+    GiReservoir sample = (GiReservoir)0;
+    sample.flags = GI_RESERVOIR_VALID;
+    sample.position = float3(0, 0, 2);
+    sample.packedNormal = CaelixPackWorldNormal(float3(0, 0, -1));
+    float3 direction;
+    float same = GiRsJacobian(sample, 0.0f, direction);
+    float closer = GiRsJacobian(sample, float3(0, 0, 1), direction);
+    float offAxis = GiRsJacobian(sample, float3(1, 0, 0), direction);
+    float back = GiRsJacobian(sample, float3(0, 0, 3), direction);
+    sample.sourcePosition = float3(0, 0, 1);
+    float reverse = GiRsJacobian(sample, 0.0f, direction);
+    g_TestResamplingResults[0] = float4(same, closer, reverse, offAxis);
+    float zeroSegment = GiRsJacobian(sample, sample.position, direction);
+    sample.flags |= GI_RESERVOIR_SKY;
+    sample.position = float3(0, 1, 0);
+    float sky = GiRsJacobian(sample, float3(10, 10, 10), direction);
+    g_TestResamplingResults[1] = float4(back, zeroSegment, sky, length(direction));
+
+    GiReservoir result = (GiReservoir)0;
+    float sum = 0.0f;
+    uint rng = 923u;
+    GiRsUpdate(result, sum, sample, 4.0f, 8.0f, 1u, rng);
+    GiRsUpdate(result, sum, (GiReservoir)0, 0.0f, 0.0f, 3u, rng);
+    GiRsFinalize(result, sum, 0.0f);
+    g_TestResamplingResults[2] = float4(result.count, result.weight, result.target * result.weight, sum);
+
+    result = (GiReservoir)0;
+    sum = 0.0f;
+    GiRsUpdate(result, sum, sample, 0.0f, 0.0f, 4u, rng);
+    GiRsFinalize(result, sum, 0.0f);
+    g_TestResamplingResults[3] = float4(result.count, result.weight, result.flags, result.target);
+    g_TestResamplingResults[4] = float4(GiRsUnpackRadiance(GiRsPackRadiance(float3(8, 4, 2))), 0);
+    g_TestResamplingResults[5] = float4(GiRsUnpackRadiance(GiRsPackRadiance(float3(1000000, 1000000, 1000000))), 0);
+}

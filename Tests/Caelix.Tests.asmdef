@@ -20,7 +20,9 @@
         "Unity.Splines",
         "Caelix.Core.Tests",
         "Caelix.Physics",
-        "Caelix.Simulation"
+        "Caelix.Simulation",
+        "Unity.RenderPipelines.Core.Runtime",
+        "Unity.RenderPipelines.Universal.Runtime"
     ],
     "includePlatforms": [
         "Editor"

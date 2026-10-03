@@ -14,6 +14,7 @@ the client holds a replica for rendering and tools. `CaelixHost` runs both local
 | Choose a traversal API | [Core: enumerator rules](https://github.com/betairylia/Caelix-Core/blob/main/Documentation~/reference/enumerators.md) |
 | Author a voxel spline | [Voxel spline authoring](manual/voxel-spline-authoring.md) |
 | Work on rendering | [Budget renderer](internals/rendering/BUDGET_RENDERER.md), [RT G-buffer](internals/rendering/RT_GBUFFER_LAYOUT.md), [Ray query backend](internals/rendering/RAYQUERY_RENDERER.md) |
+| Compare GI prototypes | [Prototype setup and limits](internals/rendering/RAYQUERY_RENDERER.md#gi-prototypes) |
 | Review the detailed network contract | [Server/client architecture](internals/SERVER_CLIENT_ARCHITECTURE.md) |
 | Understand earlier decisions and measurements | [Historical documents](archive/index.md) |
 | Write or maintain a page | [Documentation guide](documentation-guide.md) |

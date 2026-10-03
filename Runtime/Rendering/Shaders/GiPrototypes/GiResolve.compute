@@ -1,0 +1,36 @@
+#pragma kernel GiResolve
+#pragma target 5.0
+
+struct GiResolveSurface
+{
+    float3 position; uint materialId;
+    float3 normal; uint flags;
+    float3 previousPosition; float depth;
+    uint2 faceKey; uint2 reserved;
+};
+
+uint2 g_GiResolution;
+uint g_GiAccumulationValid, g_GiAccumulationLimit;
+StructuredBuffer<GiResolveSurface> g_GiSurfaces;
+StructuredBuffer<GiResolveSurface> g_GiPreviousSurfaces;
+Texture2D<float4> g_GiRawColor;
+Texture2D<float4> g_GiPreviousColor;
+RWTexture2D<float4> g_GiResolvedColor;
+
+[numthreads(8, 8, 1)]
+void GiResolve(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= g_GiResolution)) return;
+    uint index = id.x + id.y * g_GiResolution.x;
+    GiResolveSurface current = g_GiSurfaces[index];
+    GiResolveSurface previous = g_GiPreviousSurfaces[index];
+    float4 color = float4(g_GiRawColor[id.xy].rgb, 1.0);
+    if (g_GiAccumulationValid != 0u && current.flags == previous.flags
+        && all(current.faceKey == previous.faceKey) && current.materialId == previous.materialId)
+    {
+        float4 history = g_GiPreviousColor[id.xy];
+        float count = min(history.a, float(max(1u, g_GiAccumulationLimit) - 1u));
+        color = float4((color.rgb + history.rgb * count) / (count + 1.0), count + 1.0);
+    }
+    g_GiResolvedColor[id.xy] = color;
+}

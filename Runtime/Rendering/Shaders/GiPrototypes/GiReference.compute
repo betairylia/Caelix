@@ -1,0 +1,49 @@
+#pragma target 5.0
+#pragma use_dxc
+#pragma require inlineraytracing Int64
+#pragma multi_compile _ CAELIX_GROUP_3_3_3 CAELIX_GROUP_5_5_5 CAELIX_GROUP_4_7_4
+#pragma kernel GiGenerateSurfaces
+#pragma kernel GiReference
+#pragma kernel CaelixBakeMaterialsAlbedo
+#pragma kernel CaelixBakeMaterialsEmission
+#pragma kernel CaelixBakeMaterialsScalars
+
+#include "GiCommon.hlsl"
+
+[numthreads(8, 8, 1)]
+void GiGenerateSurfaces(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint2 pixel = dispatchId.xy;
+    if (any(pixel >= g_GiResolution)) return;
+    _CaelixLaunchIndex = pixel;
+    GiSurface surface;
+    GiTrace(GiCameraRay(pixel, g_GiJitter), surface);
+    g_GiSurfacesOut[pixel.x + pixel.y * g_GiResolution.x] = surface;
+    g_GiOutputDepth[pixel] = GiHasHit(surface) ? surface.depth : 0.0;
+}
+
+[numthreads(8, 8, 1)]
+void GiReference(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint2 pixel = dispatchId.xy;
+    if (any(pixel >= g_GiResolution)) return;
+    _CaelixLaunchIndex = pixel;
+    GiSurface surface = g_GiSurfaces[pixel.x + pixel.y * g_GiResolution.x];
+    RayDesc primary = GiCameraRay(pixel, g_GiJitter);
+    float3 radiance = 0.0;
+    uint count = max(1u, g_GiSamplesPerPixel);
+    if (GiHasHit(surface))
+    {
+        for (uint sampleIndex = 0u; sampleIndex < count; ++sampleIndex)
+        {
+            uint rng = GiSeed(pixel, sampleIndex);
+            radiance += GiTraceFromSurface(surface, -primary.Direction, 0u, rng, g_GiMaxBounces);
+        }
+        radiance /= float(count);
+    }
+    else
+    {
+        radiance = GiSky(primary.Direction);
+    }
+    g_GiOutputColor[pixel] = float4(GiSanitize(radiance), 1.0);
+}

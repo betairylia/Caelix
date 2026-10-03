@@ -1,0 +1,253 @@
+#pragma kernel TraceRadianceCache
+#pragma kernel TraceGuidedPath
+#pragma kernel TraceEmissionGuidedPath
+#pragma target 5.0
+#pragma use_dxc
+#pragma require inlineraytracing Int64
+#pragma only_renderers d3d11
+#pragma multi_compile_local _ CAELIX_GROUP_3_3_3 CAELIX_GROUP_5_5_5 CAELIX_GROUP_4_7_4
+
+#include "GiCommon.hlsl"
+#include "GiCache.hlsl"
+#include "GiEmission.hlsl"
+
+float g_GiGuidingStrength;
+
+float GiPowerHeuristic(float a, float b)
+{
+    float scale = max(a, b);
+    if (scale <= 0.0f) return 0.0f;
+    a /= scale;
+    b /= scale;
+    return a * a / max(1e-20f, a * a + b * b);
+}
+
+float GiContinuationPdf(GiBsdf bsdf, uint slot, float3 normal, float3 wo, float3 wi, float guideChance)
+{
+    float3 f;
+    float pdf;
+    GiEvaluate(bsdf, normal, wo, wi, f, pdf);
+    return (1.0f - guideChance) * pdf + guideChance * GiGuidePdf(slot, normal, wi);
+}
+
+GiBsdfSample GiSampleGuided(GiBsdf bsdf, uint slot, float3 normal, float3 wo, float guideChance, inout uint rng)
+{
+    GiBsdfSample sample = (GiBsdfSample)0;
+    if (guideChance > 0.0f && GiRandom(rng) < guideChance)
+    {
+        float guidePdf;
+        sample.direction = GiGuideSample(slot, normal, float2(GiRandom(rng), GiRandom(rng)), guidePdf);
+    }
+    else
+    {
+        sample = GiSample(bsdf, normal, wo, rng);
+        // Delta surfaces never enable a guide, so discrete event mass stays intact.
+        if (sample.pdf <= 0.0f || sample.delta != 0u || guideChance == 0.0f) return sample;
+    }
+    float3 f;
+    float materialPdf;
+    GiEvaluate(bsdf, normal, wo, sample.direction, f, materialPdf);
+    sample.pdf = (1.0f - guideChance) * materialPdf + guideChance * GiGuidePdf(slot, normal, sample.direction);
+    sample.weight = sample.pdf > 0.0f ? f * (abs(dot(normal, sample.direction)) / sample.pdf) : 0.0f;
+    return sample;
+}
+
+float3 GiEmitterDirect(GiSurface surface, GiBsdf bsdf, float3 wo, float3 normal, uint slot, float guideChance, inout uint rng)
+{
+    GiEmissionSample light;
+    float4 u = float4(GiRandom(rng), GiRandom(rng), GiRandom(rng), GiRandom(rng));
+    if (!GiSampleEmission(surface.position, u, light)) return 0.0f;
+    float3 f;
+    float ignoredPdf;
+    GiEvaluate(bsdf, normal, wo, light.direction, f, ignoredPdf);
+    if (!any(f > 0.0f)) return 0.0f;
+    RayDesc visibility = GiRayFromSurface(surface, light.direction);
+    float3 segment = light.position - visibility.Origin;
+    float segmentDistance = length(segment);
+    visibility.Direction = segment / max(1e-7f, segmentDistance);
+    visibility.TMax = segmentDistance + 0.01f;
+    GiSurface endpoint;
+    if (!GiTrace(visibility, endpoint) || any(endpoint.faceKey != light.faceKey)
+        || length(endpoint.position - light.position) > 0.01f) return 0.0f;
+    float continuationPdf = GiContinuationPdf(bsdf, slot, normal, wo, light.direction, guideChance);
+    return light.radiance * f * (abs(dot(normal, light.direction))
+        * GiPowerHeuristic(light.pdf, continuationPdf) / light.pdf);
+}
+
+float3 GiGuidedPath(GiSurface primary, RayDesc ray, bool useEmission, inout uint rng)
+{
+    float3 radiance = 0.0f;
+    float3 throughput = 1.0f;
+    uint medium = 0u;
+    float etaScale = 1.0f;
+    float previousPdf = 0.0f;
+    float3 previousPosition = ray.Origin;
+    bool previousNee = false;
+
+    // One uniformly chosen scattering vertex learns from its entire fresh suffix.
+    // This bounds training storage without retaining every vertex in registers.
+    uint trainingBounce = min(g_GiMaxBounces - 1u, uint(GiRandom(rng) * max(1u, g_GiMaxBounces)));
+    uint trainingSlot = GI_CACHE_INVALID;
+    float3 trainingNormal = 0.0f;
+    float3 trainingDirection = 0.0f;
+    float trainingPdf = 1.0f;
+    float3 suffixThroughput = 1.0f;
+    float3 suffixRadiance = 0.0f;
+    bool tracking = false;
+
+    [loop] for (uint bounce = 0u; bounce <= g_GiMaxBounces; ++bounce)
+    {
+        GiSurface surface = primary;
+        bool hit = bounce == 0u ? GiHasHit(primary) : GiTrace(ray, surface);
+        float distance = hit ? length(surface.position - ray.Origin) : K_T_MAX;
+        float3 transmission = GiMediumTransmittance(medium, distance);
+        throughput *= transmission;
+        if (tracking) suffixThroughput *= transmission;
+        if (!hit)
+        {
+            float3 sky = GiSky(ray.Direction);
+            radiance += throughput * sky;
+            if (tracking) suffixRadiance += suffixThroughput * sky;
+            break;
+        }
+        GiBsdf bsdf = GiMakeBsdf(surface, medium);
+        float3 wo = -ray.Direction;
+        float3 normal = dot(surface.normal, wo) >= 0.0f ? surface.normal : -surface.normal;
+        float lightWeight = 1.0f;
+        if (previousNee && bsdf.transparent == 0u && any(bsdf.emission > 0.0f))
+            lightWeight = GiPowerHeuristic(previousPdf, GiEmissionPdf(previousPosition, surface.position, surface.normal, bsdf.emission, surface.faceKey));
+        float3 localRadiance = bsdf.emission * lightWeight;
+        uint slot = bsdf.transparent == 0u && !GiIsDelta(bsdf)
+            ? GiCacheFind(surface.faceKey, bounce == trainingBounce) : GI_CACHE_INVALID;
+        float guideChance = GiGuideAvailable(slot) ? clamp(g_GiGuidingStrength, 0.0f, 0.95f) : 0.0f;
+        bool nee = useEmission && bsdf.transparent == 0u && !GiIsDelta(bsdf) && medium == 0u && bounce < g_GiMaxBounces;
+        if (nee) localRadiance += GiEmitterDirect(surface, bsdf, wo, normal, slot, guideChance, rng);
+        radiance += throughput * localRadiance;
+        if (tracking) suffixRadiance += suffixThroughput * localRadiance;
+        if (bounce == g_GiMaxBounces) break;
+
+        GiBsdfSample sample = GiSampleGuided(bsdf, slot, normal, wo, guideChance, rng);
+        if (sample.pdf <= 0.0f || !any(sample.weight > 0.0f)) break;
+        throughput *= sample.weight;
+        if (tracking) suffixThroughput *= sample.weight;
+        if (bounce == trainingBounce && slot != GI_CACHE_INVALID && sample.delta == 0u && dot(normal, sample.direction) > 0.0f)
+        {
+            trainingSlot = slot;
+            trainingNormal = normal;
+            trainingDirection = sample.direction;
+            trainingPdf = sample.pdf;
+            suffixThroughput = 1.0f;
+            tracking = true;
+        }
+        if (sample.transmission != 0u) etaScale *= (bsdf.etaT * bsdf.etaT) / (bsdf.etaI * bsdf.etaI);
+        medium = GiNextMedium(bsdf, sample, medium);
+        if (bounce >= 3u)
+        {
+            float survival = min(0.95f, max(throughput.x, max(throughput.y, throughput.z)) * etaScale);
+            if (survival <= 0.0f || GiRandom(rng) >= survival) break;
+            throughput /= survival;
+            if (tracking) suffixThroughput /= survival;
+        }
+        previousPdf = sample.pdf;
+        previousPosition = surface.position;
+        previousNee = nee && sample.delta == 0u;
+        ray = GiRayFromSurface(surface, sample.direction);
+    }
+    if (tracking)
+        GiCacheTrainGuide(trainingSlot, trainingNormal, trainingDirection, GiLuminance(GiSanitize(suffixRadiance)) / max(trainingPdf, 1e-20f));
+    return GiSanitize(radiance);
+}
+
+float3 GiRadianceCachedPath(GiSurface primary, RayDesc ray, inout uint rng)
+{
+    float3 radiance = 0.0f;
+    float3 throughput = 1.0f;
+    uint medium = 0u;
+    float etaScale = 1.0f;
+    uint trainingBounce = 1u + uint(GiRandom(rng) * max(1u, g_GiMaxBounces - 1u));
+    [loop] for (uint bounce = 0u; bounce <= g_GiMaxBounces; ++bounce)
+    {
+        GiSurface surface = primary;
+        bool hit = bounce == 0u ? GiHasHit(primary) : GiTrace(ray, surface);
+        throughput *= GiMediumTransmittance(medium, hit ? length(surface.position - ray.Origin) : K_T_MAX);
+        if (!hit)
+        {
+            radiance += throughput * GiSky(ray.Direction);
+            break;
+        }
+        GiBsdf bsdf = GiMakeBsdf(surface, medium);
+        radiance += throughput * bsdf.emission;
+        if (bounce == g_GiMaxBounces) break;
+        float3 wo = -ray.Direction;
+        float3 normal = dot(surface.normal, wo) >= 0.0f ? surface.normal : -surface.normal;
+        float3 diffuse = GiDiffuseReflectance(bsdf);
+        bool usedCache = false;
+        if (bounce > 0u && bsdf.transparent == 0u && medium == 0u && any(diffuse > 0.0f))
+        {
+            uint slot = GiCacheFind(surface.faceKey, bounce == trainingBounce);
+            float3 irradiance;
+            usedCache = GiCacheQuery(slot, irradiance);
+            if (usedCache) radiance += throughput * diffuse * irradiance;
+            if (bounce == trainingBounce && slot != GI_CACHE_INVALID)
+            {
+                // Cosine sampling cancels cos(theta)/pi in the diffuse integral.
+                // The suffix always uses the reference tracer, never this cache.
+                float3 direction = GiCosineHemisphere(normal, rng);
+                float3 estimate = GiTracePath(GiRayFromSurface(surface, direction), medium, rng, g_GiMaxBounces - 1u);
+                GiCacheTrainRadiance(slot, estimate);
+            }
+        }
+        GiBsdfSample sample = GiSample(bsdf, normal, wo, rng);
+        if (sample.pdf <= 0.0f) break;
+        if (usedCache && sample.delta == 0u)
+        {
+            float3 f;
+            float pdf;
+            GiEvaluate(bsdf, normal, wo, sample.direction, f, pdf);
+            sample.weight = max(0.0f, f - diffuse / GI_PI) * (abs(dot(normal, sample.direction)) / sample.pdf);
+        }
+        if (!any(sample.weight > 0.0f)) break;
+        throughput *= sample.weight;
+        if (sample.transmission != 0u) etaScale *= (bsdf.etaT * bsdf.etaT) / (bsdf.etaI * bsdf.etaI);
+        medium = GiNextMedium(bsdf, sample, medium);
+        if (bounce >= 3u)
+        {
+            float survival = min(0.95f, max(throughput.x, max(throughput.y, throughput.z)) * etaScale);
+            if (survival <= 0.0f || GiRandom(rng) >= survival) break;
+            throughput /= survival;
+        }
+        ray = GiRayFromSurface(surface, sample.direction);
+    }
+    return GiSanitize(radiance);
+}
+
+void GiCachePathMain(uint2 pixel, uint mode)
+{
+    if (any(pixel >= g_GiResolution)) return;
+    _CaelixLaunchIndex = pixel;
+    GiSurface primary = g_GiSurfaces[pixel.x + pixel.y * g_GiResolution.x];
+    RayDesc ray = GiCameraRay(pixel, g_GiJitter);
+    if (g_GiMaxBounces == 0u)
+    {
+        float3 direct = GiHasHit(primary) ? GiMakeBsdf(primary, 0u).emission : GiSky(ray.Direction);
+        g_GiOutputColor[pixel] = float4(GiSanitize(direct), 1.0f);
+        return;
+    }
+    float3 radiance = 0.0f;
+    uint samples = max(1u, g_GiSamplesPerPixel);
+    [loop] for (uint sampleIndex = 0u; sampleIndex < samples; ++sampleIndex)
+    {
+        uint rng = GiSeed(pixel, sampleIndex);
+        radiance += mode == 0u ? GiRadianceCachedPath(primary, ray, rng) : GiGuidedPath(primary, ray, mode == 2u, rng);
+    }
+    g_GiOutputColor[pixel] = float4(GiSanitize(radiance / float(samples)), 1.0f);
+}
+
+[numthreads(8, 8, 1)]
+void TraceRadianceCache(uint3 id : SV_DispatchThreadID) { GiCachePathMain(id.xy, 0u); }
+
+[numthreads(8, 8, 1)]
+void TraceGuidedPath(uint3 id : SV_DispatchThreadID) { GiCachePathMain(id.xy, 1u); }
+
+[numthreads(8, 8, 1)]
+void TraceEmissionGuidedPath(uint3 id : SV_DispatchThreadID) { GiCachePathMain(id.xy, 2u); }

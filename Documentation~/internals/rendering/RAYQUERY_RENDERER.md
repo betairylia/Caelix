@@ -233,6 +233,108 @@ trace of every new material buffer (`CaelixRayQueryRenderer.MaterialsBaked`).
    `rayQueryTracer`. For budget mode, assign `Budget/CaelixBudgetRQ.compute` to the budget
    feature's `rayQueryTracer`, and enable exactly one of the two features.
 
+## GI prototypes
+
+`CaelixGiPrototypeFeature` uses the same voxel acceleration structure with six selectable
+approaches. Choose the approach and settings before Play Mode. The feature captures a copy
+for that session, including when URP recreates its passes. CAGI is deferred.
+
+### Setup and comparison
+
+1. Keep the scene's `CaelixRayQueryRenderer` and `CaelixHost` connection from the setup above.
+2. Select the URP renderer asset and run **Tools > Caelix > GI Prototypes > Install On Selected
+   Renderer**. This adds the prototype feature, assigns its shaders, and disables the existing
+   regular/budget Caelix features on that asset.
+3. Open **Caelix GI Prototypes > Settings** and select **Approach**. Start with the default
+   resolution scale of `0.5`, one sample per pixel, and four scattering events.
+4. Enter Play Mode with a world encoded for the active material mode. Stop Play Mode before
+   changing approaches. For packed saves, enable `CAELIX_PACKED_SCENE_COLOR` in both Core's
+   `BlockEncoding.cs` and `Shaders/def/CaelixMaterialConfig.hlsl`.
+
+The prototypes require DX12 ray tracing, a perspective game camera without XR, and entity scale
+1. They trace voxel geometry and the environment cubemap; Unity mesh geometry and analytic lights
+do not participate in their transport. The camera is assumed to start in air. Orthographic,
+off-axis and stereo projections are outside this prototype.
+
+Keep resolution, samples, bounces, sky intensity, camera position, and scene state fixed between
+runs. **Accumulation Frames = 1** shows each frame's estimator without the common image average;
+larger values average a stationary camera and restart on camera movement. Warm caches separately
+from cold runs. Equal sample counts do not imply equal ray counts: cache training and emitter
+visibility add work. Measure GPU time and image error rather than assuming equal cost.
+
+Presentation runs after opaque geometry and refreshes URP's sampled camera depth through its
+`CopyDepthPass`. The normal sky renderer can draw the background afterward. Effects that already
+ran before opaque rendering, such as a depth prepass consumer, do not receive prototype voxel depth.
+
+### Approaches
+
+| Approach | What is implemented | Approximation or boundary |
+|---|---|---|
+| Reference Path Tracing | Independent BSDF paths, environment and emitter hits, roulette | Finite scattering budget; no explicit light sampling |
+| Restir Gi | Initial RIS candidates, temporal reprojection, spatial reservoirs, reconnection Jacobian, visibility | Basic biased reuse normalization; no all-source pairwise MIS correction |
+| Naadf Inspired | 8x8 buckets, eight retained lit samples per bucket, explicit unlit counts, compressed weighted radiance, temporal/spatial reuse | History requires a stationary camera; no original NAADF mirror-chain reprojection, adaptive radius, or sample leveling |
+| Face Radiance Cache | Sparse irradiance per exact voxel face; independent path samples train a reusable diffuse tail | Biased spatial average and finite training tail; glossy/transmissive parts continue tracing |
+| Face Path Guiding | Eight directional bins per face, exploration floor, BSDF/guide mixture with matching PDF | Coarse direction distribution; fresh paths still determine radiance |
+| Brick Emission Path Guiding | GPU emitter sum tree and voxel weights, explicit emitter sampling with visibility/MIS, plus learned guiding | Six faces of each retained opaque emitter are proposal mass; hidden faces waste samples |
+
+All paths share Lambert diffuse, isotropic GGX reflection, dielectric Fresnel, smooth/rough
+transmission, and extinction. Smoothness maps to roughness as `1 - smoothness`. Pure mirrors and
+glass use traced paths in the resampling modes. At reusable secondary surfaces, only emission and
+the diffuse component are reused; directional components are independently traced. These are
+research implementations, not claims of equivalence to RTXDI or the original NAADF renderer.
+
+The radiance cache stores incoming diffuse irradiance divided by pi. Material color is applied at
+lookup. Each record averages across one voxel face; there is no grouping of adjacent faces. A
+training suffix uses a fixed bounce budget independent of the depth of the receiving path, so a
+cache hit can approximate a longer tail than the finite reference path at the same setting.
+Cache training uses fixed-point atomics, caps each channel/sample at `16383`, and accepts at most
+1024 samples per slot per frame. NAADF's RGB9E5 compression caps channels at `65408`. These limits
+can bias unusually bright transport and should be considered when comparing images.
+
+### Storage and invalidation
+
+The selected approach owns its GPU state per camera. The common primary/history surface records
+are 64 bytes per pixel each, separate from the ray payload. Color/history images use float32 HDR
+to avoid overflow from half-float storage. The original `RayPayload` layout is unchanged.
+
+- Common storage is 180 bytes per rendered pixel. ReSTIR adds 208 bytes per pixel. At a
+  1920x1080 camera and scale `0.5`, the ReSTIR state is approximately 192 MiB, excluding the scene
+  and URP targets. Full resolution is approximately 767 MiB.
+- NAADF adds one 64-byte candidate and a 16-byte fallback image per pixel, plus two sets of
+  16-byte bucket metadata and eight 32-byte samples per 8x8 tile.
+- Face caches cost 192 bytes per slot, including keys, two histories, and accumulation. The
+  default 65536 slots costs 12 MiB; storage is independent of the world's total face count.
+  A full hash table falls back to tracing. Old entries expire according to **Cache Max Age**.
+- Emission mode adds 32 bytes per allocated renderer brick slot and a sum tree with
+  `2 * nextPowerOfTwo(brickCount)` floats, plus 80 bytes per render group. Sparse brick-map holes
+  are included in that allocation.
+
+Face keys use the existing instance padding word as an allocation lifetime token, plus exact
+group-local voxel coordinates and face number. Entity movement and pool compaction preserve the
+key; slot reuse receives a different token. No dense lighting fields are added to brick records.
+Enclosed voxels need no cache entries. Emission proposals operate on retained renderer voxels,
+with ray visibility rejecting buried faces.
+
+Geometry uploads, removal, source replacement, entity transform changes, and pool republishing
+advance `GiSceneRevision`. A changed revision clears all prototype lighting history and rebuilds
+emitter weights. This conservative reset can prevent caches warming in continuously changing
+worlds. Sky texture identity/update counters also invalidate history. A caller modifying lighting
+in place without changing the texture counter must call `CaelixRayQueryRenderer.InvalidateGiHistory()`;
+material-table changes also require rebaking via `MaterialsBaked = false`.
+
+Implementation: [feature and settings](../../../Runtime/Rendering/GiPrototypes),
+[shaders](../../../Runtime/Rendering/Shaders/GiPrototypes),
+[GPU smoke tests](../../../Tests/Editor/GiPrototypeGpuSmokeTests.cs),
+[BSDF tests](../../../Tests/Editor/GiBsdfTests.cs),
+[cache tests](../../../Tests/Editor/GiCacheTests.cs), and
+[resampling tests](../../../Tests/Editor/GiResamplingTests.cs).
+
+Validation on 2026-10-04 for the `astra/gi-prototypes` working tree: Unity 6000.5.6f1
+compilation passed; 62 focused GI Edit Mode tests and 11 renderer lifecycle/upload tests passed.
+The GPU fixtures exercise all six approaches, BSDF sampling/PDF agreement, cache and reservoir
+history, HDR presentation, and actual depth attachments. Full-scene Play Mode appearance,
+camera-depth integration with post effects, and performance comparisons remain manual checks.
+
 ## One scene renderer at a time
 
 Enable exactly one scene renderer per `ClientWorld`. Some of the state a renderer reads is

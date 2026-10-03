@@ -1,0 +1,74 @@
+#pragma kernel InsertKeys
+#pragma kernel InsertKeysConcurrent
+#pragma kernel TrainCache
+#pragma kernel InspectCache
+#pragma target 5.0
+#pragma use_dxc
+
+#include "../../Runtime/Rendering/Shaders/GiPrototypes/GiCache.hlsl"
+
+uint g_TestKeyAX;
+uint g_TestKeyAY;
+uint g_TestKeyBX;
+uint g_TestKeyBY;
+RWStructuredBuffer<float4> g_TestResults;
+
+[numthreads(1, 1, 1)]
+void InsertKeys(uint3 id : SV_DispatchThreadID)
+{
+    GiCacheFind(uint2(g_TestKeyAX, g_TestKeyAY), true);
+    GiCacheFind(uint2(g_TestKeyBX, g_TestKeyBY), true);
+}
+
+[numthreads(64, 1, 1)]
+void InsertKeysConcurrent(uint3 id : SV_DispatchThreadID)
+{
+    uint2 key = (id.x & 1u) == 0u ? uint2(g_TestKeyAX, g_TestKeyAY) : uint2(g_TestKeyBX, g_TestKeyBY);
+    GiCacheFind(key, true);
+}
+
+[numthreads(64, 1, 1)]
+void TrainCache(uint3 id : SV_DispatchThreadID)
+{
+    uint slot = GiCacheFind(uint2(g_TestKeyAX, g_TestKeyAY), false);
+    GiCacheTrainRadiance(slot, float3(float(id.x + 1u), 2, 4));
+    GiCacheTrainGuide(slot, float3(0, 0, 1), normalize(float3(1, 1, 0.25)), 16.0f);
+}
+
+[numthreads(1, 1, 1)]
+void InspectCache(uint3 id : SV_DispatchThreadID)
+{
+    uint slotA = GiCacheFind(uint2(g_TestKeyAX, g_TestKeyAY), false);
+    uint slotB = GiCacheFind(uint2(g_TestKeyBX, g_TestKeyBY), false);
+    uint otherLifetime = GiCacheFind(uint2(g_TestKeyAX + 123u, g_TestKeyAY), false);
+    float3 irradiance;
+    bool valid = GiCacheQuery(slotA, irradiance);
+    g_TestResults[0] = float4(irradiance, valid ? 1 : 0);
+    g_TestResults[1] = float4(slotA, slotB, otherLifetime == GI_CACHE_INVALID ? 1 : 0, GiGuideAvailable(slotA) ? 1 : 0);
+    float integral = 0.0f;
+    float maxDifference = 0.0f;
+    float minimumPdf = 1e20f;
+    if (slotA != GI_CACHE_INVALID)
+    {
+        float3 n = float3(0, 0, 1);
+        float3 t, b;
+        GiGuideBasis(n, t, b);
+        [unroll] for (uint bin = 0u; bin < 8u; ++bin)
+        {
+            float z = (float(bin >> 2u) + 0.5f) * 0.5f;
+            float phi = (float(bin & 3u) + 0.5f) * (GI_CACHE_PI * 0.5f);
+            float r = sqrt(1.0f - z * z);
+            float3 wi = t * (r * cos(phi)) + b * (r * sin(phi)) + n * z;
+            float pdf = GiGuidePdf(slotA, n, wi);
+            integral += pdf * (GI_CACHE_PI * 0.25f);
+            minimumPdf = min(minimumPdf, pdf);
+        }
+        [loop] for (uint i = 0u; i < 1024u; ++i)
+        {
+            float pdf;
+            float3 wi = GiGuideSample(slotA, n, float2((float(i) + 0.5f) / 1024.0f, frac(float(i) * 0.61803398875f)), pdf);
+            maxDifference = max(maxDifference, abs(pdf - GiGuidePdf(slotA, n, wi)));
+        }
+    }
+    g_TestResults[2] = float4(integral, maxDifference, minimumPdf, 0);
+}

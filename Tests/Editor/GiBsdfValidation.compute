@@ -1,0 +1,103 @@
+#pragma kernel ValidateBsdf
+#pragma use_dxc
+#pragma target 5.0
+
+#include "../../Runtime/Rendering/Shaders/GiPrototypes/GiBsdf.hlsl"
+
+struct GiValidationResult
+{
+    float4 density;
+    float4 sampledEnergy;
+    float4 integratedEnergy;
+    float4 errors;
+};
+RWStructuredBuffer<GiValidationResult> Results;
+
+GiBsdf ValidationMaterial(uint testCase, out float3 wo)
+{
+    GiBsdf bsdf = (GiBsdf)0;
+    bsdf.baseColor = float3(0.8, 0.6, 0.3);
+    bsdf.roughness = 0.7;
+    bsdf.etaI = 1.0;
+    bsdf.etaT = 1.5;
+    wo = normalize(float3(0.6, 0.0, 0.8));
+    if (testCase == 1u) bsdf.metallic = 1.0;
+    if (testCase == 2u || testCase == 3u || testCase == 5u || testCase == 6u || testCase == 8u) bsdf.transparent = 1u;
+    if (testCase == 3u || testCase == 6u)
+    {
+        bsdf.etaI = 1.5;
+        bsdf.etaT = 1.0;
+        wo = normalize(float3(0.95, 0.0, 0.31));
+    }
+    if (testCase >= 4u && testCase <= 7u) bsdf.roughness = 0.0;
+    if (testCase == 4u)
+    {
+        bsdf.metallic = 1.0;
+        bsdf.baseColor = 1.0;
+    }
+    if (testCase == 5u) wo = float3(0, 0, 1);
+    if (testCase == 8u) bsdf.etaT = 1.0;
+    return bsdf;
+}
+
+[numthreads(64, 1, 1)]
+void ValidateBsdf(uint3 dispatchId : SV_DispatchThreadID)
+{
+    uint testCase = dispatchId.x / 64u;
+    if (testCase >= 9u) return;
+    float3 normal = float3(0, 0, 1);
+    float3 wo;
+    GiBsdf bsdf = ValidationMaterial(testCase, wo);
+    uint rng = GiHash(dispatchId.x + 17u);
+    uint integrationRng = GiHash(dispatchId.x + 98731u);
+    GiValidationResult result = (GiValidationResult)0;
+    const uint count = 512u;
+    for (uint i = 0u; i < count; ++i)
+    {
+        GiBsdfSample sampled = GiSample(bsdf, normal, wo, rng);
+        if (sampled.pdf > 0.0)
+        {
+            result.density.x += 1.0;
+            result.density.y += sampled.transmission == 0u ? 1.0 : 0.0;
+            result.sampledEnergy.rgb += sampled.weight;
+            if (any(isnan(sampled.weight)) || any(isinf(sampled.weight)) || any(sampled.weight < 0.0)) result.sampledEnergy.w += 1.0;
+            result.errors.w = max(result.errors.w, abs(length(sampled.direction) - 1.0));
+            if (sampled.delta == 0u)
+            {
+                float3 f;
+                float pdf;
+                GiEvaluate(bsdf, normal, wo, sampled.direction, f, pdf);
+                float3 expected = f * abs(sampled.direction.z) / max(1e-30, pdf);
+                float3 relativeError = abs(expected - sampled.weight) / max(1.0, abs(expected));
+                result.errors.x = max(result.errors.x, max(relativeError.x, max(relativeError.y, relativeError.z)));
+            }
+            else if (testCase == 4u || testCase == 6u || testCase == 8u)
+            {
+                result.errors.z = max(result.errors.z, abs(sampled.weight.x - 1.0));
+            }
+        }
+
+        float z = 2.0 * GiRandom(integrationRng) - 1.0;
+        float phi = 2.0 * GI_PI * GiRandom(integrationRng);
+        float radius = sqrt(max(0.0, 1.0 - z * z));
+        float3 wi = float3(radius * cos(phi), radius * sin(phi), z);
+        float3 f;
+        float pdf;
+        GiEvaluate(bsdf, normal, wo, wi, f, pdf);
+        result.density.z += pdf * (4.0 * GI_PI);
+        result.density.w += wi.z > 0.0 ? pdf * (4.0 * GI_PI) : 0.0;
+        result.integratedEnergy.rgb += f * (abs(wi.z) * 4.0 * GI_PI);
+        if (bsdf.transparent == 0u && wi.z > 0.0)
+        {
+            float3 reverse;
+            float reversePdf;
+            GiEvaluate(bsdf, normal, wi, wo, reverse, reversePdf);
+            float3 error = abs(f - reverse) / max(1.0, abs(f));
+            result.errors.y = max(result.errors.y, max(error.x, max(error.y, error.z)));
+        }
+    }
+    result.density /= float(count);
+    result.sampledEnergy /= float(count);
+    result.integratedEnergy /= float(count);
+    Results[dispatchId.x] = result;
+}

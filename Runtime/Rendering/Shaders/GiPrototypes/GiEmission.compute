@@ -1,0 +1,57 @@
+#pragma kernel ClearGiEmission
+#pragma kernel BuildGiEmission
+#pragma kernel RefitGiEmission
+#pragma target 5.0
+#pragma use_dxc
+#pragma require inlineraytracing Int64
+#pragma only_renderers d3d11
+#pragma multi_compile_local _ CAELIX_GROUP_3_3_3 CAELIX_GROUP_5_5_5 CAELIX_GROUP_4_7_4
+
+#include "GiCommon.hlsl"
+#include "GiEmission.hlsl"
+
+groupshared float giEmissionPartial[64];
+
+[numthreads(64, 1, 1)]
+void ClearGiEmission(uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x + id.y * (65535u * 64u);
+    if (index < 2u * g_GiEmissionLeafCount) g_GiEmissionTree[index] = 0.0f;
+}
+
+[numthreads(64, 1, 1)]
+void BuildGiEmission(uint3 groupId : SV_GroupID, uint lane : SV_GroupIndex)
+{
+    uint brick = g_GiEmissionBuildOffset + groupId.x;
+    if (groupId.x >= g_GiEmissionBuildCount || brick >= g_GiEmissionBrickCount) return;
+    GiEmissionGroup group = g_GiEmissionGroups[GiEmissionFindGroup(brick)];
+    _CaelixBrickPage = group.page;
+    uint brickBase = group.brickBase + (brick - group.firstBrick) * BRICK_DATA_LENGTH;
+    float power = 0.0f;
+    [unroll] for (uint i = 0u; i < 8u; ++i)
+        power += GiEmissionVoxelPower(GiEmissionMaterial(brickBase, lane * 8u + i));
+    giEmissionPartial[lane] = power;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint stride = 4u; stride > 0u; stride >>= 1u)
+    {
+        if ((lane & 7u) < stride) giEmissionPartial[lane] += giEmissionPartial[lane + stride];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (lane == 0u)
+    {
+        GiEmissionVoxelWeights weights;
+        weights.low = float4(giEmissionPartial[0], giEmissionPartial[8], giEmissionPartial[16], giEmissionPartial[24]);
+        weights.high = float4(giEmissionPartial[32], giEmissionPartial[40], giEmissionPartial[48], giEmissionPartial[56]);
+        g_GiEmissionVoxelWeights[brick] = weights;
+        g_GiEmissionTree[g_GiEmissionLeafCount + brick] = dot(weights.low + weights.high, float4(1, 1, 1, 1));
+    }
+}
+
+[numthreads(64, 1, 1)]
+void RefitGiEmission(uint3 id : SV_DispatchThreadID)
+{
+    uint index = id.x + id.y * (65535u * 64u);
+    if (index >= g_GiEmissionLevelCount) return;
+    uint node = g_GiEmissionLevelOffset + index;
+    g_GiEmissionTree[node] = g_GiEmissionTree[node * 2u] + g_GiEmissionTree[node * 2u + 1u];
+}
