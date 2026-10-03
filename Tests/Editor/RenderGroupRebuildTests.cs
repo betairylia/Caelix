@@ -14,6 +14,7 @@ namespace Caelix.Tests
     /// while the group waited for pool room are absent from the enumeration and their removal
     /// records were consumed by earlier cycles, so the previous renderer state cannot be trusted.
     /// </summary>
+    [Category("RenderData")]
     public unsafe class RenderGroupRebuildTests
     {
         private sealed class JobScope : System.IDisposable
@@ -33,7 +34,8 @@ namespace Caelix.Tests
             }
 
             public GenerateGroupRenderDataJob Run(
-                VoxelEntityData data, NativeArray<BrickChange> changes, int count, bool fullUpload)
+                VoxelEntityData data, NativeArray<BrickChange> changes, int count, bool fullUpload,
+                int3 groupKey = default)
             {
                 var job = new GenerateGroupRenderDataJob
                 {
@@ -41,7 +43,7 @@ namespace Caelix.Tests
                     changes = changes,
                     start = 0,
                     count = count,
-                    groupKey = int3.zero,
+                    groupKey = groupKey,
                     grouping = Grouping,
                     forceFullUpload = fullUpload,
                     rendererBrickMap = Map,
@@ -50,7 +52,7 @@ namespace Caelix.Tests
                     stagingSlots = new NativeList<int>(4, Allocator.TempJob),
                     syncRecord = new NativeArray<int>(1, Allocator.TempJob)
                 };
-                job.Run();
+                job.Schedule().Complete();
                 return job;
             }
 
@@ -74,6 +76,115 @@ namespace Caelix.Tests
             var copy = new NativeArray<BrickChange>(math.max(1, view.Length), Allocator.TempJob);
             for (int i = 0; i < view.Length; i++) copy[i] = view[i];
             return copy;
+        }
+
+        private static void AssertRecord(GenerateGroupRenderDataJob job, int index, VoxelEntityData data, int3 key)
+        {
+            int* expected = stackalloc int[BrickRecordLayout.BRICK_DATA_LENGTH];
+            uint coarse = BrickRenderLayoutTests.GenerateScalarRecord(data, key, expected, out int3 min, out int3 max);
+            expected[0] = BrickRecordLayout.PackBrickInfo(job.grouping.LocalBrickIdx(job.grouping.LocalBrick(key)), coarse);
+            expected[1] = BrickRecordLayout.PackBrickTightBounds(min, max);
+            for (int word = 0; word < BrickRecordLayout.BRICK_DATA_LENGTH; word++)
+                Assert.That(job.stagingWords[index * BrickRecordLayout.BRICK_DATA_LENGTH + word], Is.EqualTo(expected[word]), $"word {word}");
+            int3 origin = BrickKey.ToBlockOrigin(job.grouping.LocalBrick(key));
+            var aabb = job.aabbBuffer[job.stagingSlots[index]];
+            Assert.That(aabb.min, Is.EqualTo((Vector3)(float3)(origin + min)));
+            Assert.That(aabb.max, Is.EqualTo((Vector3)(float3)(origin + max + 1)));
+        }
+
+        [TestCase(-2, 3, -1)]
+        [TestCase(1, -1, 2)]
+        public void FullUpload_NonzeroGroup_MatchesScalarRecordAndGroupLocalBounds(int x, int y, int z)
+        {
+            using var scope = new EntityDataTestScope();
+            using var jobs = new JobScope();
+            int3 groupKey = new int3(x, y, z);
+            int3 key = jobs.Grouping.FirstKey(groupKey) + new int3(0, 15, 0);
+            int3 origin = BrickKey.ToBlockOrigin(key);
+            scope.Data.EnsureRegion(VoxelRegion.OfKey(key));
+            scope.Data.SetBlock(origin, new Block(5));
+            scope.Data.SetBlock(origin + new int3(7), new Block(0x8001));
+            using var empty = new NativeArray<BrickChange>(0, Allocator.TempJob);
+            var job = jobs.Run(scope.Data, empty, 0, true, groupKey);
+            try
+            {
+                Assert.That(job.stagingSlots.Length, Is.EqualTo(1));
+                AssertRecord(job, 0, scope.Data, key);
+            }
+            finally { DisposeJob(job); }
+        }
+
+        [Test]
+        public void DeltaRebuild_UpdatesPayloadAndBoundsThenRetiresEmptyBrick()
+        {
+            using var scope = new EntityDataTestScope();
+            using var jobs = new JobScope();
+            scope.Data.EnsureRegion(int3.zero);
+            scope.Data.SetBlock(new int3(1), new Block(0x8001));
+            scope.Data.SetBlock(new int3(6), new Block(0x8001));
+            using var changeStorage = new NativeArray<BrickChange>(1, Allocator.TempJob);
+            var changes = changeStorage;
+            changes[0] = new BrickChange { Key = int3.zero, RequireUpdateFlags = BrickUpdateFlags.GeometryWithLocalNeighbor };
+            DisposeJob(jobs.Run(scope.Data, changes, 1, false));
+
+            scope.Data.SetBlock(new int3(1), new Block(0x8002));
+            var payload = jobs.Run(scope.Data, changes, 1, false);
+            try
+            {
+                AssertRecord(payload, 0, scope.Data, int3.zero);
+                Assert.That(payload.syncRecord[0], Is.Zero, "material-only change preserves the AABB");
+            }
+            finally { DisposeJob(payload); }
+
+            scope.Data.SetBlock(new int3(6), Block.Empty);
+            var shrink = jobs.Run(scope.Data, changes, 1, false);
+            try
+            {
+                AssertRecord(shrink, 0, scope.Data, int3.zero);
+                Assert.That(shrink.syncRecord[0], Is.EqualTo(1));
+            }
+            finally { DisposeJob(shrink); }
+
+            scope.Data.SetBlock(new int3(1), Block.Empty);
+            var removed = jobs.Run(scope.Data, changes, 1, false);
+            try
+            {
+                Assert.That(jobs.Map.Count, Is.Zero);
+                Assert.That(removed.syncRecord[0], Is.EqualTo(1));
+                Assert.That(float.IsNaN(jobs.Aabbs[removed.stagingSlots[0]].min.x), Is.True);
+                for (int word = 1; word < removed.stagingWords.Length; word++)
+                    Assert.That(removed.stagingWords[word], Is.Zero);
+            }
+            finally { DisposeJob(removed); }
+        }
+
+        [Test]
+        public void RemovalThenAddition_ReusesOneStagingRecordWithoutOldPayload()
+        {
+            using var scope = new EntityDataTestScope();
+            using var jobs = new JobScope();
+            scope.Data.EnsureRegion(int3.zero);
+            scope.Data.SetBlock(new int3(1), new Block(5));
+            using var changeStorage = new NativeArray<BrickChange>(2, Allocator.TempJob);
+            var changes = changeStorage;
+            changes[0] = new BrickChange { Key = int3.zero, RequireUpdateFlags = BrickUpdateFlags.GeometryWithLocalNeighbor };
+            DisposeJob(jobs.Run(scope.Data, changes, 1, false));
+            short originalId = jobs.Map.indices[0];
+
+            scope.Data.SetBlock(new int3(1), Block.Empty);
+            int3 newKey = new int3(2, 0, 0);
+            scope.Data.SetBlock(BrickKey.ToBlockOrigin(newKey) + new int3(6), new Block(0x8001));
+            changes[0] = new BrickChange { Key = int3.zero, Kind = ChangeKind.Removed };
+            changes[1] = new BrickChange { Key = newKey, RequireUpdateFlags = BrickUpdateFlags.BlockBrickAdded };
+            var job = jobs.Run(scope.Data, changes, 2, false);
+            try
+            {
+                Assert.That(job.stagingSlots.Length, Is.EqualTo(1));
+                Assert.That(job.stagingSlots[0], Is.EqualTo(originalId));
+                Assert.That(jobs.Map.Count, Is.EqualTo(1));
+                AssertRecord(job, 0, scope.Data, newKey);
+            }
+            finally { DisposeJob(job); }
         }
 
         [Test]

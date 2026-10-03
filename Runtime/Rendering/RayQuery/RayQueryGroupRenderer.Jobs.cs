@@ -1,5 +1,6 @@
 using Unity.Burst;
 using Unity.Collections;
+using Unity.Collections.LowLevel.Unsafe;
 using Unity.Jobs;
 using Unity.Mathematics;
 using UnityEngine;
@@ -14,7 +15,7 @@ namespace Caelix.Rendering.RayQuery
     /// Per brick it writes one record in the layout <see cref="BrickRecordLayout"/> describes, in
     /// group-local brick positions. Work is selected from the change list rather than by sweeping
     /// brick positions: the job walks the entries this cycle already named, binds each brick by key
-    /// and opens a 27-brick window around it for the face culling.
+    /// and binds its six face neighbors for SIMD face culling.
     /// </remarks>
     [BurstCompile]
     internal struct GenerateGroupRenderDataJob : IJob
@@ -78,9 +79,11 @@ namespace Caelix.Rendering.RayQuery
         /// </summary>
         public NativeArray<int> syncRecord;
 
-        public void Execute()
+        public unsafe void Execute()
         {
             syncRecord[0] = 0;
+            // Reuse one scratch record for the whole job, including completely culled bricks.
+            int* record = stackalloc int[BrickRecordLayout.BRICK_DATA_LENGTH];
 
             // Staging index of every slot a removal has already written, or -1. Allocated on the
             // first removal only; see TakeStagingRecord for what it is for.
@@ -96,7 +99,7 @@ namespace Caelix.Rendering.RayQuery
                 foreach (int3 key in data.EnumerateBricks(
                              grouping.FirstKey(groupKey), grouping.LastKey(groupKey)))
                 {
-                    ProcessBrick(key, true, ref removedStagingBase);
+                    ProcessBrick(key, record, ref removedStagingBase);
                 }
             }
             else
@@ -118,7 +121,7 @@ namespace Caelix.Rendering.RayQuery
                         continue;
                     }
 
-                    ProcessBrick(change.Key, isAdded, ref removedStagingBase);
+                    ProcessBrick(change.Key, record, ref removedStagingBase);
                 }
             }
 
@@ -129,7 +132,7 @@ namespace Caelix.Rendering.RayQuery
         }
 
         /// <summary>
-        /// Reserves the staging record a brick's words are written into: a zeroed block appended
+        /// Reserves the staging record a brick's words are written into: a block appended
         /// to <see cref="stagingWords"/>, with <paramref name="rendererBrickId"/> appended to
         /// <see cref="stagingSlots"/>.
         /// </summary>
@@ -138,10 +141,11 @@ namespace Caelix.Rendering.RayQuery
         /// and <see cref="SparseBrickIdTable"/> hands a freed id straight back out, so a brick
         /// added later in the same run can claim that very slot. Two staged records for one slot
         /// would race inside the scatter kernel — its threads run in no order — so the removal's
-        /// record is taken over instead of a second one being appended. It is already zeroed,
-        /// which is exactly what a fresh record needs.
+        /// record is taken over instead of a second one being appended. Removal records request
+        /// zero initialization; live records overwrite every word from their scratch record.
         /// </remarks>
-        private int TakeStagingRecord(int rendererBrickId, ref NativeArray<int> removedStagingBase)
+        private int TakeStagingRecord(int rendererBrickId, ref NativeArray<int> removedStagingBase,
+            NativeArrayOptions options = NativeArrayOptions.ClearMemory)
         {
             if (removedStagingBase.IsCreated && removedStagingBase[rendererBrickId] >= 0)
             {
@@ -151,7 +155,7 @@ namespace Caelix.Rendering.RayQuery
             }
 
             int stagingBase = stagingWords.Length;
-            stagingWords.Resize(stagingBase + BrickRecordLayout.BRICK_DATA_LENGTH, NativeArrayOptions.ClearMemory);
+            stagingWords.Resize(stagingBase + BrickRecordLayout.BRICK_DATA_LENGTH, options);
             stagingSlots.Add(rendererBrickId);
             return stagingBase;
         }
@@ -227,7 +231,7 @@ namespace Caelix.Rendering.RayQuery
             syncRecord[0] = 1;
         }
 
-        private unsafe void ProcessBrick(int3 key, bool isAdded, ref NativeArray<int> removedStagingBase)
+        private unsafe void ProcessBrick(int3 key, int* record, ref NativeArray<int> removedStagingBase)
         {
             int3 local = grouping.LocalBrick(key);
 
@@ -239,93 +243,33 @@ namespace Caelix.Rendering.RayQuery
                 return;
             }
 
-            VoxelNeighborhood neighborhood = data.OpenNeighborhood(key);
-
             int localIdx = grouping.LocalBrickIdx(local);
 
             // Group-local block coordinates: the frame the instance's translation is built in.
             int3 brickBlockPos = BrickKey.ToBlockOrigin(local);
 
-            // Neighbour reads are ENTITY-local, the frame the neighbourhood window was opened in.
-            int3 brickOriginBlock = BrickKey.ToBlockOrigin(key);
+            uint coarseOccupancy = BrickRecordLayout.GenerateBrickRecord(data, key, brick, record,
+                out int3 occupiedMin, out int3 occupiedMax);
 
-            int rendererBrickId = -1;
-            int rendererBrickBase = -1;
-
-            uint coarseOccupancy = 0;
-            int3 occupiedMin = new int3(BrickKey.BlocksPerAxis);
-            int3 occupiedMax = new int3(-1);
-
-            // Brick data
-            for (int bz = 0; bz < BrickKey.BlocksPerAxis; bz++)
-            {
-                for (int by = 0; by < BrickKey.BlocksPerAxis; by++)
-                {
-                    // Assume X-First
-                    for (int bx = 0; bx < BrickKey.BlocksPerAxis; bx += 2)
-                    {
-                        Block block0 = brick[BrickKey.ToBlockIdx(bx, by, bz)];
-                        Block block1 = brick[BrickKey.ToBlockIdx(bx + 1, by, bz)];
-
-                        int rendererBlockIdx = BrickKey.ToBlockIdx(bx, by, bz) / 2;
-
-                        uint block0Data = BrickRecordLayout.GetRendererBlockData(
-                            block0, brickOriginBlock + new int3(bx, by, bz), ref neighborhood);
-                        uint block1Data = BrickRecordLayout.GetRendererBlockData(
-                            block1, brickOriginBlock + new int3(bx + 1, by, bz), ref neighborhood);
-
-                        // Do nothing if blocks are empty. The staged record starts zeroed, so an
-                        // empty pair simply stays zero.
-                        if (Block.IsRendererDataEmpty(block0Data) && Block.IsRendererDataEmpty(block1Data))
-                        {
-                            continue;
-                        }
-
-                        // Brick not allocated yet
-                        if (rendererBrickId == -1)
-                        {
-                            // Claim this brick's renderer id
-                            isAdded = rendererBrickMap.AddBrickAt(localIdx, out rendererBrickId, out bool requireExtension);
-                            if (requireExtension)
-                            {
-                                aabbBuffer.Resize(rendererBrickMap.Capacity, NativeArrayOptions.UninitializedMemory);
-                            }
-
-                            // The record is staged zeroed, so the block words before this one,
-                            // the occupancy words and the info words need no explicit reset.
-                            rendererBrickBase = TakeStagingRecord(rendererBrickId, ref removedStagingBase);
-                        }
-
-                        stagingWords[rendererBrickBase + BrickRecordLayout.BRICK_BLOCK_DATA_OFFSET + rendererBlockIdx] =
-                            unchecked((int)((block0Data << 16) | block1Data));
-
-                        if (!Block.IsRendererDataEmpty(block0Data))
-                        {
-                            AccumulateOccupancy(ref coarseOccupancy, rendererBrickBase, bx, by, bz);
-                            occupiedMin = math.min(occupiedMin, new int3(bx, by, bz));
-                            occupiedMax = math.max(occupiedMax, new int3(bx, by, bz));
-                        }
-
-                        if (!Block.IsRendererDataEmpty(block1Data))
-                        {
-                            AccumulateOccupancy(ref coarseOccupancy, rendererBrickBase, bx + 1, by, bz);
-                            occupiedMin = math.min(occupiedMin, new int3(bx + 1, by, bz));
-                            occupiedMax = math.max(occupiedMax, new int3(bx + 1, by, bz));
-                        }
-                    }
-                }
-            }
-
-            // Handle removal if brick empty
-            // TODO: Compaction?
+            // Retire the renderer slot when face culling leaves no visible voxel data.
             if (coarseOccupancy == 0)
             {
                 RemoveRendererBrick(local, ref removedStagingBase);
                 return;
             }
 
-            stagingWords[rendererBrickBase] = BrickRecordLayout.PackBrickInfo(localIdx, coarseOccupancy);
-            stagingWords[rendererBrickBase + 1] = BrickRecordLayout.PackBrickTightBounds(occupiedMin, occupiedMax);
+            bool isAdded = rendererBrickMap.AddBrickAt(localIdx, out int rendererBrickId, out bool requireExtension);
+            if (requireExtension)
+            {
+                aabbBuffer.Resize(rendererBrickMap.Capacity, NativeArrayOptions.UninitializedMemory);
+            }
+
+            record[0] = BrickRecordLayout.PackBrickInfo(localIdx, coarseOccupancy);
+            record[1] = BrickRecordLayout.PackBrickTightBounds(occupiedMin, occupiedMax);
+            int rendererBrickBase = TakeStagingRecord(rendererBrickId, ref removedStagingBase,
+                NativeArrayOptions.UninitializedMemory);
+            UnsafeUtility.MemCpy((int*)stagingWords.GetUnsafePtr() + rendererBrickBase, record,
+                BrickRecordLayout.BRICK_DATA_LENGTH * sizeof(int));
 
             // AABB tight to the occupied blocks, in group-local block coordinates.
             // Rewritten on every rebuild since edits can grow or shrink the bounds;
@@ -355,17 +299,6 @@ namespace Caelix.Rendering.RayQuery
                 aabbBuffer[rendererBrickId] = tightAABB;
                 syncRecord[0] = 1;
             }
-        }
-
-        private void AccumulateOccupancy(ref uint coarseOccupancy, int bp, int bx, int by, int bz)
-        {
-            int coarseBit = BrickRecordLayout.ToCoarseOccupancyBit(bx, by, bz);
-            int microBit = BrickRecordLayout.ToMicroOccupancyBit(bx, by, bz);
-            int wordOffset = BrickRecordLayout.ToOccupancyWordOffset(coarseBit, microBit);
-            uint wordBit = 1u << (microBit & 31);
-
-            coarseOccupancy |= 1u << coarseBit;
-            stagingWords[bp + wordOffset] = unchecked((int)(uint)stagingWords[bp + wordOffset] | (int)wordBit);
         }
     }
 }

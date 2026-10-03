@@ -156,11 +156,17 @@ namespace Caelix
                 {
                     for (int i = 0; i < Zs; i++)
                     {
-                        int y = p % VoxelRegion.SizeInBlocks;
                         int z = ((p / VoxelRegion.SizeInBlocks) % (VoxelRegion.SizeInBlocks / Zs)) * Zs + i;
-                        int3 pos = origin + new int3(x, y, z);
-                        region.SetBlock(
-                            pos, new Block((ushort)(region.GetBlock(pos).isEmpty ? new Block(0.5f, 1.0f, 0.8f, 0.0f).data : 0)));
+                        
+                        int Ys = 4;
+                        int y_start = p % (VoxelRegion.SizeInBlocks / Ys);
+                        
+                        for (int y = y_start * Ys; y < (y_start + 1) * Ys; y++)
+                        {
+                            int3 pos = origin + new int3(x, y, z);
+                            region.SetBlock(
+                                pos, new Block((ushort)(region.GetBlock(pos).isEmpty ? new Block(0.5f, 1.0f, 0.8f, 0.0f).data : 0)), BrickUpdateFlags.None);
+                        }
                     }
                 }
             }
