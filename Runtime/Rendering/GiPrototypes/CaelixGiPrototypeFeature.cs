@@ -18,8 +18,7 @@ namespace Caelix.Rendering.GiPrototypes
         public Shader presentShader;
         public Shader depthCopyShader;
 
-        private static int playSession;
-        private int capturedSession = -1;
+        [System.NonSerialized]
         private CaelixGiSettings capturedSettings;
         private CaelixGiPrototypePass pass;
         private Material presentMaterial;
@@ -30,7 +29,11 @@ namespace Caelix.Rendering.GiPrototypes
         public long AllocatedBytes => pass?.AllocatedBytes ?? 0;
 
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
-        private static void BeginSession() => playSession++;
+        internal static void BeginSession()
+        {
+            foreach (var feature in Resources.FindObjectsOfTypeAll<CaelixGiPrototypeFeature>())
+                feature.ResetSession();
+        }
 
         public override void Create()
         {
@@ -46,7 +49,7 @@ namespace Caelix.Rendering.GiPrototypes
         {
             if (!Application.isPlaying || renderingData.cameraData.cameraType != CameraType.Game
                 || renderingData.cameraData.renderType != CameraRenderType.Base) return;
-            CaptureSessionSettings(playSession);
+            CaptureSessionSettings();
             var camera = renderingData.cameraData.camera;
             if (!SystemInfo.supportsInlineRayTracing || SystemInfo.graphicsDeviceType != GraphicsDeviceType.Direct3D12
                 || camera.orthographic || camera.stereoEnabled || !ShadersReady())
@@ -70,14 +73,20 @@ namespace Caelix.Rendering.GiPrototypes
             && cachePathShader != null && emissionShader != null && resolveShader != null
             && presentShader != null && depthCopyShader != null;
 
-        internal CaelixGiSettings CaptureSessionSettings(int session)
+        internal CaelixGiSettings CaptureSessionSettings()
         {
-            if (capturedSession != session || capturedSettings == null)
-            {
-                capturedSession = session;
+            if (capturedSettings == null)
                 capturedSettings = settings.ValidatedCopy();
-            }
             return capturedSettings;
+        }
+
+        /// <summary>Clears the previous run so the next one captures the Inspector settings.</summary>
+        public void ResetSession()
+        {
+            ReleaseResources();
+            capturedSettings = null;
+            scene = null;
+            warned = false;
         }
 
         public void ReleaseResources()

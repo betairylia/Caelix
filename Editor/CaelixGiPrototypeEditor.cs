@@ -43,9 +43,10 @@ namespace Caelix.EditorTools
         {
             EditorApplication.playModeStateChanged += state =>
             {
-                if (state != PlayModeStateChange.EnteredEditMode) return;
+                if (state != PlayModeStateChange.EnteredEditMode
+                    && state != PlayModeStateChange.ExitingEditMode) return;
                 foreach (var feature in Resources.FindObjectsOfTypeAll<CaelixGiPrototypeFeature>())
-                    feature.ReleaseResources();
+                    feature.ResetSession();
             };
         }
 

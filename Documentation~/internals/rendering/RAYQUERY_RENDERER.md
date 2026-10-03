@@ -237,7 +237,9 @@ trace of every new material buffer (`CaelixRayQueryRenderer.MaterialsBaked`).
 
 `CaelixGiPrototypeFeature` uses the same voxel acceleration structure with six selectable
 approaches. Choose the approach and settings before Play Mode. The feature captures a copy
-for that session, including when URP recreates its passes. CAGI is deferred.
+for that session, including when URP recreates its passes. Stopping Play Mode clears the captured
+settings and GPU resources; the next run captures the new selection with domain reload enabled or
+disabled. CAGI is deferred.
 
 ### Setup and comparison
 
