@@ -38,6 +38,13 @@ namespace Caelix.Tests
             public uint token, voxelFace, reserved0, reserved1;
         }
 
+        [StructLayout(LayoutKind.Sequential)]
+        private struct CacheHistoryRecord
+        {
+            public Vector4 irradiance, guide0, guide1;
+            public uint radianceFrame, guideFrame, guideCount, reserved;
+        }
+
         private sealed class Fixture : IDisposable
         {
             public readonly CaelixGiResources State;
@@ -46,7 +53,7 @@ namespace Caelix.Tests
             public readonly GraphicsBuffer Brick, Materials;
             public readonly Cubemap Sky;
             public readonly ComputeShader Reference, Resampling, Cache, CachePath, Emission;
-            public readonly Vector3 CameraPosition = new(4, 4, 12);
+            public Vector3 CameraPosition = new(4, 4, 12);
             public readonly Color SkyColor = new(0.25f, 0.5f, 1, 1);
             public Color ExpectedEmission;
             public uint Token;
@@ -428,6 +435,81 @@ namespace Caelix.Tests
             }
             if (approach != CaelixGiApproach.FaceRadianceCache)
                 Assert.That(guideSamples, Is.GreaterThan(0), "The selected guiding estimator must run.");
+        }
+
+        [Test]
+        public void ResizeKeepsBuiltEmissionData()
+        {
+            using var fixture = new Fixture(CaelixGiApproach.BrickEmissionPathGuiding, true, 0);
+            fixture.State.Settings.samplesPerPixel = 1;
+            fixture.Render();
+            fixture.State.FinishFrame(Matrix4x4.Translate(-fixture.CameraPosition), 0.25f, Vector2.zero);
+            var groups = fixture.State.EmissionGroups;
+            var weights = fixture.State.EmissionWeights;
+            var tree = fixture.State.EmissionTree;
+            var before = new float[2];
+            tree.GetData(before);
+            Assert.That(before[1], Is.GreaterThan(0));
+            fixture.State.Resize(Size * 2, Size);
+            Assert.That(fixture.State.EmissionGroups, Is.SameAs(groups));
+            Assert.That(fixture.State.EmissionWeights, Is.SameAs(weights));
+            Assert.That(fixture.State.EmissionTree, Is.SameAs(tree));
+            Assert.That(fixture.State.EmissionBrickCount, Is.EqualTo(1));
+            Assert.That(fixture.State.ValidLightingHistory, Is.True);
+            Assert.That(fixture.State.ValidHistory, Is.False);
+            var after = new float[2];
+            tree.GetData(after);
+            Assert.That(after, Is.EqualTo(before));
+        }
+
+        [Test]
+        public void RadianceCacheTrainsVisibleFacesWithOneBounceAndOneSample()
+        {
+            using var fixture = new Fixture(CaelixGiApproach.FaceRadianceCache, true, 1);
+            fixture.State.Settings.samplesPerPixel = 1;
+            int previousSamples = 0;
+            for (int frame = 0; frame < 2; frame++)
+            {
+                fixture.Render();
+                var request = AsyncGPUReadback.Request(fixture.State.NextCacheHistory);
+                request.WaitForCompletion();
+                Assert.That(request.hasError, Is.False);
+                int samples = 0;
+                foreach (var record in request.GetData<CacheHistoryRecord>())
+                {
+                    if (record.irradiance.w <= 0) continue;
+                    samples += (int)record.irradiance.w;
+                    Assert.That(record.irradiance.x, Is.EqualTo(fixture.SkyColor.r).Within(0.004f));
+                    Assert.That(record.irradiance.y, Is.EqualTo(fixture.SkyColor.g).Within(0.004f));
+                    Assert.That(record.irradiance.z, Is.EqualTo(fixture.SkyColor.b).Within(0.004f));
+                }
+                // Threads may skip a face while another thread first claims its entry.
+                if (frame == 0) Assert.That(samples, Is.GreaterThan(0));
+                else Assert.That(samples - previousSamples, Is.EqualTo(Size * Size),
+                    "Every primary diffuse sample trains an existing entry without a secondary hit.");
+                previousSamples = samples;
+                fixture.State.FinishFrame(Matrix4x4.Translate(-fixture.CameraPosition), 0.25f, Vector2.zero);
+            }
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void RadianceCacheQueriesVisibleFacesWithoutASecondaryHit(bool moveCamera)
+        {
+            using var fixture = new Fixture(CaelixGiApproach.FaceRadianceCache, true, 1);
+            fixture.State.Settings.samplesPerPixel = 1;
+            fixture.Render();
+            fixture.State.FinishFrame(Matrix4x4.Translate(-fixture.CameraPosition), 0.25f, Vector2.zero);
+            var records = new CacheHistoryRecord[fixture.State.Settings.cacheCapacity];
+            fixture.State.CacheHistory.GetData(records);
+            for (int i = 0; i < records.Length; i++)
+                records[i].irradiance = new Vector4(4, 8, 16, 64);
+            fixture.State.CacheHistory.SetData(records);
+            if (moveCamera) fixture.CameraPosition += new Vector3(0.02f, 0, 0);
+            fixture.Render();
+            foreach (var color in fixture.ReadColor())
+                Assert.That(color.r, Is.GreaterThan(fixture.ExpectedEmission.r + 1),
+                    "The warm primary face must reuse diffuse lighting, not just resample the sky.");
         }
 
         private static void AssertColors(Color[] pixels, Color expected)

@@ -80,7 +80,7 @@ namespace Caelix.Tests
             var history = new Color[count];
             for (int i = 0; i < count; ++i)
             {
-                previous[i] = new Surface { flags = 1, material = 42, token = 11, face = 37, normal = Vector3.forward, depth = 4 };
+                previous[i] = new Surface { flags = 1, material = 42, token = 11, face = 37, normal = Vector3.forward, depth = 4, reserved0 = 3 };
                 current[i] = previous[i];
                 raw[i] = new Color(6, 8, 10, 1);
                 history[i] = new Color(2, 4, 6, 3);
@@ -107,6 +107,7 @@ namespace Caelix.Tests
                 int kernel = shader.FindKernel("GiResolve");
                 shader.SetInts("g_GiResolution", count, 1);
                 shader.SetInt("g_GiAccumulationValid", valid ? 1 : 0);
+                shader.SetInt("g_GiStationary", 1);
                 shader.SetInt("g_GiAccumulationLimit", limit);
                 shader.SetBuffer(kernel, "g_GiSurfaces", state.Surfaces);
                 shader.SetBuffer(kernel, "g_GiPreviousSurfaces", state.PreviousSurfaces);
@@ -115,6 +116,7 @@ namespace Caelix.Tests
                 shader.SetTexture(kernel, "g_GiResolvedColor", state.ResolvedColor.rt);
                 shader.Dispatch(kernel, 1, 1, 1);
                 Color[] result = Read(state.ResolvedColor.rt);
+                state.Surfaces.GetData(current);
                 for (int i = 0; i < count; ++i)
                 {
                     // Jitter may sample another face, material, or sky inside this same static pixel.
@@ -122,6 +124,8 @@ namespace Caelix.Tests
                     Color expected = (raw[i] + history[i] * weight) / (weight + 1);
                     expected.a = weight + 1;
                     AssertColor(result[i], expected);
+                    uint coherent = i == 4 || i == 5 ? 0u : valid && limit > 1 && (i == 0 || i >= 6) ? 4u : 1u;
+                    Assert.That(current[i].reserved0, Is.EqualTo(coherent), $"pixel {i} face coherence");
                 }
                 Assert.That(result[7].r, Is.GreaterThan(65504), "HDR must survive above the Float16 range");
             }
@@ -130,6 +134,129 @@ namespace Caelix.Tests
                 Object.DestroyImmediate(shader);
                 Object.DestroyImmediate(rawTexture);
                 Object.DestroyImmediate(previousTexture);
+            }
+        }
+
+        [TestCase("Translation", true)]
+        [TestCase("PreviousProjectionAndJitter", true)]
+        [TestCase("RotatedPreviousView", true)]
+        [TestCase("ShortHistoryLimit", true)]
+        [TestCase("DifferentFace", false)]
+        [TestCase("DifferentLifetime", false)]
+        [TestCase("DifferentMaterial", false)]
+        [TestCase("ReversedNormal", false)]
+        [TestCase("Miss", false)]
+        [TestCase("ViewDependentMaterial", false)]
+        [TestCase("MixedSilhouetteHistory", false)]
+        [TestCase("DifferentDepth", false)]
+        [TestCase("DifferentPosition", false)]
+        [TestCase("DifferentPlane", false)]
+        [TestCase("InvalidColor", false)]
+        [TestCase("EmptyHistory", false)]
+        [TestCase("Offscreen", false)]
+        [TestCase("BehindCamera", false)]
+        [TestCase("ChangedViewingDirection", false)]
+        [TestCase("LightingReset", false)]
+        [TestCase("AccumulationDisabled", false)]
+        public void MovingResolveReprojectsOnlyValidatedSurfaceHistory(string scenario, bool accepted)
+        {
+            const int count = 4;
+            using var state = new CaelixGiResources(count, 1, new CaelixGiSettings());
+            var current = new Surface[count];
+            var previous = new Surface[count];
+            var oldCamera = Vector3.zero;
+            var newCamera = new Vector3(0.02f, 0, 0);
+            var jitter = Vector2.zero;
+            float zoom = 0.125f;
+            bool valid = scenario != "LightingReset";
+            int limit = scenario == "AccumulationDisabled" ? 1 : scenario == "ShortHistoryLimit" ? 4 : 64;
+            var surface = new Surface
+            {
+                flags = 1, material = 42, token = 11, face = 37, normal = Vector3.forward,
+                position = new Vector3(0.5f, 0, -4), depth = 4, reserved0 = 64
+            };
+            if (scenario == "PreviousProjectionAndJitter")
+            {
+                oldCamera = new Vector3(0.2f, 0, 0);
+                newCamera = new Vector3(0.21f, 0, 0);
+                zoom = 0.25f;
+                jitter = new Vector2(0.25f, 0);
+                surface.position.x = 1.7f;
+            }
+            Matrix4x4 previousView = Matrix4x4.Translate(-oldCamera);
+            if (scenario == "RotatedPreviousView")
+            {
+                var rotation = Quaternion.Euler(0, 30, 0);
+                surface.position = rotation * surface.position;
+                surface.normal = rotation * surface.normal;
+                previousView = Matrix4x4.Rotate(Quaternion.Inverse(rotation));
+            }
+            surface.previousPosition = surface.position;
+            current[1] = previous[2] = surface;
+            current[1].reserved0 = 0;
+            switch (scenario)
+            {
+                case "DifferentFace": previous[2].face++; break;
+                case "DifferentLifetime": previous[2].token++; break;
+                case "DifferentMaterial": previous[2].material++; break;
+                case "ReversedNormal": previous[2].normal = Vector3.back; break;
+                case "Miss": current[1].flags = 0; break;
+                case "ViewDependentMaterial": current[1].flags = previous[2].flags = 3; break;
+                case "MixedSilhouetteHistory": previous[2].reserved0 = 63; break;
+                case "DifferentDepth": previous[2].depth = 8; break;
+                case "DifferentPosition": previous[2].position.x += 4; break;
+                case "DifferentPlane": previous[2].position.z += 0.1f; break;
+                case "Offscreen": current[1].previousPosition.x = 20; break;
+                case "BehindCamera": current[1].previousPosition.z = 4; break;
+                case "ChangedViewingDirection": newCamera = new Vector3(4, 0, 0); break;
+            }
+            var raw = new Color[count];
+            var history = new Color[count];
+            for (int i = 0; i < count; i++)
+            {
+                raw[i] = new Color(6, 8, 10, 1);
+                history[i] = new Color(1000, 1000, 1000, 64);
+            }
+            history[2] = new Color(2, 4, 6, 64);
+            if (scenario == "InvalidColor") history[2].r = float.NaN;
+            if (scenario == "EmptyHistory") history[2].a = 0;
+            state.Surfaces.SetData(current);
+            state.PreviousSurfaces.SetData(previous);
+            var rawTexture = Texture(raw);
+            var historyTexture = Texture(history);
+            var shader = Object.Instantiate(AssetDatabase.LoadAssetAtPath<ComputeShader>(Root + "GiResolve.compute"));
+            try
+            {
+                Graphics.CopyTexture(rawTexture, state.RawColor.rt);
+                Graphics.CopyTexture(historyTexture, state.PreviousColor.rt);
+                int kernel = shader.FindKernel("GiResolve");
+                shader.SetInts("g_GiResolution", count, 1);
+                shader.SetInt("g_GiAccumulationValid", valid ? 1 : 0);
+                shader.SetInt("g_GiStationary", 0);
+                shader.SetInt("g_GiAccumulationLimit", limit);
+                shader.SetFloat("g_GiPreviousZoom", zoom);
+                shader.SetVector("g_GiPreviousJitter", jitter);
+                shader.SetMatrix("g_GiPreviousWorldToCamera", previousView);
+                shader.SetVector("g_GiCameraPosition", newCamera);
+                shader.SetVector("g_GiPreviousCameraPosition", oldCamera);
+                shader.SetBuffer(kernel, "g_GiSurfaces", state.Surfaces);
+                shader.SetBuffer(kernel, "g_GiPreviousSurfaces", state.PreviousSurfaces);
+                shader.SetTexture(kernel, "g_GiRawColor", state.RawColor.rt);
+                shader.SetTexture(kernel, "g_GiPreviousColor", state.PreviousColor.rt);
+                shader.SetTexture(kernel, "g_GiResolvedColor", state.ResolvedColor.rt);
+                shader.Dispatch(kernel, 1, 1, 1);
+                int historyLength = Mathf.Min(limit, 8);
+                Color expected = accepted ? new Color(2, 4, 6, historyLength)
+                    + new Color(4, 4, 4, 0) / historyLength : raw[1];
+                AssertColor(Read(state.ResolvedColor.rt)[1], expected);
+                state.Surfaces.GetData(current);
+                Assert.That(current[1].reserved0, Is.EqualTo(accepted ? (uint)historyLength : scenario == "Miss" ? 0u : 1u));
+            }
+            finally
+            {
+                Object.DestroyImmediate(shader);
+                Object.DestroyImmediate(rawTexture);
+                Object.DestroyImmediate(historyTexture);
             }
         }
 

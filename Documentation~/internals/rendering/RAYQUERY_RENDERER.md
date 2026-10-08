@@ -262,9 +262,11 @@ off-axis and stereo projections are outside this prototype.
 
 Keep resolution, samples, bounces, sky intensity, camera position, and scene state fixed between
 runs. **Accumulation Frames = 1** shows each frame's estimator without the common image average;
-larger values average a stationary camera and restart on camera movement. Subpixel jitter can hit
-different voxel faces within one pixel; this does not invalidate the stationary pixel average.
-Scene, material and lighting invalidation still reset it. Warm caches separately
+larger values average a stationary camera and reproject validated surface history during movement.
+Moving history is capped at eight frames and at **Accumulation Frames**, whichever is smaller.
+Subpixel jitter can hit different voxel faces within one stationary pixel; this does not invalidate
+its image average, but a pixel containing mixed faces cannot be reprojected onto a single face.
+Scene, material and lighting invalidation still reset the average. Warm caches separately
 from cold runs. Equal sample counts do not imply equal ray counts: cache training and emitter
 visibility add work. Measure GPU time and image error rather than assuming equal cost.
 
@@ -279,7 +281,7 @@ ran before opaque rendering, such as a depth prepass consumer, do not receive pr
 | Reference Path Tracing | Independent BSDF paths, environment and emitter hits, roulette | Finite scattering budget; no explicit light sampling |
 | Restir Gi | Initial RIS candidates, temporal reprojection, spatial reservoirs, reconnection Jacobian, visibility | Basic biased reuse normalization; no all-source pairwise MIS correction |
 | Naadf Inspired | 8x8 buckets, eight retained lit samples per bucket, explicit unlit counts, compressed weighted radiance, temporal/spatial reuse | History requires a stationary camera; no original NAADF mirror-chain reprojection, adaptive radius, or sample leveling |
-| Face Radiance Cache | Sparse irradiance per exact voxel face; independent path samples train a reusable diffuse tail | Biased spatial average and finite training tail; glossy/transmissive parts continue tracing |
+| Face Radiance Cache | Sparse irradiance per exact voxel face, including visible primary faces; independent paths train reusable diffuse lighting | Biased spatial average and finite training tail; glossy/transmissive parts continue tracing |
 | Face Path Guiding | Eight directional bins per face, exploration floor, BSDF/guide mixture with matching PDF | Coarse direction distribution; fresh paths still determine radiance |
 | Brick Emission Path Guiding | GPU emitter sum tree and voxel weights, explicit emitter sampling with visibility/MIS, plus learned guiding | Six faces of each retained opaque emitter are proposal mass; hidden faces waste samples |
 
@@ -290,9 +292,13 @@ the diffuse component are reused; directional components are independently trace
 research implementations, not claims of equivalence to RTXDI or the original NAADF renderer.
 
 The radiance cache stores incoming diffuse irradiance divided by pi. Material color is applied at
-lookup. Each record averages across one voxel face; there is no grouping of adjacent faces. A
-training suffix uses a fixed bounce budget independent of the depth of the receiving path, so a
-cache hit can approximate a longer tail than the finite reference path at the same setting.
+lookup. Each record averages across one voxel face; there is no grouping of adjacent faces.
+Both primary and secondary diffuse surfaces can query it, so a warmed visible face retains its
+diffuse lighting when the camera moves. One randomly selected scattering vertex per path trains
+from an independent reference suffix. Glossy and transmissive components continue tracing.
+The training suffix uses a fixed bounce budget independent of the depth of the receiving path,
+so a secondary cache hit can approximate a longer tail than the finite reference path at the same
+setting. Primary face averaging can soften shadows within an individual voxel face.
 Cache training uses fixed-point atomics, caps each channel/sample at `16383`, and accepts at most
 1024 samples per slot per frame. NAADF's RGB9E5 compression caps channels at `65408`. These limits
 can bias unusually bright transport and should be considered when comparing images.
@@ -329,6 +335,17 @@ worlds. Sky texture identity/update counters also invalidate history. A caller m
 in place without changing the texture counter must call `CaelixRayQueryRenderer.InvalidateGiHistory()`;
 material-table changes also require rebaking via `MaterialsBaked = false`.
 
+Camera translation, rotation, FOV changes and image resizing preserve face caches and emitter
+data. A resize recreates pixel buffers and starts a new image average; it preserves cache age and
+does not rebuild emitter weights. ReSTIR reservoirs reset on resize or FOV changes. NAADF bucket
+history still requires a stationary camera.
+
+The common image resolve reprojects using the previous view, FOV and jitter. It accepts matching
+face identity, material, normal, depth and position with a small change in viewing direction.
+Newly visible faces, sky, glass, sharp reflections and mixed silhouette history start fresh.
+Thus motion can still expose noisy pixels even with warm caches. The resolve stores its face
+coherence count in existing surface padding; it adds no GPU allocations or ray payload fields.
+
 Implementation: [feature and settings](../../../Runtime/Rendering/GiPrototypes),
 [shaders](../../../Runtime/Rendering/Shaders/GiPrototypes),
 [GPU smoke tests](../../../Tests/Editor/GiPrototypeGpuSmokeTests.cs),
@@ -337,6 +354,10 @@ Implementation: [feature and settings](../../../Runtime/Rendering/GiPrototypes),
 [resampling tests](../../../Tests/Editor/GiResamplingTests.cs).
 
 ### Bistro comparison and defaults
+
+These measurements predate the primary-face caching and motion reprojection changes below.
+They remain the basis of the saved defaults; current visual quality and GPU times need a new
+Play Mode comparison.
 
 The 2026-10-04 comparison used Unity 6000.5.6f1, DX12, RTX 5080, packed Bistro 4096, and one
 stationary street view. The game view was 2560x1440 with GI at 1280x720. All rows below use
@@ -362,7 +383,7 @@ or an equal-time benchmark. Movement, other viewpoints, and material stress scen
 visual checks.
 
 - Common recommended values: resolution scale `0.5`, samples `1`, max bounces `4`, sky intensity `1`,
-  accumulation frames `64`. Accumulation restarts during camera movement.
+  accumulation frames `64`. Validated moving image history now uses at most eight frames.
 - ReSTIR/NAADF: spatial samples `4`, radius `8`, history frames `2`. ReSTIR max reservoir count `8`.
   These reduce the patches and darkening seen with radius 24/history 8. Remaining mean luminance
   was about 90% of reference for ReSTIR and 82% for NAADF; the sampled right wall was about 79% and
@@ -376,7 +397,7 @@ visual checks.
   0.0151, so the larger table did not improve this view. Brick emission's larger cache was not tested.
 
 Face caching and brick emission guiding should approach similar illumination. Their distinction
-is the estimator: the former reuses diffuse radiance at secondary faces; the latter traces fresh
+is the estimator: the former reuses diffuse lighting on voxel faces; the latter traces fresh
 guided paths and explicitly samples emitters. In this view brick emission gave the lowest measured
 error but cost substantially more than the reference tracer. The current face guiding implementation
 did not establish an advantage over reference tracing.
@@ -387,6 +408,22 @@ pixel accumulation under jitter. GPU regression tests reproduce both cases. Unit
 82 focused GI Edit Mode tests passed, including settings serialization and Undo/Redo, all six
 approaches, BSDF sampling/PDF agreement, cache/reservoir history, HDR presentation, and depth
 attachments. The earlier 11 renderer lifecycle/upload tests were not rerun in this visual review.
+
+### Motion follow-up
+
+Source reviewed: Caelix `eee9ac8` plus this change, 2026-10-04. The follow-up preserves lighting
+storage across resizing and FOV changes, adds conservative image reprojection, and trains/queries
+the radiance cache on primary diffuse faces. It retains the 1-spp defaults and existing allocation
+sizes. Edit Mode checks cover reprojection rejection, rotation and previous projection/jitter,
+stationary silhouette coherence, persistent cache/emitter storage, and primary-face training and
+lookup at 1 spp. Unity compilation and all 114 focused GI Edit Mode tests passed, with no console
+errors. Play Mode visual checks and new performance measurements are pending.
+
+In Bistro, warm each selected approach, then strafe and rotate slowly, change FOV, and resize the
+game view. Inspect walls, newly revealed surfaces, silhouette edges, glass and reflections for
+trails or persistent dark patches. Stop before selecting the next approach. Face radiance caching
+should retain diffuse lighting on warmed faces; fresh glossy paths and newly discovered faces can
+still be noisy. Scene or lighting edits still clear all caches conservatively.
 
 ## One scene renderer at a time
 

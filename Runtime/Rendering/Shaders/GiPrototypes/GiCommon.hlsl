@@ -20,6 +20,7 @@ RaytracingAccelerationStructure g_AccelStruct;
 
 // GPU surface record: four 16-byte rows. Runtime caches address geometry by
 // instance lifetime and exact group-local voxel face, independent of pool slots.
+// reserved.x is the resolve's count of consecutive samples on the same face.
 struct GiSurface
 {
     float3 position;

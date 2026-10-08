@@ -98,7 +98,8 @@ float3 GiGuidedPath(GiSurface primary, RayDesc ray, bool useEmission, inout uint
     [loop] for (uint bounce = 0u; bounce <= g_GiMaxBounces; ++bounce)
     {
         GiSurface surface = primary;
-        bool hit = bounce == 0u ? GiHasHit(primary) : GiTrace(ray, surface);
+        bool hit = GiHasHit(primary);
+        if (bounce != 0u) hit = GiTrace(ray, surface);
         float distance = hit ? length(surface.position - ray.Origin) : K_T_MAX;
         float3 transmission = GiMediumTransmittance(medium, distance);
         throughput *= transmission;
@@ -164,11 +165,12 @@ float3 GiRadianceCachedPath(GiSurface primary, RayDesc ray, inout uint rng)
     float3 throughput = 1.0f;
     uint medium = 0u;
     float etaScale = 1.0f;
-    uint trainingBounce = 1u + uint(GiRandom(rng) * max(1u, g_GiMaxBounces - 1u));
+    uint trainingBounce = uint(GiRandom(rng) * max(1u, g_GiMaxBounces));
     [loop] for (uint bounce = 0u; bounce <= g_GiMaxBounces; ++bounce)
     {
         GiSurface surface = primary;
-        bool hit = bounce == 0u ? GiHasHit(primary) : GiTrace(ray, surface);
+        bool hit = GiHasHit(primary);
+        if (bounce != 0u) hit = GiTrace(ray, surface);
         throughput *= GiMediumTransmittance(medium, hit ? length(surface.position - ray.Origin) : K_T_MAX);
         if (!hit)
         {
@@ -182,7 +184,7 @@ float3 GiRadianceCachedPath(GiSurface primary, RayDesc ray, inout uint rng)
         float3 normal = dot(surface.normal, wo) >= 0.0f ? surface.normal : -surface.normal;
         float3 diffuse = GiDiffuseReflectance(bsdf);
         bool usedCache = false;
-        if (bounce > 0u && bsdf.transparent == 0u && medium == 0u && any(diffuse > 0.0f))
+        if (bsdf.transparent == 0u && medium == 0u && any(diffuse > 0.0f))
         {
             uint slot = GiCacheFind(surface.faceKey, bounce == trainingBounce);
             float3 irradiance;

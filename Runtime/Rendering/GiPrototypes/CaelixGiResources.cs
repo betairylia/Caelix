@@ -18,7 +18,8 @@ namespace Caelix.Rendering.GiPrototypes
     /// <summary>Only the selected approach allocates its auxiliary storage. Owned by one camera.</summary>
     internal sealed class CaelixGiResources : IDisposable
     {
-        public readonly int Width, Height;
+        public int Width { get; private set; }
+        public int Height { get; private set; }
         public readonly CaelixGiSettings Settings;
         public readonly List<GraphicsBuffer> Buffers = new();
         public readonly List<RTHandle> Textures = new();
@@ -34,7 +35,7 @@ namespace Caelix.Rendering.GiPrototypes
         public CaelixRayQueryRenderer Scene;
         public Texture Sky;
         public uint SkyUpdateCount;
-        public bool ValidHistory;
+        public bool ValidHistory, ValidLightingHistory;
         public Matrix4x4 PreviousView;
         public float PreviousZoom;
         public Vector2 PreviousJitter;
@@ -42,21 +43,39 @@ namespace Caelix.Rendering.GiPrototypes
 
         public CaelixGiResources(int width, int height, CaelixGiSettings settings)
         {
+            Settings = settings;
+            Resize(width, height);
+            if (settings.UsesCache)
+            {
+                CacheKeys = Buffer(settings.cacheCapacity, 12, "GI face keys");
+                CacheHistory = Buffer(settings.cacheCapacity, 64, "GI cache history");
+                NextCacheHistory = Buffer(settings.cacheCapacity, 64, "GI next cache history");
+                CacheAccum = Buffer(settings.cacheCapacity, 52, "GI cache accumulation");
+            }
+        }
+
+        /// <summary>Rebuilds pixel storage while retaining face lighting and emitter data.</summary>
+        public void Resize(int width, int height)
+        {
+            if (width < 1) throw new ArgumentOutOfRangeException(nameof(width));
+            if (height < 1) throw new ArgumentOutOfRangeException(nameof(height));
+            int pixels = checked(width * height);
+            if (Width == width && Height == height) return;
+            ReleaseScreenResources();
             Width = width;
             Height = height;
-            Settings = settings;
-            int pixels = checked(width * height);
+            ValidHistory = false;
             Surfaces = Buffer(pixels, 64, "GI surfaces");
             PreviousSurfaces = Buffer(pixels, 64, "GI previous surfaces");
             RawColor = Texture(RenderTextureFormat.ARGBFloat, "GI raw color");
             Depth = Texture(RenderTextureFormat.RFloat, "GI view depth");
             ResolvedColor = Texture(RenderTextureFormat.ARGBFloat, "GI resolved color");
             PreviousColor = Texture(RenderTextureFormat.ARGBFloat, "GI previous color");
-            if (settings.UsesReservoirs)
+            if (Settings.UsesReservoirs)
             {
                 Candidates = Buffer(pixels, 64, "GI candidates");
                 Fallback = Texture(RenderTextureFormat.ARGBFloat, "GI directional remainder");
-                if (settings.approach == CaelixGiApproach.RestirGi)
+                if (Settings.approach == CaelixGiApproach.RestirGi)
                 {
                     TemporalReservoirs = Buffer(pixels, 64, "GI temporal reservoirs");
                     ReservoirHistory = Buffer(pixels, 64, "GI reservoir history");
@@ -69,13 +88,6 @@ namespace Caelix.Rendering.GiPrototypes
                     BucketSamples = Buffer(tiles * 8, 32, "GI bucket samples");
                     PreviousBucketSamples = Buffer(tiles * 8, 32, "GI previous bucket samples");
                 }
-            }
-            if (settings.UsesCache)
-            {
-                CacheKeys = Buffer(settings.cacheCapacity, 12, "GI face keys");
-                CacheHistory = Buffer(settings.cacheCapacity, 64, "GI cache history");
-                NextCacheHistory = Buffer(settings.cacheCapacity, 64, "GI next cache history");
-                CacheAccum = Buffer(settings.cacheCapacity, 52, "GI cache accumulation");
             }
         }
 
@@ -109,6 +121,32 @@ namespace Caelix.Rendering.GiPrototypes
             buffer.Dispose();
             buffer = null;
         }
+
+        private void ReleaseScreenResources()
+        {
+            ReleaseBuffer(ref Surfaces);
+            ReleaseBuffer(ref PreviousSurfaces);
+            ReleaseBuffer(ref Candidates);
+            ReleaseBuffer(ref TemporalReservoirs);
+            ReleaseBuffer(ref ReservoirHistory);
+            ReleaseBuffer(ref Buckets);
+            ReleaseBuffer(ref PreviousBuckets);
+            ReleaseBuffer(ref BucketSamples);
+            ReleaseBuffer(ref PreviousBucketSamples);
+            foreach (var handle in Textures)
+            {
+                var texture = handle.rt;
+                EstimatedBytes -= (long)texture.width * texture.height * (handle == Depth ? 4 : 16);
+                handle.Release();
+                CoreUtils.Destroy(texture);
+            }
+            Textures.Clear();
+            RawColor = Depth = ResolvedColor = PreviousColor = Fallback = null;
+        }
+
+        public bool NeedsLightingReset(CaelixRayQueryRenderer renderer, Texture sky) =>
+            !ValidLightingHistory || Scene != renderer || SceneRevision != renderer.GiSceneRevision
+            || Sky != sky || SkyUpdateCount != sky.updateCount || !renderer.MaterialsBaked;
 
         public void UpdateEmissionGroups(CaelixRayQueryRenderer renderer)
         {
@@ -168,20 +206,16 @@ namespace Caelix.Rendering.GiPrototypes
             PreviousZoom = zoom;
             PreviousJitter = jitter;
             ValidHistory = true;
+            ValidLightingHistory = true;
             Frame++;
         }
 
         public void Dispose()
         {
+            ReleaseScreenResources();
             foreach (var buffer in Buffers) buffer.Dispose();
-            foreach (var handle in Textures)
-            {
-                var texture = handle.rt;
-                handle.Release();
-                CoreUtils.Destroy(texture);
-            }
             Buffers.Clear();
-            Textures.Clear();
+            EstimatedBytes = 0;
         }
     }
 }

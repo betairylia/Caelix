@@ -18,6 +18,12 @@ void GiGenerateSurfaces(uint3 dispatchId : SV_DispatchThreadID)
     _CaelixLaunchIndex = pixel;
     GiSurface surface;
     GiTrace(GiCameraRay(pixel, g_GiJitter), surface);
+    if (GiHasHit(surface))
+    {
+        GiBsdf bsdf = GiMakeBsdf(surface, 0u);
+        // Bit 1 excludes view-dependent glass and sharp reflections from moving image history.
+        if (bsdf.transparent != 0u || bsdf.roughness < 0.25f) surface.flags |= 2u;
+    }
     g_GiSurfacesOut[pixel.x + pixel.y * g_GiResolution.x] = surface;
     g_GiOutputDepth[pixel] = GiHasHit(surface) ? surface.depth : 0.0;
 }

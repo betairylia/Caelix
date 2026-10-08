@@ -1,4 +1,5 @@
 using Caelix.Rendering.GiPrototypes;
+using Caelix.Rendering.RayQuery;
 using NUnit.Framework;
 using UnityEngine;
 
@@ -220,6 +221,87 @@ namespace Caelix.Tests
             Assert.That(resources.EstimatedBytes, Is.EqualTo(64L * (2 * 64 + 3 * 16 + 4) + extraBytes));
             Assert.That(resources.CacheKeys != null, Is.EqualTo(settings.UsesCache));
             Assert.That(resources.Candidates != null, Is.EqualTo(settings.UsesReservoirs));
+        }
+
+        [TestCase(CaelixGiApproach.ReferencePathTracing)]
+        [TestCase(CaelixGiApproach.RestirGi)]
+        [TestCase(CaelixGiApproach.NaadfInspired)]
+        [TestCase(CaelixGiApproach.FaceRadianceCache)]
+        [TestCase(CaelixGiApproach.FacePathGuiding)]
+        [TestCase(CaelixGiApproach.BrickEmissionPathGuiding)]
+        public void ResizeRetainsLightingAndOnlyRebuildsPixelStorage(CaelixGiApproach approach)
+        {
+            if (!SystemInfo.supportsComputeShaders) Assert.Ignore("Compute shaders unavailable.");
+            var settings = new CaelixGiSettings { approach = approach, cacheCapacity = 1024 };
+            using var resources = new CaelixGiResources(8, 8, settings);
+            long initialBytes = resources.EstimatedBytes;
+            int initialBuffers = resources.Buffers.Count;
+            int initialTextures = resources.Textures.Count;
+            var keys = resources.CacheKeys;
+            var history = resources.CacheHistory;
+            var nextHistory = resources.NextCacheHistory;
+            var accumulation = resources.CacheAccum;
+            var surfaces = resources.Surfaces;
+            var color = resources.RawColor;
+            resources.ValidHistory = resources.ValidLightingHistory = true;
+            resources.Frame = 41;
+            resources.Resize(8, 8);
+            Assert.That(resources.Surfaces, Is.SameAs(surfaces));
+            Assert.That(resources.ValidHistory, Is.True);
+            resources.Resize(16, 8);
+            Assert.That(resources.Surfaces, Is.Not.SameAs(surfaces));
+            Assert.That(resources.RawColor, Is.Not.SameAs(color));
+            Assert.That(resources.Surfaces.count, Is.EqualTo(128));
+            Assert.That(resources.ValidHistory, Is.False);
+            Assert.That(resources.ValidLightingHistory, Is.True);
+            Assert.That(resources.Frame, Is.EqualTo(41), "Cache ages must survive a resize.");
+            Assert.That(resources.CacheKeys, Is.SameAs(keys));
+            Assert.That(resources.CacheHistory, Is.SameAs(history));
+            Assert.That(resources.NextCacheHistory, Is.SameAs(nextHistory));
+            Assert.That(resources.CacheAccum, Is.SameAs(accumulation));
+            long persistentBytes = settings.UsesCache ? 1024 * 192 : 0;
+            Assert.That(resources.EstimatedBytes, Is.EqualTo((initialBytes - persistentBytes) * 2 + persistentBytes));
+            resources.Resize(8, 8);
+            Assert.That(resources.EstimatedBytes, Is.EqualTo(initialBytes));
+            Assert.That(resources.Buffers.Count, Is.EqualTo(initialBuffers));
+            Assert.That(resources.Textures.Count, Is.EqualTo(initialTextures));
+        }
+
+        [Test]
+        public void LightingInvalidationIgnoresCameraButTracksSceneSkyAndMaterials()
+        {
+            if (!SystemInfo.supportsComputeShaders) Assert.Ignore("Compute shaders unavailable.");
+            var gameObject = new GameObject("GI invalidation test");
+            gameObject.SetActive(false);
+            var renderer = gameObject.AddComponent<CaelixRayQueryRenderer>();
+            var sky = new Texture2D(1, 1);
+            var otherSky = new Texture2D(1, 1);
+            using var resources = new CaelixGiResources(8, 8,
+                new CaelixGiSettings { approach = CaelixGiApproach.FaceRadianceCache, cacheCapacity = 1024 });
+            try
+            {
+                renderer.MaterialsBaked = true;
+                Assert.That(resources.NeedsLightingReset(renderer, sky), Is.True);
+                resources.Scene = renderer;
+                resources.SceneRevision = renderer.GiSceneRevision;
+                resources.Sky = sky;
+                resources.SkyUpdateCount = sky.updateCount;
+                resources.FinishFrame(Matrix4x4.identity, 1, Vector2.zero);
+                Assert.That(resources.NeedsLightingReset(renderer, sky), Is.False);
+                resources.FinishFrame(Matrix4x4.Translate(Vector3.one), 0.5f, Vector2.one);
+                resources.Resize(16, 8);
+                Assert.That(resources.NeedsLightingReset(renderer, sky), Is.False, "Movement, FOV and size do not change lighting.");
+                Assert.That(resources.NeedsLightingReset(renderer, otherSky), Is.True);
+                sky.IncrementUpdateCount();
+                Assert.That(resources.NeedsLightingReset(renderer, sky), Is.True);
+                resources.SkyUpdateCount = sky.updateCount;
+                renderer.MaterialsBaked = false;
+                Assert.That(resources.NeedsLightingReset(renderer, sky), Is.True);
+                renderer.MaterialsBaked = true;
+                renderer.InvalidateGiHistory();
+                Assert.That(resources.NeedsLightingReset(renderer, sky), Is.True);
+            }
+            finally { Object.DestroyImmediate(gameObject); Object.DestroyImmediate(sky); Object.DestroyImmediate(otherSky); }
         }
     }
 }

@@ -10,25 +10,111 @@ struct GiResolveSurface
 };
 
 uint2 g_GiResolution;
-uint g_GiAccumulationValid, g_GiAccumulationLimit;
-StructuredBuffer<GiResolveSurface> g_GiSurfaces;
+uint g_GiAccumulationValid, g_GiAccumulationLimit, g_GiStationary;
+float4x4 g_GiPreviousWorldToCamera;
+float2 g_GiPreviousJitter;
+float g_GiPreviousZoom;
+float3 g_GiCameraPosition, g_GiPreviousCameraPosition;
+RWStructuredBuffer<GiResolveSurface> g_GiSurfaces;
 StructuredBuffer<GiResolveSurface> g_GiPreviousSurfaces;
 Texture2D<float4> g_GiRawColor;
 Texture2D<float4> g_GiPreviousColor;
 RWTexture2D<float4> g_GiResolvedColor;
 
+bool GiSameFace(GiResolveSurface a, GiResolveSurface b)
+{
+    return (a.flags & 1u) != 0u && a.flags == b.flags && a.faceKey.x != 0u
+        && all(a.faceKey == b.faceKey) && a.materialId == b.materialId
+        && dot(a.normal, b.normal) > 0.99f;
+}
+
+bool GiFiniteHistory(float4 history)
+{
+    return all(isfinite(history)) && history.a >= 1.0f;
+}
+
+bool GiReprojectHistory(GiResolveSurface current, out float4 history)
+{
+    history = 0.0f;
+    // Misses, glass and sharp reflections cannot use surface-based moving history.
+    if ((current.flags & 3u) != 1u || g_GiPreviousZoom <= 0.0f) return false;
+    float3 view = mul(g_GiPreviousWorldToCamera, float4(current.previousPosition, 1.0f)).xyz;
+    if (!all(isfinite(view)) || view.z >= -1e-5f) return false;
+    float aspect = float(g_GiResolution.x) / float(g_GiResolution.y);
+    float2 ndc = view.xy / (-view.z * float2(aspect, 1.0f) * g_GiPreviousZoom);
+    float2 projected = (ndc * 0.5f + 0.5f) * g_GiResolution - g_GiPreviousJitter;
+    if (any(projected < 0.0f) || any(projected >= float2(g_GiResolution))) return false;
+
+    int2 basePixel = int2(floor(projected - 0.5f));
+    float footprint = 2.0f * -view.z * g_GiPreviousZoom / float(g_GiResolution.y);
+    float tolerance = max(0.01f, footprint * 1.5f);
+    float bestDistance = 1e20f;
+    [unroll] for (int y = 0; y < 2; ++y)
+    {
+        [unroll] for (int x = 0; x < 2; ++x)
+        {
+            int2 pixel = basePixel + int2(x, y);
+            if (any(pixel < 0) || any(pixel >= int2(g_GiResolution))) continue;
+            GiResolveSurface previous = g_GiPreviousSurfaces[pixel.x + pixel.y * g_GiResolution.x];
+            if (!GiSameFace(current, previous)) continue;
+            float3 offset = previous.position - current.previousPosition;
+            if (abs(previous.depth + view.z) > tolerance || dot(offset, offset) > tolerance * tolerance
+                || abs(dot(offset, current.normal)) > 0.01f) continue;
+            float3 oldDirection = normalize(g_GiPreviousCameraPosition - previous.position);
+            float3 newDirection = normalize(g_GiCameraPosition - current.position);
+            if (dot(oldDirection, newDirection) < 0.995f) continue;
+
+            float4 candidate = g_GiPreviousColor[pixel];
+            // A stationary pixel may average several subpixel faces. Do not move that
+            // mixed silhouette history onto a single face in the next view.
+            if (!GiFiniteHistory(candidate) || previous.reserved.x < candidate.a) continue;
+            float2 delta = float2(pixel) + 0.5f - projected;
+            float distance = dot(delta, delta);
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                history = candidate;
+            }
+        }
+    }
+    return bestDistance < 1e20f;
+}
+
 [numthreads(8, 8, 1)]
 void GiResolve(uint3 id : SV_DispatchThreadID)
 {
     if (any(id.xy >= g_GiResolution)) return;
+    uint index = id.x + id.y * g_GiResolution.x;
+    GiResolveSurface current = g_GiSurfaces[index];
     float4 color = float4(g_GiRawColor[id.xy].rgb, 1.0);
-    // The CPU validates the stationary camera and scene. Jitter intentionally samples
-    // different subpixel faces, so face identity must not restart the pixel average.
-    if (g_GiAccumulationValid != 0u)
+    uint limit = max(1u, g_GiAccumulationLimit);
+    uint coherent = (current.flags & 1u) != 0u ? 1u : 0u;
+    if (g_GiAccumulationValid != 0u && limit > 1u)
     {
-        float4 history = g_GiPreviousColor[id.xy];
-        float count = min(history.a, float(max(1u, g_GiAccumulationLimit) - 1u));
-        color = float4((color.rgb + history.rgb * count) / (count + 1.0), count + 1.0);
+        float4 history = 0.0f;
+        bool valid;
+        uint historyLimit = limit;
+        if (g_GiStationary != 0u)
+        {
+            // Jitter samples different faces inside a static pixel; keep its image average.
+            history = g_GiPreviousColor[id.xy];
+            valid = GiFiniteHistory(history);
+            if (valid && GiSameFace(current, g_GiPreviousSurfaces[index]))
+                coherent = min(limit, g_GiPreviousSurfaces[index].reserved.x + 1u);
+        }
+        else
+        {
+            valid = GiReprojectHistory(current, history);
+            historyLimit = min(limit, 8u);
+            if (valid) coherent = uint(min(history.a + 1.0f, float(historyLimit)));
+        }
+        if (valid)
+        {
+            float count = min(history.a, float(historyLimit - 1u));
+            color = float4((color.rgb + history.rgb * count) / (count + 1.0f), count + 1.0f);
+        }
     }
+    current.reserved.x = coherent;
+    g_GiSurfaces[index] = current;
     g_GiResolvedColor[id.xy] = color;
 }

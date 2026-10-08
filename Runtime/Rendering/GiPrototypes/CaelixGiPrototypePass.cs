@@ -41,7 +41,7 @@ namespace Caelix.Rendering.GiPrototypes
             public Vector2 jitter;
             public float zoom;
             public Texture sky;
-            public bool reset, stationary, bake;
+            public bool reset, resetScreen, stationary, bake;
             public TextureHandle cameraColor, cameraDepth, source;
         }
 
@@ -68,24 +68,22 @@ namespace Caelix.Rendering.GiPrototypes
             var camera = cameraData.camera;
             int width = Mathf.Max(1, Mathf.RoundToInt(cameraData.scaledWidth * settings.resolutionScale));
             int height = Mathf.Max(1, Mathf.RoundToInt(cameraData.scaledHeight * settings.resolutionScale));
-            if (!cameras.TryGetValue(camera, out var state) || state.Width != width || state.Height != height
-                || !ReferenceEquals(state.Settings, settings))
+            if (!cameras.TryGetValue(camera, out var state) || !ReferenceEquals(state.Settings, settings))
             {
                 state?.Dispose();
                 state = new CaelixGiResources(width, height, settings);
                 cameras[camera] = state;
             }
+            else state.Resize(width, height);
             state.LastUsedFrame = Time.frameCount;
             PruneCameras();
             Matrix4x4 view = cameraData.GetViewMatrix();
             float zoom = Mathf.Tan(camera.fieldOfView * Mathf.Deg2Rad * 0.5f);
             Texture sky = ResolveSky();
-            bool reset = !state.ValidHistory || state.Scene != scene
-                || state.SceneRevision != scene.GiSceneRevision || state.Sky != sky
-                || state.SkyUpdateCount != sky.updateCount || !scene.MaterialsBaked;
+            bool reset = state.NeedsLightingReset(scene, sky);
             bool stationary = state.ValidHistory && view == state.PreviousView && Mathf.Approximately(zoom, state.PreviousZoom);
             // Reservoir reprojection assumes the previous projection has the same field of view.
-            reset |= state.ValidHistory && !Mathf.Approximately(zoom, state.PreviousZoom);
+            bool resetScreen = reset || !state.ValidHistory || !Mathf.Approximately(zoom, state.PreviousZoom);
             if (settings.approach == CaelixGiApproach.BrickEmissionPathGuiding && reset)
                 state.UpdateEmissionGroups(scene);
             state.Scene = scene;
@@ -106,6 +104,7 @@ namespace Caelix.Rendering.GiPrototypes
                 data.jitter = new Vector2(Halton(state.Frame + 1, 2) - 0.5f, Halton(state.Frame + 1, 3) - 0.5f);
                 data.sky = sky;
                 data.reset = reset;
+                data.resetScreen = resetScreen;
                 data.stationary = stationary;
                 data.bake = !scene.MaterialsBaked;
                 data.cameraColor = targets.activeColorTexture;
@@ -118,7 +117,7 @@ namespace Caelix.Rendering.GiPrototypes
                 builder.UseTexture(data.cameraDepth, AccessFlags.ReadWrite);
                 builder.AllowPassCulling(false);
                 builder.AllowGlobalStateModification(true);
-                builder.SetRenderFunc((PassData pass, UnsafeGraphContext context) =>
+                builder.SetRenderFunc(static (PassData pass, UnsafeGraphContext context) =>
                     pass.owner.Execute(pass, CommandBufferHelpers.GetNativeCommandBuffer(context.cmd)));
             }
             // URP may have copied depth before our event. Refresh its sampled depth after voxel presentation.
@@ -224,7 +223,7 @@ namespace Caelix.Rendering.GiPrototypes
         private static void BindResampling(CommandBuffer cmd, ComputeShader cs, int kernel, PassData data)
         {
             var s = data.state;
-            cmd.SetComputeIntParam(cs, "g_GiResetHistory", data.reset ? 1 : 0);
+            cmd.SetComputeIntParam(cs, "g_GiResetHistory", data.resetScreen ? 1 : 0);
             cmd.SetComputeIntParam(cs, "g_GiNaadfHistoryValid", !data.reset && data.stationary ? 1 : 0);
             cmd.SetComputeIntParam(cs, "g_GiSpatialSamples", s.Settings.spatialSamples);
             cmd.SetComputeIntParam(cs, "g_GiSpatialRadius", s.Settings.spatialRadius);
@@ -321,8 +320,14 @@ namespace Caelix.Rendering.GiPrototypes
             var cs = feature.resolveShader;
             int kernel = cs.FindKernel("GiResolve");
             cmd.SetComputeIntParams(cs, "g_GiResolution", s.Width, s.Height);
-            cmd.SetComputeIntParam(cs, "g_GiAccumulationValid", !data.reset && data.stationary ? 1 : 0);
+            cmd.SetComputeIntParam(cs, "g_GiAccumulationValid", !data.reset && s.ValidHistory ? 1 : 0);
+            cmd.SetComputeIntParam(cs, "g_GiStationary", data.stationary ? 1 : 0);
             cmd.SetComputeIntParam(cs, "g_GiAccumulationLimit", s.Settings.accumulationFrames);
+            cmd.SetComputeMatrixParam(cs, "g_GiPreviousWorldToCamera", s.PreviousView);
+            cmd.SetComputeVectorParam(cs, "g_GiPreviousJitter", s.PreviousJitter);
+            cmd.SetComputeFloatParam(cs, "g_GiPreviousZoom", s.PreviousZoom);
+            cmd.SetComputeVectorParam(cs, "g_GiCameraPosition", data.position);
+            cmd.SetComputeVectorParam(cs, "g_GiPreviousCameraPosition", s.PreviousView.inverse.GetColumn(3));
             cmd.SetComputeBufferParam(cs, kernel, "g_GiSurfaces", s.Surfaces);
             cmd.SetComputeBufferParam(cs, kernel, "g_GiPreviousSurfaces", s.PreviousSurfaces);
             cmd.SetComputeTextureParam(cs, kernel, "g_GiRawColor", s.RawColor);
