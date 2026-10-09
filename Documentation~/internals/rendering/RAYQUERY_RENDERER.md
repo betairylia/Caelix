@@ -235,7 +235,7 @@ trace of every new material buffer (`CaelixRayQueryRenderer.MaterialsBaked`).
 
 ## GI prototypes
 
-`CaelixGiPrototypeFeature` uses the same voxel acceleration structure with six selectable
+`CaelixGiPrototypeFeature` uses the same voxel acceleration structure with seven selectable
 approaches. Choose the approach and settings before Play Mode. The feature captures a copy
 for that session, including when URP recreates its passes. Stopping Play Mode clears the captured
 settings and GPU resources; the next run captures the new selection with domain reload enabled or
@@ -284,6 +284,7 @@ ran before opaque rendering, such as a depth prepass consumer, do not receive pr
 | Face Radiance Cache | Sparse irradiance per exact voxel face, including visible primary faces; independent paths train reusable diffuse lighting | Biased spatial average and finite training tail; glossy/transmissive parts continue tracing |
 | Face Path Guiding | Eight directional bins per face, exploration floor, BSDF/guide mixture with matching PDF | Coarse direction distribution; fresh paths still determine radiance |
 | Brick Emission Path Guiding | GPU emitter sum tree and voxel weights, explicit emitter sampling with visibility/MIS, plus learned guiding | Six faces of each retained opaque emitter are proposal mass; hidden faces waste samples |
+| Brick Skin Irradiance | Diffuse walks confined to the hit brick's record, irradiance cached on each brick's skin (6 x 8 x 8 voxel texels), trained by cosine rays per touched texel | Six-direction irradiance at the skin blurs direction inside a face hemisphere; interior walks are diffuse-only; untouched texels fall back to tracing |
 
 All paths share Lambert diffuse, isotropic GGX reflection, dielectric Fresnel, smooth/rough
 transmission, and extinction. Smoothness maps to roughness as `1 - smoothness`. Pure mirrors and
@@ -303,6 +304,37 @@ Cache training uses fixed-point atomics, caps each channel/sample at `16383`, an
 1024 samples per slot per frame. NAADF's RGB9E5 compression caps channels at `65408`. These limits
 can bias unusually bright transport and should be considered when comparing images.
 
+### Brick skin irradiance
+
+The skin approach keeps nothing per face and nothing per pixel beyond the common surfaces. A
+diffuse surface runs **Skin Walks Per Pixel** random walks with the brick DDA on the record of the
+voxel it was found in (`GiSurface.reserved.y` carries the committed primitive, which is the
+renderer brick slot). Interior hits add emission and scatter diffusely for up to **Skin Walk
+Bounces**; a walk that leaves the brick reads the irradiance stored on the skin texel it crosses and
+uses `E / pi` as the entering radiance. Every exit requests training for its texel. Walks never
+cache anything inside the brick, so the only approximation is the skin: a six-direction irradiance
+record at voxel resolution, which keeps solid neighbors from leaking light across the boundary.
+
+Training runs after shading as an indirect dispatch over the frame's requested texels (bounded by
+**Skin Training Budget**). Each texel shoots **Skin Training Rays** cosine-distributed rays from
+its center outward; a hit is shaded with the same walk-and-skin estimator (without allocating or
+requesting), a miss returns the sky, and irradiance is `pi` times the mean. With **Skin Emitter
+Sampling** the emitter sum tree of the brick emission prototype adds one explicit sample of direct
+light from retained emissive voxels per texel per frame, and a training ray's first hit then drops
+the emission the proposal already covers. Texel histories blend by sample count up to **Cache
+History Samples**; a texel with fewer than **Cache Min Samples** is cold and its reader traces one
+real path from the exit point instead. Bricks no walk has touched for **Cache Max Age** frames are
+released and their texels zeroed.
+
+The group descriptor table that emitter sampling builds (`CaelixGiEmissionGroup`, sorted by
+lifetime token) is also what the skin uses to reach a brick record and to move between object and
+world space; without emitter sampling the weights and tree stay at placeholder size. Interior
+walks treat glossy voxels as diffuse and end on transparent voxels; glossy and transmissive lobes
+of the shaded surface continue with real rays and are shaded the same way where they land. A
+`GiSceneRevision` change still clears every skin; brick-granular invalidation from the tick's dirty
+flags is the intended follow-up. Cold texels appear on newly revealed bricks for a frame or two,
+which shows as noise there until the first training lands.
+
 ### Storage and invalidation
 
 The selected approach owns its GPU state per camera. The common primary/history surface records
@@ -320,7 +352,11 @@ to avoid overflow from half-float storage. The original `RayPayload` layout is u
   A full hash table falls back to tracing. Old entries expire according to **Cache Max Age**.
 - Emission mode adds 32 bytes per allocated renderer brick slot and a sum tree with
   `2 * nextPowerOfTwo(brickCount)` floats, plus 80 bytes per render group. Sparse brick-map holes
-  are included in that allocation.
+  are included in that allocation. Brick skin irradiance with emitter sampling allocates the same.
+- Brick skins cost 3136 bytes per table entry (16-byte key, 384 texels of 8 bytes, 48 bytes of
+  request marks) plus 4 bytes per training budget entry: the recommended 32768 bricks and 262144
+  texels per frame take 99 MiB. Only bricks a walk has touched hold an entry; the storage is
+  independent of the world's brick count, and a full table falls back to tracing.
 
 Face keys use the existing instance padding word as an allocation lifetime token, plus exact
 group-local voxel coordinates and face number. Entity movement and pool compaction preserve the
@@ -347,7 +383,8 @@ Thus motion can still expose noisy pixels even with warm caches. The resolve sto
 coherence count in existing surface padding; it adds no GPU allocations or ray payload fields.
 
 Implementation: [feature and settings](../../../Runtime/Rendering/GiPrototypes),
-[shaders](../../../Runtime/Rendering/Shaders/GiPrototypes),
+[shaders](../../../Runtime/Rendering/Shaders/GiPrototypes) (the skin estimator is `GiSkin.hlsl`
+and its kernels `GiSkin.compute`),
 [GPU smoke tests](../../../Tests/Editor/GiPrototypeGpuSmokeTests.cs),
 [BSDF tests](../../../Tests/Editor/GiBsdfTests.cs),
 [cache tests](../../../Tests/Editor/GiCacheTests.cs), and
@@ -395,6 +432,10 @@ visual checks.
 - Both guiding modes: capacity `65536`, history samples `64`, minimum samples `4`, max age `120`,
   guiding strength `0.5`. A 1048576-entry face guiding run used 350.2 MiB and 5.02 ms with RMSE
   0.0151, so the larger table did not improve this view. Brick emission's larger cache was not tested.
+
+Brick skin irradiance was added after this comparison and has not been measured in Play Mode; its
+smoke tests cover an emissive cube under a uniform sky, where a warm skin reproduces the diffuse
+sky bounce exactly on the second frame.
 
 Face caching and brick emission guiding should approach similar illumination. Their distinction
 is the estimator: the former reuses diffuse lighting on voxel faces; the latter traces fresh

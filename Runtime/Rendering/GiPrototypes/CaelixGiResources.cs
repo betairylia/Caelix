@@ -28,6 +28,7 @@ namespace Caelix.Rendering.GiPrototypes
         public GraphicsBuffer Buckets, PreviousBuckets, BucketSamples, PreviousBucketSamples;
         public GraphicsBuffer CacheKeys, CacheHistory, NextCacheHistory, CacheAccum;
         public GraphicsBuffer EmissionGroups, EmissionWeights, EmissionTree;
+        public GraphicsBuffer SkinBricks, SkinTexels, SkinMarks, SkinTouched, SkinControl;
         public RTHandle RawColor, Depth, ResolvedColor, PreviousColor, Fallback;
         public int EmissionGroupCount, EmissionBrickCount, EmissionLeafCount;
         public uint SceneRevision;
@@ -51,6 +52,15 @@ namespace Caelix.Rendering.GiPrototypes
                 CacheHistory = Buffer(settings.cacheCapacity, 64, "GI cache history");
                 NextCacheHistory = Buffer(settings.cacheCapacity, 64, "GI next cache history");
                 CacheAccum = Buffer(settings.cacheCapacity, 52, "GI cache accumulation");
+            }
+            if (settings.UsesSkin)
+            {
+                SkinBricks = Buffer(settings.skinBrickCapacity, 16, "GI skin bricks");
+                SkinTexels = Buffer(checked(settings.skinBrickCapacity * CaelixGiSettings.SkinTexelsPerBrick), 8, "GI skin texels");
+                SkinMarks = Buffer(checked(settings.skinBrickCapacity * CaelixGiSettings.SkinMarkWordsPerBrick), 4, "GI skin marks");
+                SkinTouched = Buffer(settings.skinTrainingBudget, 4, "GI skin touched texels");
+                SkinControl = Buffer(CaelixGiSettings.SkinControlWords, 4, "GI skin control",
+                    GraphicsBuffer.Target.Structured | GraphicsBuffer.Target.IndirectArguments);
             }
         }
 
@@ -91,9 +101,10 @@ namespace Caelix.Rendering.GiPrototypes
             }
         }
 
-        private GraphicsBuffer Buffer(int count, int stride, string name)
+        private GraphicsBuffer Buffer(int count, int stride, string name,
+            GraphicsBuffer.Target target = GraphicsBuffer.Target.Structured)
         {
-            var result = new GraphicsBuffer(GraphicsBuffer.Target.Structured, Mathf.Max(1, count), stride) { name = name };
+            var result = new GraphicsBuffer(target, Mathf.Max(1, count), stride) { name = name };
             Buffers.Add(result);
             EstimatedBytes += (long)result.count * result.stride;
             return result;
@@ -148,7 +159,12 @@ namespace Caelix.Rendering.GiPrototypes
             !ValidLightingHistory || Scene != renderer || SceneRevision != renderer.GiSceneRevision
             || Sky != sky || SkyUpdateCount != sky.updateCount || !renderer.MaterialsBaked;
 
-        public void UpdateEmissionGroups(CaelixRayQueryRenderer renderer)
+        /// <summary>
+        /// Rebuilds the group descriptor table (sorted by lifetime token). With
+        /// <paramref name="emitters"/> the emitter weights and sum tree are sized for every published
+        /// brick; without it they stay at placeholder size and emitter sampling reports no bricks.
+        /// </summary>
+        public void UpdateEmissionGroups(CaelixRayQueryRenderer renderer, bool emitters = true)
         {
             var descriptors = new List<CaelixGiEmissionGroup>();
             int total = 0;
@@ -174,10 +190,10 @@ namespace Caelix.Rendering.GiPrototypes
                 descriptors[index] = descriptor;
             }
             EmissionGroupCount = descriptors.Count;
-            EmissionBrickCount = total;
-            EmissionLeafCount = Mathf.NextPowerOfTwo(Mathf.Max(1, total));
+            EmissionBrickCount = emitters ? total : 0;
+            EmissionLeafCount = Mathf.NextPowerOfTwo(Mathf.Max(1, EmissionBrickCount));
             EnsureBuffer(ref EmissionGroups, descriptors.Count, 80, "GI emission groups");
-            EnsureBuffer(ref EmissionWeights, total, 32, "GI emission voxel weights");
+            EnsureBuffer(ref EmissionWeights, EmissionBrickCount, 32, "GI emission voxel weights");
             EnsureBuffer(ref EmissionTree, checked(2 * EmissionLeafCount), 4, "GI emission tree");
             if (descriptors.Count > 0) EmissionGroups.SetData(descriptors);
         }

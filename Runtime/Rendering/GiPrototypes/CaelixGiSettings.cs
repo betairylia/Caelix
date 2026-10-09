@@ -10,7 +10,8 @@ namespace Caelix.Rendering.GiPrototypes
         NaadfInspired,
         FaceRadianceCache,
         FacePathGuiding,
-        BrickEmissionPathGuiding
+        BrickEmissionPathGuiding,
+        BrickSkinIrradiance
     }
 
     [Serializable]
@@ -31,6 +32,16 @@ namespace Caelix.Rendering.GiPrototypes
         [Range(1, 64)] public int cacheMinSamples = 4;
         [Range(1, 1024)] public int cacheMaxAge = 120;
         [Range(0f, 0.95f)] public float guidingStrength = 0.5f;
+        [Range(256, 262144)] public int skinBrickCapacity = 32768;
+        [Range(1, 64)] public int skinWalksPerPixel = 16;
+        [Range(1, 8)] public int skinWalkBounces = 4;
+        [Range(1, 16)] public int skinTrainingRays = 4;
+        [Range(1024, 1048576)] public int skinTrainingBudget = 262144;
+        public bool skinEmitterSampling = true;
+
+        public const int SkinTexelsPerBrick = 384;
+        public const int SkinMarkWordsPerBrick = 12;
+        public const int SkinControlWords = 8;
 
         public static CaelixGiSettings Recommended(CaelixGiApproach approach)
         {
@@ -62,11 +73,26 @@ namespace Caelix.Rendering.GiPrototypes
             copy.cacheMinSamples = Mathf.Clamp(copy.cacheMinSamples, 1, Mathf.Min(64, copy.cacheHistorySamples));
             copy.cacheMaxAge = Mathf.Clamp(copy.cacheMaxAge, 1, 1024);
             copy.guidingStrength = Mathf.Clamp(copy.guidingStrength, 0f, 0.95f);
+            copy.skinBrickCapacity = Mathf.Clamp(copy.skinBrickCapacity, 256, 262144);
+            copy.skinWalksPerPixel = Mathf.Clamp(copy.skinWalksPerPixel, 1, 64);
+            copy.skinWalkBounces = Mathf.Clamp(copy.skinWalkBounces, 1, 8);
+            copy.skinTrainingRays = Mathf.Clamp(copy.skinTrainingRays, 1, 16);
+            copy.skinTrainingBudget = Mathf.Clamp(copy.skinTrainingBudget, 1024, 1048576);
             return copy;
         }
 
-        public bool UsesCache => approach >= CaelixGiApproach.FaceRadianceCache;
+        public bool UsesCache => approach == CaelixGiApproach.FaceRadianceCache
+            || approach == CaelixGiApproach.FacePathGuiding || approach == CaelixGiApproach.BrickEmissionPathGuiding;
         public bool UsesReservoirs => approach == CaelixGiApproach.RestirGi || approach == CaelixGiApproach.NaadfInspired;
         public bool UsesGuiding => approach == CaelixGiApproach.FacePathGuiding || approach == CaelixGiApproach.BrickEmissionPathGuiding;
+        public bool UsesSkin => approach == CaelixGiApproach.BrickSkinIrradiance;
+        /// <summary>The group descriptor table is needed by emitter sampling and by brick skin lookups.</summary>
+        public bool UsesGroupTable => approach == CaelixGiApproach.BrickEmissionPathGuiding || UsesSkin;
+        public bool UsesEmitterSampling => approach == CaelixGiApproach.BrickEmissionPathGuiding || (UsesSkin && skinEmitterSampling);
+
+        /// <summary>Bytes of the brick skin tables these settings allocate, independent of resolution.</summary>
+        public long SkinBytes => !UsesSkin ? 0 :
+            (long)skinBrickCapacity * (16 + SkinTexelsPerBrick * 8 + SkinMarkWordsPerBrick * 4)
+            + (long)skinTrainingBudget * 4 + SkinControlWords * 4;
     }
 }

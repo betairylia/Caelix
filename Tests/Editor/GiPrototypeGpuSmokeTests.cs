@@ -39,6 +39,12 @@ namespace Caelix.Tests
         }
 
         [StructLayout(LayoutKind.Sequential)]
+        private struct SkinBrickRecord
+        {
+            public uint state, token, brickIndex, touchedFrame;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
         private struct CacheHistoryRecord
         {
             public Vector4 irradiance, guide0, guide1;
@@ -52,10 +58,11 @@ namespace Caelix.Tests
             public readonly CaelixRayQueryInstanceTable Instances;
             public readonly GraphicsBuffer Brick, Materials;
             public readonly Cubemap Sky;
-            public readonly ComputeShader Reference, Resampling, Cache, CachePath, Emission;
+            public readonly ComputeShader Reference, Resampling, Cache, CachePath, Emission, Skin;
             public Vector3 CameraPosition = new(4, 4, 12);
             public readonly Color SkyColor = new(0.25f, 0.5f, 1, 1);
             public Color ExpectedEmission;
+            public Vector3 ExpectedDiffuse;
             public uint Token;
             private readonly List<GraphicsBuffer> auxiliary = new();
             private readonly List<ComputeShader> shaders = new();
@@ -65,13 +72,15 @@ namespace Caelix.Tests
                 State = new CaelixGiResources(Size, Size, new CaelixGiSettings
                 {
                     approach = approach, maxBounces = bounces, samplesPerPixel = 2,
-                    cacheCapacity = 1024, cacheMinSamples = 1, spatialSamples = 2, spatialRadius = 2
+                    cacheCapacity = 1024, cacheMinSamples = 1, spatialSamples = 2, spatialRadius = 2,
+                    skinBrickCapacity = 256, skinTrainingBudget = 1024
                 });
                 Reference = Shader("GiReference.compute");
                 Resampling = Shader("GiResampling.compute");
                 Cache = Shader("GiCache.compute");
                 CachePath = Shader("GiCachePath.compute");
                 Emission = Shader("GiEmission.compute");
+                Skin = Shader("GiSkin.compute");
                 Acceleration = new RayTracingAccelerationStructure(new RayTracingAccelerationStructure.Settings
                 {
                     managementMode = RayTracingAccelerationStructure.ManagementMode.Manual,
@@ -99,6 +108,9 @@ namespace Caelix.Tests
                     Materials.SetData(material, 0, (int)materialId, 1);
                 }
                 ExpectedEmission = new Color(material[0].emission.x, material[0].emission.y, material[0].emission.z, 1);
+                float eta = Mathf.Max(1, material[0].ior);
+                float f0 = (eta - 1) / (eta + 1) * ((eta - 1) / (eta + 1));
+                ExpectedDiffuse = Vector3.Scale(material[0].albedo, Vector3.one * ((1 - material[0].metallic) * (1 - f0)));
 
                 var words = new int[BrickRecordLayout.BRICK_DATA_LENGTH];
                 if (cube)
@@ -119,14 +131,14 @@ namespace Caelix.Tests
                 }
                 Brick.SetData(words);
                 Instances.Flush();
-                if (approach == CaelixGiApproach.BrickEmissionPathGuiding)
+                if (State.Settings.UsesGroupTable)
                 {
                     State.EmissionGroups = Buffer(1, 80);
                     State.EmissionWeights = Buffer(1, 32);
                     State.EmissionTree = Buffer(2, 4);
                     State.EmissionLeafCount = 1;
                     State.EmissionGroupCount = cube ? 1 : 0;
-                    State.EmissionBrickCount = cube ? 1 : 0;
+                    State.EmissionBrickCount = cube && State.Settings.UsesEmitterSampling ? 1 : 0;
                     State.EmissionGroups.SetData(new[]
                     {
                         new CaelixGiEmissionGroup
@@ -202,6 +214,26 @@ namespace Caelix.Tests
                 cmd.SetComputeBufferParam(shader, kernel, "g_GiEmissionTree", State.EmissionTree);
             }
 
+            private void BindSkin(CommandBuffer cmd, ComputeShader shader, int kernel)
+            {
+                var settings = State.Settings;
+                cmd.SetComputeIntParam(shader, "g_GiSkinCapacity", settings.skinBrickCapacity);
+                cmd.SetComputeIntParam(shader, "g_GiSkinTrainingBudget", settings.skinTrainingBudget);
+                cmd.SetComputeIntParam(shader, "g_GiSkinWalks", settings.skinWalksPerPixel);
+                cmd.SetComputeIntParam(shader, "g_GiSkinWalkBounces", settings.skinWalkBounces);
+                cmd.SetComputeIntParam(shader, "g_GiSkinTrainingRays", settings.skinTrainingRays);
+                cmd.SetComputeIntParam(shader, "g_GiSkinEmitterSampling", settings.skinEmitterSampling ? 1 : 0);
+                cmd.SetComputeIntParam(shader, "g_GiSkinFrame", State.Frame);
+                cmd.SetComputeIntParam(shader, "g_GiSkinMaxAge", 120);
+                cmd.SetComputeIntParam(shader, "g_GiSkinHistoryLimit", 64);
+                cmd.SetComputeIntParam(shader, "g_GiSkinMinSamples", 1);
+                cmd.SetComputeBufferParam(shader, kernel, "g_GiSkinBricks", State.SkinBricks);
+                cmd.SetComputeBufferParam(shader, kernel, "g_GiSkinTexels", State.SkinTexels);
+                cmd.SetComputeBufferParam(shader, kernel, "g_GiSkinMarks", State.SkinMarks);
+                cmd.SetComputeBufferParam(shader, kernel, "g_GiSkinTouched", State.SkinTouched);
+                cmd.SetComputeBufferParam(shader, kernel, "g_GiSkinControl", State.SkinControl);
+            }
+
             private void BindResampling(CommandBuffer cmd, int kernel)
             {
                 cmd.SetComputeIntParam(Resampling, "g_GiResetHistory", State.Frame == 0 ? 1 : 0);
@@ -240,7 +272,27 @@ namespace Caelix.Tests
                     BindCache(cmd, shader, kernel);
                     if (State.EmissionGroups != null) BindEmission(cmd, shader, kernel);
                 }
+                if (shader == Skin)
+                {
+                    BindSkin(cmd, shader, kernel);
+                    BindEmission(cmd, shader, kernel);
+                }
                 cmd.DispatchCompute(shader, kernel, 1, 1, 1);
+            }
+
+            private void TrainSkin(CommandBuffer cmd)
+            {
+                int prepare = Skin.FindKernel("GiSkinPrepareTraining");
+                BindSkin(cmd, Skin, prepare);
+                cmd.DispatchCompute(Skin, prepare, 1, 1, 1);
+                int train = Skin.FindKernel("GiSkinTrain");
+                BindCommon(cmd, Skin, train);
+                BindSkin(cmd, Skin, train);
+                BindEmission(cmd, Skin, train);
+                cmd.DispatchCompute(Skin, train, State.SkinControl, 16);
+                int expire = Skin.FindKernel("GiSkinExpire");
+                BindSkin(cmd, Skin, expire);
+                cmd.DispatchCompute(Skin, expire, (State.Settings.skinBrickCapacity + 63) / 64, 1, 1);
             }
 
             public void Render()
@@ -257,7 +309,13 @@ namespace Caelix.Tests
                     cmd.SetComputeBufferParam(Cache, clear, "g_GiCacheNextHistory", State.CacheHistory);
                     cmd.DispatchCompute(Cache, clear, State.Settings.cacheCapacity / 64, 1, 1);
                 }
-                if (State.Settings.approach == CaelixGiApproach.BrickEmissionPathGuiding && State.Frame == 0)
+                if (State.Settings.UsesSkin && State.Frame == 0)
+                {
+                    int clear = Skin.FindKernel("GiSkinClear");
+                    BindSkin(cmd, Skin, clear);
+                    cmd.DispatchCompute(Skin, clear, (State.Settings.skinBrickCapacity + 63) / 64, 1, 1);
+                }
+                if (State.Settings.UsesEmitterSampling && State.Frame == 0)
                 {
                     int clear = Emission.FindKernel("ClearGiEmission");
                     BindEmission(cmd, Emission, clear);
@@ -289,6 +347,10 @@ namespace Caelix.Tests
                     case CaelixGiApproach.FaceRadianceCache: Dispatch(cmd, CachePath, "TraceRadianceCache"); break;
                     case CaelixGiApproach.FacePathGuiding: Dispatch(cmd, CachePath, "TraceGuidedPath"); break;
                     case CaelixGiApproach.BrickEmissionPathGuiding: Dispatch(cmd, CachePath, "TraceEmissionGuidedPath"); break;
+                    case CaelixGiApproach.BrickSkinIrradiance:
+                        Dispatch(cmd, Skin, "GiSkinShade");
+                        TrainSkin(cmd);
+                        break;
                 }
                 if (State.Settings.UsesCache)
                 {
@@ -334,6 +396,7 @@ namespace Caelix.Tests
         [TestCase(CaelixGiApproach.FaceRadianceCache)]
         [TestCase(CaelixGiApproach.FacePathGuiding)]
         [TestCase(CaelixGiApproach.BrickEmissionPathGuiding)]
+        [TestCase(CaelixGiApproach.BrickSkinIrradiance)]
         public void EmptySceneWritesExpectedSkyInEveryPixel(CaelixGiApproach approach)
         {
             using var fixture = new Fixture(approach, false, 2);
@@ -355,6 +418,7 @@ namespace Caelix.Tests
         [TestCase(CaelixGiApproach.FaceRadianceCache)]
         [TestCase(CaelixGiApproach.FacePathGuiding)]
         [TestCase(CaelixGiApproach.BrickEmissionPathGuiding)]
+        [TestCase(CaelixGiApproach.BrickSkinIrradiance)]
         public void ZeroBounceEmissiveCubeWritesExactEmissionAndFaceIdentity(CaelixGiApproach approach)
         {
             using var fixture = new Fixture(approach, true, 0);
@@ -391,6 +455,7 @@ namespace Caelix.Tests
         [TestCase(CaelixGiApproach.FaceRadianceCache)]
         [TestCase(CaelixGiApproach.FacePathGuiding)]
         [TestCase(CaelixGiApproach.BrickEmissionPathGuiding)]
+        [TestCase(CaelixGiApproach.BrickSkinIrradiance)]
         public void ScatteringAndHistoryProduceFiniteNonblankLighting(CaelixGiApproach approach)
         {
             using var fixture = new Fixture(approach, true, 2);
@@ -510,6 +575,59 @@ namespace Caelix.Tests
             foreach (var color in fixture.ReadColor())
                 Assert.That(color.r, Is.GreaterThan(fixture.ExpectedEmission.r + 1),
                     "The warm primary face must reuse diffuse lighting, not just resample the sky.");
+        }
+
+        [Test]
+        public void BrickSkinTrainsTouchedTexelsFromSkyAndShadesFromThemNextFrame()
+        {
+            using var fixture = new Fixture(CaelixGiApproach.BrickSkinIrradiance, true, 1);
+            fixture.State.Settings.samplesPerPixel = 1;
+            fixture.Render();
+            var control = new uint[CaelixGiSettings.SkinControlWords];
+            fixture.State.SkinControl.GetData(control);
+            Assert.That(control[0], Is.Zero, "The request list reopens after training is prepared.");
+            Assert.That(control[1], Is.InRange(1, 64), "Front-face texels crossed by immediate exits are requested once each.");
+            Assert.That(control[4], Is.EqualTo((control[1] + 63) / 64));
+
+            var bricks = new SkinBrickRecord[fixture.State.Settings.skinBrickCapacity];
+            fixture.State.SkinBricks.GetData(bricks);
+            int live = 0;
+            foreach (var brick in bricks)
+            {
+                if (brick.state == 0) continue;
+                live++;
+                Assert.That(brick.state, Is.EqualTo(2));
+                Assert.That(brick.token, Is.EqualTo(fixture.Token));
+                Assert.That(brick.brickIndex, Is.Zero);
+            }
+            Assert.That(live, Is.EqualTo(1), "Every visible face belongs to the single brick.");
+
+            var texels = new uint[fixture.State.Settings.skinBrickCapacity * CaelixGiSettings.SkinTexelsPerBrick * 2];
+            fixture.State.SkinTexels.GetData(texels);
+            int warm = 0;
+            for (int texel = 0; texel < texels.Length / 2; texel++)
+            {
+                uint low = texels[texel * 2], high = texels[texel * 2 + 1];
+                if (low == 0 && high == 0) continue;
+                warm++;
+                Assert.That(texel % CaelixGiSettings.SkinTexelsPerBrick / 64, Is.EqualTo(4), "Only the +Z skin is seen");
+                Assert.That(high >> 16, Is.EqualTo(fixture.State.Settings.skinTrainingRays), "Count equals the rays of one training");
+                Vector3 irradiance = new(Mathf.HalfToFloat((ushort)(low & 0xffff)), Mathf.HalfToFloat((ushort)(low >> 16)),
+                    Mathf.HalfToFloat((ushort)(high & 0xffff)));
+                for (int channel = 0; channel < 3; channel++)
+                    Assert.That(irradiance[channel], Is.EqualTo(Mathf.PI * fixture.SkyColor[channel]).Within(0.01f),
+                        "Cosine rays into a uniform sky give irradiance pi times the sky radiance");
+            }
+            Assert.That(warm, Is.EqualTo((int)control[1]));
+
+            fixture.State.FinishFrame(Matrix4x4.Translate(-fixture.CameraPosition), 0.25f, Vector2.zero);
+            fixture.Render();
+            Color expected = fixture.ExpectedEmission;
+            for (int channel = 0; channel < 3; channel++) expected[channel] += fixture.ExpectedDiffuse[channel] * fixture.SkyColor[channel];
+            foreach (var color in fixture.ReadColor())
+                for (int channel = 0; channel < 3; channel++)
+                    Assert.That(color[channel], Is.EqualTo(expected[channel]).Within(0.01f),
+                        "A warm skin reproduces the diffuse sky bounce without noise");
         }
 
         private static void AssertColors(Color[] pixels, Color expected)

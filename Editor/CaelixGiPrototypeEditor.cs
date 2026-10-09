@@ -23,6 +23,7 @@ namespace Caelix.EditorTools
                 serializedObject.FindProperty("cacheShader"),
                 serializedObject.FindProperty("cachePathShader"),
                 serializedObject.FindProperty("emissionShader"),
+                serializedObject.FindProperty("skinShader"),
                 serializedObject.FindProperty("resolveShader"),
                 serializedObject.FindProperty("presentShader"),
                 serializedObject.FindProperty("depthCopyShader")
@@ -72,6 +73,20 @@ namespace Caelix.EditorTools
                     DrawSetting("cacheMaxAge");
                 }
                 if (feature.settings.UsesGuiding) DrawSetting("guidingStrength");
+                if (feature.settings.UsesSkin)
+                {
+                    EditorGUILayout.Space();
+                    EditorGUILayout.LabelField("Brick Skin", EditorStyles.boldLabel);
+                    DrawSetting("skinBrickCapacity");
+                    DrawSetting("skinWalksPerPixel");
+                    DrawSetting("skinWalkBounces");
+                    DrawSetting("skinTrainingRays");
+                    DrawSetting("skinTrainingBudget");
+                    DrawSetting("skinEmitterSampling");
+                    DrawSetting("cacheHistorySamples");
+                    DrawSetting("cacheMinSamples");
+                    DrawSetting("cacheMaxAge");
+                }
 
                 EditorGUILayout.Space();
                 if (GUILayout.Button("Apply Recommended Defaults"))
@@ -172,6 +187,7 @@ namespace Caelix.EditorTools
             feature.cacheShader = Load("GiCache.compute");
             feature.cachePathShader = Load("GiCachePath.compute");
             feature.emissionShader = Load("GiEmission.compute");
+            feature.skinShader = Load("GiSkin.compute");
             feature.resolveShader = Load("GiResolve.compute");
             feature.presentShader = AssetDatabase.LoadAssetAtPath<Shader>(ShaderPath + "GiPresent.shader");
             feature.depthCopyShader = AssetDatabase.LoadAssetAtPath<Shader>(

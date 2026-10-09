@@ -1,0 +1,147 @@
+#pragma kernel GiSkinClear
+#pragma kernel GiSkinShade
+#pragma kernel GiSkinPrepareTraining
+#pragma kernel GiSkinTrain
+#pragma kernel GiSkinExpire
+#pragma target 5.0
+#pragma use_dxc
+#pragma require inlineraytracing Int64
+#pragma only_renderers d3d11
+#pragma multi_compile_local _ CAELIX_GROUP_3_3_3 CAELIX_GROUP_5_5_5 CAELIX_GROUP_4_7_4
+
+#include "GiCommon.hlsl"
+#include "GiEmission.hlsl"
+#include "GiSkin.hlsl"
+
+void GiSkinReleaseSlot(uint slot)
+{
+    [loop] for (uint texel = 0u; texel < GI_SKIN_TEXELS; ++texel)
+        g_GiSkinTexels[slot * GI_SKIN_TEXELS + texel] = uint2(0u, 0u);
+    [unroll] for (uint word = 0u; word < GI_SKIN_MARK_WORDS; ++word)
+        g_GiSkinMarks[slot * GI_SKIN_MARK_WORDS + word] = 0u;
+    g_GiSkinBricks[slot] = (GiSkinBrick)0;
+}
+
+// Dispatch once per brick slot when lighting history resets.
+[numthreads(64, 1, 1)]
+void GiSkinClear(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x == 0u)
+    {
+        [unroll] for (uint i = 0u; i < 8u; ++i) g_GiSkinControl[i] = 0u;
+        g_GiSkinControl[GI_SKIN_CONTROL_ARGS + 1u] = 1u;
+        g_GiSkinControl[GI_SKIN_CONTROL_ARGS + 2u] = 1u;
+    }
+    if (id.x >= g_GiSkinCapacity) return;
+    GiSkinReleaseSlot(id.x);
+}
+
+[numthreads(8, 8, 1)]
+void GiSkinShade(uint3 id : SV_DispatchThreadID)
+{
+    uint2 pixel = id.xy;
+    if (any(pixel >= g_GiResolution)) return;
+    _CaelixLaunchIndex = pixel;
+    GiSurface surface = g_GiSurfaces[pixel.x + pixel.y * g_GiResolution.x];
+    RayDesc ray = GiCameraRay(pixel, g_GiJitter);
+    float3 radiance = 0.0f;
+    if (!GiHasHit(surface))
+    {
+        radiance = GiSky(ray.Direction);
+    }
+    else
+    {
+        uint samples = max(1u, g_GiSamplesPerPixel);
+        [loop] for (uint sampleIndex = 0u; sampleIndex < samples; ++sampleIndex)
+        {
+            uint rng = GiSeed(pixel, sampleIndex);
+            radiance += GiSkinShadeChain(surface, ray, rng, true, false);
+        }
+        radiance /= float(samples);
+    }
+    g_GiOutputColor[pixel] = float4(GiSanitize(radiance), 1.0f);
+}
+
+// Turns this frame's request list into an indirect dispatch and reopens the list.
+[numthreads(1, 1, 1)]
+void GiSkinPrepareTraining(uint3 id : SV_DispatchThreadID)
+{
+    uint count = min(g_GiSkinControl[GI_SKIN_CONTROL_TOUCHED], g_GiSkinTrainingBudget);
+    g_GiSkinControl[GI_SKIN_CONTROL_TRAINING] = count;
+    g_GiSkinControl[GI_SKIN_CONTROL_ARGS] = (count + 63u) / 64u;
+    g_GiSkinControl[GI_SKIN_CONTROL_ARGS + 1u] = 1u;
+    g_GiSkinControl[GI_SKIN_CONTROL_ARGS + 2u] = 1u;
+    g_GiSkinControl[GI_SKIN_CONTROL_TOUCHED] = 0u;
+}
+
+// One thread per requested texel: cosine rays outward from the texel estimate the irradiance
+// arriving at the brick skin, with the emitter proposal supplying direct light from retained
+// emissive voxels when enabled. Training reads other bricks' skins but never requests them.
+[numthreads(64, 1, 1)]
+void GiSkinTrain(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= g_GiSkinControl[GI_SKIN_CONTROL_TRAINING]) return;
+    uint entry = g_GiSkinTouched[id.x];
+    uint slot = entry / GI_SKIN_TEXELS;
+    uint texel = entry - slot * GI_SKIN_TEXELS;
+    if (slot >= g_GiSkinCapacity) return;
+    GiSkinUnmark(slot, texel);
+    GiSkinBrick brick = g_GiSkinBricks[slot];
+    if (brick.state != 2u) return;
+    GiEmissionGroup group;
+    if (!GiSkinFindGroup(brick.key.x, group)) return;
+
+    float3 outwardNormal;
+    float3 local = GiSkinBrickOrigin(brick.key.y) + GiSkinTexelCenter(texel, outwardNormal);
+    float3 origin = GiSkinToWorld(group, local);
+    float3 normal = normalize(GiSkinDirectionToWorld(group, outwardNormal));
+    _CaelixLaunchIndex = uint2(id.x & 1023u, id.x >> 10u);
+    uint rng = GiHash(entry ^ GiHash(g_GiSkinFrame * 0x9e3779b9u + 0x632be5abu));
+
+    uint rays = max(1u, g_GiSkinTrainingRays);
+    float3 sum = 0.0f;
+    [loop] for (uint rayIndex = 0u; rayIndex < rays; ++rayIndex)
+    {
+        RayDesc ray;
+        ray.Origin = origin;
+        ray.Direction = GiCosineHemisphere(normal, rng);
+        ray.TMin = 0.0f;
+        ray.TMax = K_T_MAX;
+        GiSurface hit;
+        if (!GiTrace(ray, hit))
+        {
+            sum += GiSky(ray.Direction);
+            continue;
+        }
+        bool covered = false;
+        if (g_GiSkinEmitterSampling != 0u)
+        {
+            GiBsdf bsdf = GiMakeBsdf(hit, 0u);
+            covered = bsdf.transparent == 0u && any(bsdf.emission > 0.0f)
+                && GiEmissionPdf(origin, hit.position, hit.normal, bsdf.emission, hit.faceKey) > 0.0f;
+        }
+        sum += GiSkinShadeChain(hit, ray, rng, false, covered);
+    }
+    // Cosine sampling: E = pi * mean(L). The emitter estimate is one more term of the same frame.
+    float3 irradiance = sum * (GI_PI / float(rays));
+    if (g_GiSkinEmitterSampling != 0u) irradiance += GiSkinEmitterIrradiance(origin, normal, rng);
+    if (any(!isfinite(irradiance))) return;
+
+    float3 previous;
+    uint count;
+    GiSkinUnpack(g_GiSkinTexels[entry], previous, count);
+    float weight = float(min(count, max(1u, g_GiSkinHistoryLimit)));
+    float3 next = (previous * weight + irradiance * float(rays)) / (weight + float(rays));
+    g_GiSkinTexels[entry] = GiSkinPack(next, count + rays);
+}
+
+// Frees bricks no walk has touched for Cache Max Age frames, zeroing their texels for reuse.
+[numthreads(64, 1, 1)]
+void GiSkinExpire(uint3 id : SV_DispatchThreadID)
+{
+    uint slot = id.x;
+    if (slot >= g_GiSkinCapacity) return;
+    GiSkinBrick brick = g_GiSkinBricks[slot];
+    if (brick.state != 2u || g_GiSkinFrame - brick.touchedFrame <= g_GiSkinMaxAge) return;
+    GiSkinReleaseSlot(slot);
+}

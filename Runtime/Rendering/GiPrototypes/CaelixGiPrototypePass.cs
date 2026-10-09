@@ -84,8 +84,8 @@ namespace Caelix.Rendering.GiPrototypes
             bool stationary = state.ValidHistory && view == state.PreviousView && Mathf.Approximately(zoom, state.PreviousZoom);
             // Reservoir reprojection assumes the previous projection has the same field of view.
             bool resetScreen = reset || !state.ValidHistory || !Mathf.Approximately(zoom, state.PreviousZoom);
-            if (settings.approach == CaelixGiApproach.BrickEmissionPathGuiding && reset)
-                state.UpdateEmissionGroups(scene);
+            if (settings.UsesGroupTable && reset)
+                state.UpdateEmissionGroups(scene, settings.UsesEmitterSampling);
             state.Scene = scene;
             state.SceneRevision = scene.GiSceneRevision;
             state.Sky = sky;
@@ -138,7 +138,8 @@ namespace Caelix.Rendering.GiPrototypes
                 data.scene.MaterialsBaked = true;
             }
             if (s.Settings.UsesCache && data.reset) ClearCache(cmd, s);
-            if (s.Settings.approach == CaelixGiApproach.BrickEmissionPathGuiding && data.reset)
+            if (s.Settings.UsesSkin && data.reset) ClearSkin(cmd, s);
+            if (s.Settings.UsesEmitterSampling && data.reset)
                 BuildEmission(cmd, data);
             DispatchImage(cmd, feature.referenceShader, "GiGenerateSurfaces", data);
             switch (s.Settings.approach)
@@ -161,6 +162,10 @@ namespace Caelix.Rendering.GiPrototypes
                     break;
                 case CaelixGiApproach.BrickEmissionPathGuiding:
                     DispatchImage(cmd, feature.cachePathShader, "TraceEmissionGuidedPath", data);
+                    break;
+                case CaelixGiApproach.BrickSkinIrradiance:
+                    DispatchImage(cmd, feature.skinShader, "GiSkinShade", data);
+                    TrainSkin(cmd, data);
                     break;
                 default:
                     DispatchImage(cmd, feature.referenceShader, "GiReference", data);
@@ -190,6 +195,11 @@ namespace Caelix.Rendering.GiPrototypes
             {
                 BindCache(cmd, cs, kernel, s);
                 if (s.EmissionGroups != null) BindEmission(cmd, cs, kernel, s);
+            }
+            if (cs == feature.skinShader)
+            {
+                BindSkin(cmd, cs, kernel, s);
+                BindEmission(cmd, cs, kernel, s);
             }
             // Bucket generation has one thread per tile, all other image kernels have 8x8 threads.
             cmd.DispatchCompute(cs, kernel, (s.Width + 7) / 8, (s.Height + 7) / 8, 1);
@@ -270,6 +280,51 @@ namespace Caelix.Rendering.GiPrototypes
             cmd.DispatchCompute(cs, kernel, (s.Settings.cacheCapacity + 63) / 64, 1, 1);
             cmd.SetComputeBufferParam(cs, kernel, "g_GiCacheNextHistory", s.CacheHistory);
             cmd.DispatchCompute(cs, kernel, (s.Settings.cacheCapacity + 63) / 64, 1, 1);
+        }
+
+        private static void BindSkin(CommandBuffer cmd, ComputeShader cs, int kernel, CaelixGiResources s)
+        {
+            cmd.SetComputeIntParam(cs, "g_GiSkinCapacity", s.Settings.skinBrickCapacity);
+            cmd.SetComputeIntParam(cs, "g_GiSkinTrainingBudget", s.Settings.skinTrainingBudget);
+            cmd.SetComputeIntParam(cs, "g_GiSkinWalks", s.Settings.skinWalksPerPixel);
+            cmd.SetComputeIntParam(cs, "g_GiSkinWalkBounces", s.Settings.skinWalkBounces);
+            cmd.SetComputeIntParam(cs, "g_GiSkinTrainingRays", s.Settings.skinTrainingRays);
+            cmd.SetComputeIntParam(cs, "g_GiSkinEmitterSampling", s.Settings.skinEmitterSampling ? 1 : 0);
+            cmd.SetComputeIntParam(cs, "g_GiSkinFrame", s.Frame);
+            cmd.SetComputeIntParam(cs, "g_GiSkinMaxAge", s.Settings.cacheMaxAge);
+            cmd.SetComputeIntParam(cs, "g_GiSkinHistoryLimit", s.Settings.cacheHistorySamples);
+            cmd.SetComputeIntParam(cs, "g_GiSkinMinSamples", s.Settings.cacheMinSamples);
+            cmd.SetComputeBufferParam(cs, kernel, "g_GiSkinBricks", s.SkinBricks);
+            cmd.SetComputeBufferParam(cs, kernel, "g_GiSkinTexels", s.SkinTexels);
+            cmd.SetComputeBufferParam(cs, kernel, "g_GiSkinMarks", s.SkinMarks);
+            cmd.SetComputeBufferParam(cs, kernel, "g_GiSkinTouched", s.SkinTouched);
+            cmd.SetComputeBufferParam(cs, kernel, "g_GiSkinControl", s.SkinControl);
+        }
+
+        private void ClearSkin(CommandBuffer cmd, CaelixGiResources s)
+        {
+            var cs = feature.skinShader;
+            int kernel = cs.FindKernel("GiSkinClear");
+            BindSkin(cmd, cs, kernel, s);
+            cmd.DispatchCompute(cs, kernel, (s.Settings.skinBrickCapacity + 63) / 64, 1, 1);
+        }
+
+        /// <summary>Trains the texels this frame's walks requested, then expires untouched bricks.</summary>
+        private void TrainSkin(CommandBuffer cmd, PassData data)
+        {
+            var s = data.state;
+            var cs = feature.skinShader;
+            int prepare = cs.FindKernel("GiSkinPrepareTraining");
+            BindSkin(cmd, cs, prepare, s);
+            cmd.DispatchCompute(cs, prepare, 1, 1, 1);
+            int train = cs.FindKernel("GiSkinTrain");
+            BindCommon(cmd, cs, train, data);
+            BindSkin(cmd, cs, train, s);
+            BindEmission(cmd, cs, train, s);
+            cmd.DispatchCompute(cs, train, s.SkinControl, 4 * 4);
+            int expire = cs.FindKernel("GiSkinExpire");
+            BindSkin(cmd, cs, expire, s);
+            cmd.DispatchCompute(cs, expire, (s.Settings.skinBrickCapacity + 63) / 64, 1, 1);
         }
 
         private static void BindEmission(CommandBuffer cmd, ComputeShader cs, int kernel, CaelixGiResources s)

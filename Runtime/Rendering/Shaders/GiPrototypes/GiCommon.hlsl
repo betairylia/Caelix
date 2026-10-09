@@ -20,7 +20,8 @@ RaytracingAccelerationStructure g_AccelStruct;
 
 // GPU surface record: four 16-byte rows. Runtime caches address geometry by
 // instance lifetime and exact group-local voxel face, independent of pool slots.
-// reserved.x is the resolve's count of consecutive samples on the same face.
+// reserved.x is the resolve's count of consecutive samples on the same face;
+// reserved.y is the committed primitive (renderer brick slot) of the hit.
 struct GiSurface
 {
     float3 position;
@@ -102,6 +103,7 @@ bool GiTrace(RayDesc ray, out GiSurface surface)
     query.TraceRayInline(g_AccelStruct, RAY_FLAG_NONE, 0xFF, ray);
     uint committedAttribute = 0u;
     uint committedInstance = 0u;
+    uint committedPrimitive = 0u;
     while (query.Proceed())
     {
         if (query.CandidateType() != CANDIDATE_PROCEDURAL_PRIMITIVE) continue;
@@ -116,6 +118,7 @@ bool GiTrace(RayDesc ray, out GiSurface surface)
             query.CommitProceduralPrimitiveHit(distance);
             committedAttribute = attribute.matID_faceNormal;
             committedInstance = instanceId;
+            committedPrimitive = query.CandidatePrimitiveIndex();
         }
     }
     if (query.CommittedStatus() != COMMITTED_PROCEDURAL_PRIMITIVE_HIT) return false;
@@ -133,6 +136,9 @@ bool GiTrace(RayDesc ray, out GiSurface surface)
     surface.previousPosition = mul(CaelixInstancePrevObjectToWorld(instance), float4(localPosition, 1.0)).xyz;
     surface.depth = -mul(g_GiWorldToCamera, float4(surface.position, 1.0)).z;
     surface.faceKey = uint2(instance.pad1, voxel.x | (voxel.y << 9u) | (voxel.z << 19u) | (face << 28u));
+    // reserved.y names the brick record inside the group's published range (the AABB primitive
+    // index is the renderer brick slot), so a later pass can run the brick DDA on the hit brick.
+    surface.reserved = uint2(0u, committedPrimitive);
     return true;
 }
 

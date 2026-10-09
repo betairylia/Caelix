@@ -15,6 +15,7 @@ namespace Caelix.Rendering.GiPrototypes
         public ComputeShader cacheShader;
         public ComputeShader cachePathShader;
         public ComputeShader emissionShader;
+        public ComputeShader skinShader;
         public ComputeShader resolveShader;
         public Shader presentShader;
         public Shader depthCopyShader;
@@ -100,7 +101,7 @@ namespace Caelix.Rendering.GiPrototypes
         }
 
         private bool ShadersReady() => referenceShader != null && resamplingShader != null && cacheShader != null
-            && cachePathShader != null && emissionShader != null && resolveShader != null
+            && cachePathShader != null && emissionShader != null && skinShader != null && resolveShader != null
             && presentShader != null && depthCopyShader != null;
 
         internal CaelixGiSettings CaptureSessionSettings()

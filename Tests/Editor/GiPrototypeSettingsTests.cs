@@ -98,6 +98,7 @@ namespace Caelix.Tests
         [TestCase(CaelixGiApproach.FaceRadianceCache, false, true, false)]
         [TestCase(CaelixGiApproach.FacePathGuiding, false, true, true)]
         [TestCase(CaelixGiApproach.BrickEmissionPathGuiding, false, true, true)]
+        [TestCase(CaelixGiApproach.BrickSkinIrradiance, false, false, false)]
         public void RecommendedDefaultsUseOneSampleAndRelevantControls(CaelixGiApproach approach,
             bool reservoirs, bool cache, bool guiding)
         {
@@ -144,6 +145,7 @@ namespace Caelix.Tests
         [TestCase(CaelixGiApproach.FaceRadianceCache)]
         [TestCase(CaelixGiApproach.FacePathGuiding)]
         [TestCase(CaelixGiApproach.BrickEmissionPathGuiding)]
+        [TestCase(CaelixGiApproach.BrickSkinIrradiance)]
         public void SessionResetAcceptsNewSelectionOnSameFeature(CaelixGiApproach approach)
         {
             var feature = ScriptableObject.CreateInstance<CaelixGiPrototypeFeature>();
@@ -213,14 +215,20 @@ namespace Caelix.Tests
         [TestCase(CaelixGiApproach.FaceRadianceCache, 1024 * 192)]
         [TestCase(CaelixGiApproach.FacePathGuiding, 1024 * 192)]
         [TestCase(CaelixGiApproach.BrickEmissionPathGuiding, 1024 * 192)]
+        [TestCase(CaelixGiApproach.BrickSkinIrradiance, 256 * (16 + 384 * 8 + 12 * 4) + 1024 * 4 + 8 * 4)]
         public void AllocatesOnlySelectedApproach(CaelixGiApproach approach, int extraBytes)
         {
             if (!SystemInfo.supportsComputeShaders) Assert.Ignore("Compute shaders unavailable.");
-            var settings = new CaelixGiSettings { approach = approach, cacheCapacity = 1024 };
+            var settings = new CaelixGiSettings
+            {
+                approach = approach, cacheCapacity = 1024, skinBrickCapacity = 256, skinTrainingBudget = 1024
+            };
             using var resources = new CaelixGiResources(8, 8, settings);
             Assert.That(resources.EstimatedBytes, Is.EqualTo(64L * (2 * 64 + 3 * 16 + 4) + extraBytes));
             Assert.That(resources.CacheKeys != null, Is.EqualTo(settings.UsesCache));
             Assert.That(resources.Candidates != null, Is.EqualTo(settings.UsesReservoirs));
+            Assert.That(resources.SkinTexels != null, Is.EqualTo(settings.UsesSkin));
+            Assert.That(settings.SkinBytes, Is.EqualTo(settings.UsesSkin ? extraBytes : 0));
         }
 
         [TestCase(CaelixGiApproach.ReferencePathTracing)]
@@ -229,10 +237,14 @@ namespace Caelix.Tests
         [TestCase(CaelixGiApproach.FaceRadianceCache)]
         [TestCase(CaelixGiApproach.FacePathGuiding)]
         [TestCase(CaelixGiApproach.BrickEmissionPathGuiding)]
+        [TestCase(CaelixGiApproach.BrickSkinIrradiance)]
         public void ResizeRetainsLightingAndOnlyRebuildsPixelStorage(CaelixGiApproach approach)
         {
             if (!SystemInfo.supportsComputeShaders) Assert.Ignore("Compute shaders unavailable.");
-            var settings = new CaelixGiSettings { approach = approach, cacheCapacity = 1024 };
+            var settings = new CaelixGiSettings
+            {
+                approach = approach, cacheCapacity = 1024, skinBrickCapacity = 256, skinTrainingBudget = 1024
+            };
             using var resources = new CaelixGiResources(8, 8, settings);
             long initialBytes = resources.EstimatedBytes;
             int initialBuffers = resources.Buffers.Count;
@@ -241,6 +253,7 @@ namespace Caelix.Tests
             var history = resources.CacheHistory;
             var nextHistory = resources.NextCacheHistory;
             var accumulation = resources.CacheAccum;
+            var skinTexels = resources.SkinTexels;
             var surfaces = resources.Surfaces;
             var color = resources.RawColor;
             resources.ValidHistory = resources.ValidLightingHistory = true;
@@ -259,7 +272,8 @@ namespace Caelix.Tests
             Assert.That(resources.CacheHistory, Is.SameAs(history));
             Assert.That(resources.NextCacheHistory, Is.SameAs(nextHistory));
             Assert.That(resources.CacheAccum, Is.SameAs(accumulation));
-            long persistentBytes = settings.UsesCache ? 1024 * 192 : 0;
+            Assert.That(resources.SkinTexels, Is.SameAs(skinTexels), "Brick skins must survive a resize.");
+            long persistentBytes = settings.UsesCache ? 1024 * 192 : settings.SkinBytes;
             Assert.That(resources.EstimatedBytes, Is.EqualTo((initialBytes - persistentBytes) * 2 + persistentBytes));
             resources.Resize(8, 8);
             Assert.That(resources.EstimatedBytes, Is.EqualTo(initialBytes));
