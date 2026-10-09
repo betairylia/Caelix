@@ -624,10 +624,21 @@ namespace Caelix.Tests
             fixture.Render();
             Color expected = fixture.ExpectedEmission;
             for (int channel = 0; channel < 3; channel++) expected[channel] += fixture.ExpectedDiffuse[channel] * fixture.SkyColor[channel];
-            foreach (var color in fixture.ReadColor())
+            // The diffuse term comes from the warm skin and is exact. The dielectric's GGX lobe still
+            // reflects the sky through a traced ray: a non-negative, stochastic term of roughly F0 times
+            // the sky on average, so it is bounded rather than matched.
+            Color[] colors = fixture.ReadColor();
+            Color mean = Color.black;
+            foreach (var color in colors)
+            {
                 for (int channel = 0; channel < 3; channel++)
-                    Assert.That(color[channel], Is.EqualTo(expected[channel]).Within(0.01f),
-                        "A warm skin reproduces the diffuse sky bounce without noise");
+                    Assert.That(color[channel], Is.GreaterThanOrEqualTo(expected[channel] - 0.005f),
+                        "Every pixel carries the full diffuse sky bounce from the warm skin");
+                mean += color / colors.Length;
+            }
+            for (int channel = 0; channel < 3; channel++)
+                Assert.That(mean[channel], Is.InRange(expected[channel] - 0.005f, expected[channel] + 0.005f + 0.15f * fixture.SkyColor[channel]),
+                    "On average only a small specular sky reflection exceeds the diffuse bounce");
         }
 
         private static void AssertColors(Color[] pixels, Color expected)
