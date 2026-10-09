@@ -271,10 +271,19 @@ float3 GiSkinWalks(GiSkinBrickContext context, float3 localPosition, uint face, 
         float3 throughput = 1.0f;
         [loop] for (uint bounce = 0u; bounce <= g_GiSkinWalkBounces; ++bounce)
         {
-            _CaelixBrickPage = context.group.page;
+            // The DDA clamps its start into the brick, so a start already outside (a surface that
+            // lies on a brick face) must exit here instead of hitting its own voxel at t = 0.
             AttributeData attribute;
-            float t = CaelixTraceBrickRay(context.recordBase, position, direction, 0.0f,
-                (faceFlags << 26u) | context.coarse, attribute);
+            attribute.matID_faceNormal = 0u;
+            float t = 0.0f;
+            if (all(position >= 0.0f) && all(position < float(SIZE_IN_BLOCKS)))
+            {
+                _CaelixBrickPage = context.group.page;
+                t = CaelixTraceBrickRay(context.recordBase, position, direction, 0.0f,
+                    (faceFlags << 26u) | context.coarse, attribute);
+                // A hit at zero distance means the start cell itself is solid; stop rather than loop.
+                if (attribute.matID_faceNormal != 0u && t <= 0.0f) break;
+            }
             if (attribute.matID_faceNormal != 0u)
             {
                 uint blockId = attribute.matID_faceNormal >> 16u;
