@@ -321,14 +321,21 @@ its center outward; a hit is shaded with the same walk-and-skin estimator (witho
 requesting), a miss returns the sky, and irradiance is `pi` times the mean. With **Skin Emitter
 Sampling** the emitter sum tree of the brick emission prototype adds one explicit sample of direct
 light from retained emissive voxels per texel per frame, and a training ray's first hit then drops
-the emission the proposal already covers. Texel histories blend by sample count up to **Cache
-History Samples**; a texel with fewer than **Cache Min Samples** is cold and its reader traces one
-real path from the exit point instead. Bricks no walk has touched for **Cache Max Age** frames are
+the emission the proposal already covers. Training hits run **Skin Training Walks** instead of
+the per-pixel count. Texel histories blend by sample count up to **Cache History Samples**; a texel
+with fewer than **Cache Min Samples** is cold and its reader traces one real path of **Skin Cold
+Bounces** from the exit point instead, so the first frames after a reset cost about one traced ray
+per walk rather than a full path. Bricks no walk has touched for **Cache Max Age** frames are
 released and their texels zeroed.
 
 The group descriptor table that emitter sampling builds (`CaelixGiEmissionGroup`, sorted by
 lifetime token) is also what the skin uses to reach a brick record and to move between object and
-world space; without emitter sampling the weights and tree stay at placeholder size. Interior
+world space; without emitter sampling the weights and tree stay at placeholder size. Streaming a
+world bumps the scene revision every tick, and the emitter build reads every voxel of every
+published brick, so both emitter-sampling approaches now rebuild the proposal only after
+`CaelixGiSettings.EmitterSettleFrames` (30) frames without a reset. Until then emitter sampling
+reports no bricks and training rays count emission where they find it; the group table itself
+follows every reset. Interior
 walks treat glossy voxels as diffuse and end on transparent voxels; glossy and transmissive lobes
 of the shaded surface continue with real rays and are shaded the same way where they land. A
 `GiSceneRevision` change still clears every skin; brick-granular invalidation from the tick's dirty

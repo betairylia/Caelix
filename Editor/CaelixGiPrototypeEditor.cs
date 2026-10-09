@@ -81,6 +81,8 @@ namespace Caelix.EditorTools
                     DrawSetting("skinWalksPerPixel");
                     DrawSetting("skinWalkBounces");
                     DrawSetting("skinTrainingRays");
+                    DrawSetting("skinTrainingWalks");
+                    DrawSetting("skinColdBounces");
                     DrawSetting("skinTrainingBudget");
                     DrawSetting("skinEmitterSampling");
                     DrawSetting("cacheHistorySamples");

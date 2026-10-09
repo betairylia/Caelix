@@ -41,7 +41,7 @@ namespace Caelix.Rendering.GiPrototypes
             public Vector2 jitter;
             public float zoom;
             public Texture sky;
-            public bool reset, resetScreen, stationary, bake;
+            public bool reset, resetScreen, stationary, bake, buildEmitters;
             public TextureHandle cameraColor, cameraDepth, source;
         }
 
@@ -84,8 +84,24 @@ namespace Caelix.Rendering.GiPrototypes
             bool stationary = state.ValidHistory && view == state.PreviousView && Mathf.Approximately(zoom, state.PreviousZoom);
             // Reservoir reprojection assumes the previous projection has the same field of view.
             bool resetScreen = reset || !state.ValidHistory || !Mathf.Approximately(zoom, state.PreviousZoom);
+            // Streaming bumps the scene revision every tick. The group table is cheap and must follow
+            // every reset, but the emitter proposal reads every voxel of every brick, so it waits
+            // until the scene has been stable for EmitterSettleFrames. Until then emitter sampling
+            // reports no bricks and training counts emission where rays find it.
+            bool buildEmitters = false;
             if (settings.UsesGroupTable && reset)
-                state.UpdateEmissionGroups(scene, settings.UsesEmitterSampling);
+            {
+                state.UpdateEmissionGroups(scene, emitters: false);
+                state.EmittersStale = settings.UsesEmitterSampling;
+                state.LastResetFrame = state.Frame;
+            }
+            else if (settings.UsesGroupTable && state.EmittersStale
+                && state.Frame - state.LastResetFrame >= CaelixGiSettings.EmitterSettleFrames)
+            {
+                state.UpdateEmissionGroups(scene, emitters: true);
+                state.EmittersStale = false;
+                buildEmitters = true;
+            }
             state.Scene = scene;
             state.SceneRevision = scene.GiSceneRevision;
             state.Sky = sky;
@@ -107,6 +123,7 @@ namespace Caelix.Rendering.GiPrototypes
                 data.resetScreen = resetScreen;
                 data.stationary = stationary;
                 data.bake = !scene.MaterialsBaked;
+                data.buildEmitters = buildEmitters;
                 data.cameraColor = targets.activeColorTexture;
                 data.cameraDepth = targets.activeDepthTexture;
                 data.source = graph.ImportTexture(state.ResolvedColor);
@@ -139,8 +156,7 @@ namespace Caelix.Rendering.GiPrototypes
             }
             if (s.Settings.UsesCache && data.reset) ClearCache(cmd, s);
             if (s.Settings.UsesSkin && data.reset) ClearSkin(cmd, s);
-            if (s.Settings.UsesEmitterSampling && data.reset)
-                BuildEmission(cmd, data);
+            if (data.buildEmitters) BuildEmission(cmd, data);
             DispatchImage(cmd, feature.referenceShader, "GiGenerateSurfaces", data);
             switch (s.Settings.approach)
             {
@@ -289,6 +305,8 @@ namespace Caelix.Rendering.GiPrototypes
             cmd.SetComputeIntParam(cs, "g_GiSkinWalks", s.Settings.skinWalksPerPixel);
             cmd.SetComputeIntParam(cs, "g_GiSkinWalkBounces", s.Settings.skinWalkBounces);
             cmd.SetComputeIntParam(cs, "g_GiSkinTrainingRays", s.Settings.skinTrainingRays);
+            cmd.SetComputeIntParam(cs, "g_GiSkinTrainingWalks", s.Settings.skinTrainingWalks);
+            cmd.SetComputeIntParam(cs, "g_GiSkinColdBounces", s.Settings.skinColdBounces);
             cmd.SetComputeIntParam(cs, "g_GiSkinEmitterSampling", s.Settings.skinEmitterSampling ? 1 : 0);
             cmd.SetComputeIntParam(cs, "g_GiSkinFrame", s.Frame);
             cmd.SetComputeIntParam(cs, "g_GiSkinMaxAge", s.Settings.cacheMaxAge);

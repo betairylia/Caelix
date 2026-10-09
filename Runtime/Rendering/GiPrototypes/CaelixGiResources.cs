@@ -33,6 +33,9 @@ namespace Caelix.Rendering.GiPrototypes
         public int EmissionGroupCount, EmissionBrickCount, EmissionLeafCount;
         public uint SceneRevision;
         public int Frame, LastUsedFrame;
+        /// <summary>The frame of the last lighting reset, and whether the emitter proposal still awaits a build.</summary>
+        public int LastResetFrame;
+        public bool EmittersStale;
         public CaelixRayQueryRenderer Scene;
         public Texture Sky;
         public uint SkyUpdateCount;

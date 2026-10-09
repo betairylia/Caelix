@@ -36,12 +36,16 @@ namespace Caelix.Rendering.GiPrototypes
         [Range(1, 64)] public int skinWalksPerPixel = 16;
         [Range(1, 8)] public int skinWalkBounces = 4;
         [Range(1, 16)] public int skinTrainingRays = 4;
+        [Range(1, 64)] public int skinTrainingWalks = 4;
+        [Range(0, 12)] public int skinColdBounces = 1;
         [Range(1024, 1048576)] public int skinTrainingBudget = 262144;
         public bool skinEmitterSampling = true;
 
         public const int SkinTexelsPerBrick = 384;
         public const int SkinMarkWordsPerBrick = 12;
         public const int SkinControlWords = 8;
+        /// <summary>Frames without a lighting reset before the emitter proposal is (re)built.</summary>
+        public const int EmitterSettleFrames = 30;
 
         public static CaelixGiSettings Recommended(CaelixGiApproach approach)
         {
@@ -77,6 +81,8 @@ namespace Caelix.Rendering.GiPrototypes
             copy.skinWalksPerPixel = Mathf.Clamp(copy.skinWalksPerPixel, 1, 64);
             copy.skinWalkBounces = Mathf.Clamp(copy.skinWalkBounces, 1, 8);
             copy.skinTrainingRays = Mathf.Clamp(copy.skinTrainingRays, 1, 16);
+            copy.skinTrainingWalks = Mathf.Clamp(copy.skinTrainingWalks, 1, 64);
+            copy.skinColdBounces = Mathf.Clamp(copy.skinColdBounces, 0, 12);
             copy.skinTrainingBudget = Mathf.Clamp(copy.skinTrainingBudget, 1024, 1048576);
             return copy;
         }

@@ -222,6 +222,8 @@ namespace Caelix.Tests
                 cmd.SetComputeIntParam(shader, "g_GiSkinWalks", settings.skinWalksPerPixel);
                 cmd.SetComputeIntParam(shader, "g_GiSkinWalkBounces", settings.skinWalkBounces);
                 cmd.SetComputeIntParam(shader, "g_GiSkinTrainingRays", settings.skinTrainingRays);
+                cmd.SetComputeIntParam(shader, "g_GiSkinTrainingWalks", settings.skinTrainingWalks);
+                cmd.SetComputeIntParam(shader, "g_GiSkinColdBounces", settings.skinColdBounces);
                 cmd.SetComputeIntParam(shader, "g_GiSkinEmitterSampling", settings.skinEmitterSampling ? 1 : 0);
                 cmd.SetComputeIntParam(shader, "g_GiSkinFrame", State.Frame);
                 cmd.SetComputeIntParam(shader, "g_GiSkinMaxAge", 120);

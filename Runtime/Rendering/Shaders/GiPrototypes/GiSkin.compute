@@ -55,7 +55,7 @@ void GiSkinShade(uint3 id : SV_DispatchThreadID)
         [loop] for (uint sampleIndex = 0u; sampleIndex < samples; ++sampleIndex)
         {
             uint rng = GiSeed(pixel, sampleIndex);
-            radiance += GiSkinShadeChain(surface, ray, rng, true, false);
+            radiance += GiSkinShadeChain(surface, ray, g_GiSkinWalks, rng, true, false);
         }
         radiance /= float(samples);
     }
@@ -120,7 +120,7 @@ void GiSkinTrain(uint3 id : SV_DispatchThreadID)
             covered = bsdf.transparent == 0u && any(bsdf.emission > 0.0f)
                 && GiEmissionPdf(origin, hit.position, hit.normal, bsdf.emission, hit.faceKey) > 0.0f;
         }
-        sum += GiSkinShadeChain(hit, ray, rng, false, covered);
+        sum += GiSkinShadeChain(hit, ray, g_GiSkinTrainingWalks, rng, false, covered);
     }
     // Cosine sampling: E = pi * mean(L). The emitter estimate is one more term of the same frame.
     float3 irradiance = sum * (GI_PI / float(rays));

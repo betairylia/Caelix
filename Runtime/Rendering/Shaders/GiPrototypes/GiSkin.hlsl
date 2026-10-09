@@ -43,6 +43,8 @@ uint g_GiSkinTrainingBudget;
 uint g_GiSkinWalks;
 uint g_GiSkinWalkBounces;
 uint g_GiSkinTrainingRays;
+uint g_GiSkinTrainingWalks;
+uint g_GiSkinColdBounces;
 uint g_GiSkinEmitterSampling;
 uint g_GiSkinFrame;
 uint g_GiSkinMaxAge;
@@ -256,11 +258,12 @@ uint GiSkinExit(float3 position, float3 direction, out float3 exitPosition, out 
 
 // Average radiance arriving at a diffuse interior point along cosine-distributed directions
 // (irradiance over pi). Each walk bounces diffusely inside the brick until it leaves, then reads
-// the skin texel it crossed. A cold texel costs one real path from the exit point instead.
-float3 GiSkinWalks(GiSkinBrickContext context, float3 localPosition, uint face, inout uint rng, bool allowMark)
+// the skin texel it crossed. A cold texel costs one real path of Skin Cold Bounces from the exit
+// point instead, so cold frames stay bounded.
+float3 GiSkinWalks(GiSkinBrickContext context, float3 localPosition, uint face, uint walks, inout uint rng, bool allowMark)
 {
     float3 total = 0.0f;
-    uint walks = max(1u, g_GiSkinWalks);
+    walks = max(1u, walks);
     float3 startNormal = float3(objectNormals[face]);
     float3 start = localPosition + startNormal * K_RAY_ORIGIN_PUSH_OFF;
     [loop] for (uint walk = 0u; walk < walks; ++walk)
@@ -323,7 +326,7 @@ float3 GiSkinWalks(GiSkinBrickContext context, float3 localPosition, uint face, 
             ray.Direction = normalize(GiSkinDirectionToWorld(context.group, direction));
             ray.TMin = 0.0f;
             ray.TMax = K_T_MAX;
-            total += throughput * GiTracePath(ray, 0u, rng, g_GiMaxBounces);
+            total += throughput * GiTracePath(ray, 0u, rng, g_GiSkinColdBounces);
             break;
         }
     }
@@ -333,7 +336,7 @@ float3 GiSkinWalks(GiSkinBrickContext context, float3 localPosition, uint face, 
 // Shades a surface. Diffuse reflection comes from skin walks; emission is exact; glossy and
 // transmissive lobes continue with real rays and are shaded the same way where they land.
 // `skipFirstEmission` drops the first vertex's emission when emitter sampling already covers it.
-float3 GiSkinShadeChain(GiSurface surface, RayDesc ray, inout uint rng, bool allowMark, bool skipFirstEmission)
+float3 GiSkinShadeChain(GiSurface surface, RayDesc ray, uint walks, inout uint rng, bool allowMark, bool skipFirstEmission)
 {
     float3 radiance = 0.0f;
     float3 throughput = 1.0f;
@@ -356,7 +359,7 @@ float3 GiSkinShadeChain(GiSurface surface, RayDesc ray, inout uint rng, bool all
             {
                 uint face = surface.faceKey.y >> 28u;
                 float3 localPosition = GiSkinToObject(context.group, surface.position) - context.origin;
-                radiance += throughput * diffuse * GiSkinWalks(context, localPosition, face, rng, allowMark);
+                radiance += throughput * diffuse * GiSkinWalks(context, localPosition, face, walks, rng, allowMark);
                 if (allowMark) GiSkinTouch(context.slot);
                 cached = true;
             }
