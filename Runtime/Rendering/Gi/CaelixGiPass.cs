@@ -367,13 +367,31 @@ public class CaelixGiPass : ScriptableRenderPass, IDisposable
         int bucketGroups = (data.bucketCount + 63) / 64;
         GraphicsBuffer args = data.args;
 
+        // One profiler sample per kernel, so the Profiler's GPU module (and Nsight) can attribute
+        // the pass's time to a stage. The names are stable; tools key on them.
+        cmd.BeginSample("Caelix GI 1 PreparePixels");
         cmd.DispatchCompute(cs, k[KernelPreparePixels], pixelGroupsX, pixelGroupsY, 1);
+        cmd.EndSample("Caelix GI 1 PreparePixels");
+        cmd.BeginSample("Caelix GI 2 PrepareBuckets");
         cmd.DispatchCompute(cs, k[KernelPrepareBuckets], bucketGroups, 1, 1);
+        cmd.EndSample("Caelix GI 2 PrepareBuckets");
+        cmd.BeginSample("Caelix GI 3 GenerateSamples");
         cmd.DispatchCompute(cs, k[KernelGenerateSamples], pixelGroupsX, pixelGroupsY, 1);
+        cmd.EndSample("Caelix GI 3 GenerateSamples");
+        cmd.BeginSample("Caelix GI 4 PrepareHistory");
         cmd.DispatchCompute(cs, k[KernelPrepareHistory], 1, 1, 1);
+        cmd.EndSample("Caelix GI 4 PrepareHistory");
+        cmd.BeginSample("Caelix GI 5 ReprojectLit");
         cmd.DispatchCompute(cs, k[KernelReprojectLit], args, 0u);
+        cmd.EndSample("Caelix GI 5 ReprojectLit");
+        cmd.BeginSample("Caelix GI 6 ReprojectUnlit");
         cmd.DispatchCompute(cs, k[KernelReprojectUnlit], args, UnlitArgsOffset);
+        cmd.EndSample("Caelix GI 6 ReprojectUnlit");
+        cmd.BeginSample("Caelix GI 7 RefineBuckets");
         cmd.DispatchCompute(cs, k[KernelRefineBuckets], bucketGroups, 1, 1);
+        cmd.EndSample("Caelix GI 7 RefineBuckets");
+        cmd.BeginSample("Caelix GI 8 Spatial");
         cmd.DispatchCompute(cs, k[KernelSpatial], pixelGroupsX, pixelGroupsY, 1);
+        cmd.EndSample("Caelix GI 8 Spatial");
     }
 }

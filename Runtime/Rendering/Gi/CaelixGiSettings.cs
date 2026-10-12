@@ -74,7 +74,7 @@ public struct CaelixGiSettings
         unlitRingFrames = 4,
         maxHistoryFrames = 64,
         spatialIterations = 12,
-        spatialRadius = 500.0f,
+        spatialRadius = 160.0f,
         adaptiveRadius = true,
         radiusLitFactor = 3.0f,
         sampleLeveling = true,
