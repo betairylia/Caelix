@@ -372,6 +372,16 @@ has, copied, because `CaelixGBufferPass` and `CaelixDenoisePass` take the same s
 Memory at 2560x1440 with the defaults: lit ring 413 MB, unlit ring 531 MB, buckets 7 MB, pixel info
 30 MB. At 1280x720 a quarter of that.
 
+## Status 2026-10-12
+
+Implemented and validated on Bistro (see `Artifacts/gi-resampling-20261012/README.md`). Two defaults differ
+from the design table above: `spatialRadius` is 160 (500 doubled the occlusion loss on walls) and a new
+`ownSampleFallback` (default on) writes the pixel's own fresh sample instead of black when no candidate is
+usable or the chosen reconnection is occluded; it lifted the final brightness from 0.81-0.92 to 0.93-0.95 of
+the path tracer's. `debugMode` (0..4) colours the spatial pass's outcome for diagnosis. Per-kernel GPU time at
+1440p: GenerateSamples 8.5 ms, Spatial 2.5, reprojection 1.6, prep and refine 0.9; the whole frame is 20 ms
+against 14.8 ms for the path tracer, and `sampleRateDivisor` is the lever (NAADF runs at 0.25 spp).
+
 ## Known approximations
 
 - A sample whose first hit is a mirror or glass voxel reconnects at that voxel.
