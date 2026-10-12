@@ -13,6 +13,10 @@
 | `Caelix_outNormal` / `NormalTarget` | `ARGBHalf` | `RG`: Unity oct-packed normal in `[0, 1]`, `B`: 10-bit voxel-face hash stored as exact integer-valued half float, `A`: linear roughness |
 | `Caelix_NormalDepth` / `DepthTarget` | `RFloat` | `R`: linear eye depth for depth copy |
 | `Caelix_outMotionVector` / `MotionVectorTarget` | `ARGBFloat` | `RG`: previousUV minus current (un-jittered) UV, `B`: viewZprev minus viewZ, `A`: delta-checkerboard flag |
+| `Caelix_outGiSurface` / `GiSurfaceTarget` (GI mode only) | `ARGBFloat` | `RGB`: real world position of the surface the primary delta chain ended on, `A`: virtual distance along the camera ray (`path.T`); `(0, 0, 0, K_T_MAX)` on a miss |
+| `Caelix_outGiKey` / `GiKeyTarget` (GI mode only) | `R32G32B32A32_UInt` | `R`: path hash16 \| instance slot << 16, `G`: instance lifetime token, `B`: flags (bit 0 hit, bit 1 wants a diffuse GI estimate, bit 2 opaque), `A`: block ID; 0 on a miss |
+
+The GI targets exist only when the trace runs with the `CAELIX_GI_MODE` keyword, which `CaelixGBufferPass` sets on the command buffer every frame (on for `CaelixGiRendererFeature`, off otherwise). In GI mode the diffuse lobe of an opaque primary is not traced: `CaelixGiPass` fills `DiffuseRadianceTarget` instead, and every traced path goes to `SpecularRadianceTarget`. See `GI_RESAMPLING.md`.
 
 ## Pass Order
 

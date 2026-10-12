@@ -552,7 +552,7 @@ namespace Caelix.Rendering.RayQuery
             {
                 if (brickBaseWords >= 0 && brickPage >= 0)
                 {
-                    // The shader reads the previous transform, the brick pool page and the hash seed
+                    // The shader reads both transforms, the brick pool page and the hash seed
                     // from the instance table, keyed by the RTAS instance ID. The slot is claimed
                     // once and kept for the renderer's whole life, because the ID has to survive a
                     // remove + add.
@@ -561,7 +561,8 @@ namespace Caelix.Rendering.RayQuery
                         instanceSlot = table.Allocate();
                     }
 
-                    table.Set(instanceSlot, prevObjectToWorld, brickBaseWords, brickPage, (uint)groupHashSeed);
+                    table.Set(
+                        instanceSlot, prevObjectToWorld, objectToWorld, brickBaseWords, brickPage, (uint)groupHashSeed);
                     publishedBrickBase = brickBaseWords;
                     publishedPage = brickPage;
                 }

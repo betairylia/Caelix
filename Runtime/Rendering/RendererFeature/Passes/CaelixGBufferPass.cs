@@ -44,6 +44,8 @@ public class CaelixGBufferPass : ScriptableRenderPass
         /// <summary>This frame's global sub-pixel ray offset, in pixels, in launch space.</summary>
         internal Vector2 jitter;
         internal int frameIndex;
+        /// <summary>Trace in GI mode: <c>CAELIX_GI_MODE</c> on, GI targets bound.</summary>
+        internal bool giMode;
 
         internal Matrix4x4 worldToCamera;
         internal Matrix4x4 cameraToWorld;
@@ -63,6 +65,8 @@ public class CaelixGBufferPass : ScriptableRenderPass
         internal TextureHandle MotionVector;
         internal TextureHandle CurrentDepthHistory;
         internal TextureHandle CurrentNormalHistory;
+        internal TextureHandle GiSurface;
+        internal TextureHandle GiKey;
 
         internal RayTracingAccelerationStructure voxAS;
         internal Texture2D blueNoiseTexture;
@@ -91,6 +95,13 @@ public class CaelixGBufferPass : ScriptableRenderPass
     /// only change between frames, so the array is refilled at record time rather than reallocated.
     /// </summary>
     private readonly GraphicsBuffer[] brickPages = new GraphicsBuffer[CaelixBrickPool.MaxNamedPages];
+
+    /// <summary>
+    /// True for the GI resampling feature: the trace runs with <c>CAELIX_GI_MODE</c>, writes the GI
+    /// key and surface targets, and leaves the diffuse lobe of opaque primaries to
+    /// <see cref="CaelixGiPass"/>. False for the regular path tracer.
+    /// </summary>
+    public bool GiMode { get; set; }
 
     /// <summary>
     /// Binds the scene renderer, its compute kernel and this frame's settings.
@@ -169,6 +180,19 @@ public class CaelixGBufferPass : ScriptableRenderPass
         resources.CurrentDepthHistory = renderGraph.ImportTexture(history.CurrentDepth);
         resources.CurrentNormalHistory = renderGraph.ImportTexture(history.CurrentNormal);
 
+        if (GiMode)
+        {
+            resources.GiSurface = UniversalRenderer.CreateRenderGraphTexture(
+                renderGraph, CaelixFrameResources.DescriptorWithFormat(cameraData, RenderTextureFormat.ARGBFloat),
+                "Caelix_outGiSurface", false);
+
+            RenderTextureDescriptor giKeyDesc = CaelixFrameResources.BaseDescriptor(cameraData);
+            giKeyDesc.graphicsFormat = GraphicsFormat.R32G32B32A32_UInt;
+            giKeyDesc.enableRandomWrite = true;
+            resources.GiKey = UniversalRenderer.CreateRenderGraphTexture(
+                renderGraph, giKeyDesc, "Caelix_outGiKey", false, FilterMode.Point);
+        }
+
         using (var builder = renderGraph.AddUnsafePass<PassData>("Caelix RayQuery Trace", out var passData))
         {
             passData.width = (uint)cameraData.scaledWidth;
@@ -179,6 +203,7 @@ public class CaelixGBufferPass : ScriptableRenderPass
             passData.aspectRatio = history.Aspect;
             passData.jitter = history.Jitter;
             passData.frameIndex = Time.frameCount;
+            passData.giMode = GiMode;
 
             passData.worldToCamera = worldToCamera;
             passData.cameraToWorld = worldToCamera.inverse;
@@ -198,6 +223,8 @@ public class CaelixGBufferPass : ScriptableRenderPass
             passData.MotionVector = resources.MotionVector;
             passData.CurrentDepthHistory = resources.CurrentDepthHistory;
             passData.CurrentNormalHistory = resources.CurrentNormalHistory;
+            passData.GiSurface = resources.GiSurface;
+            passData.GiKey = resources.GiKey;
 
             passData.voxAS = rayQuery.voxelScene;
             passData.blueNoiseTexture = blueNoiseTexture;
@@ -236,6 +263,14 @@ public class CaelixGBufferPass : ScriptableRenderPass
             builder.SetGlobalTextureAfterPass(passData.MotionVector, CaelixShaderIDs.MotionVectorTex);
             builder.SetGlobalTextureAfterPass(passData.CurrentDepthHistory, CaelixShaderIDs.CurrentDepthHistoryTex);
             builder.SetGlobalTextureAfterPass(passData.CurrentNormalHistory, CaelixShaderIDs.CurrentNormalHistoryTex);
+
+            if (passData.giMode)
+            {
+                builder.UseTexture(passData.GiSurface, AccessFlags.Write);
+                builder.UseTexture(passData.GiKey, AccessFlags.Write);
+                builder.SetGlobalTextureAfterPass(passData.GiSurface, CaelixShaderIDs.GiSurfaceTex);
+                builder.SetGlobalTextureAfterPass(passData.GiKey, CaelixShaderIDs.GiKeyTex);
+            }
 
             builder.AllowPassCulling(false);
             builder.AllowGlobalStateModification(true);
@@ -301,6 +336,10 @@ public class CaelixGBufferPass : ScriptableRenderPass
         }
 
         CaelixRayQueryDispatch.SetGroupKeyword(cmd, cs, data.groupSize);
+        // Set both ways every frame: the regular and the GI feature share this compute shader, and
+        // a keyword left on by one would otherwise leak into the other. Built here rather than
+        // cached, so a reimported shader never meets a stale keyword handle.
+        cmd.SetKeyword(cs, new LocalKeyword(cs, "CAELIX_GI_MODE"), data.giMode);
 
         CaelixRayQueryDispatch.BindSceneInputs(
             cmd, cs, k, data.voxAS, data.brickPages, data.instanceTable, data.materialTable);
@@ -314,6 +353,11 @@ public class CaelixGBufferPass : ScriptableRenderPass
         cmd.SetComputeTextureParam(cs, k, "MotionVectorTarget", (RTHandle)data.MotionVector);
         cmd.SetComputeTextureParam(cs, k, "g_CurrentDepthHistory", (RTHandle)data.CurrentDepthHistory);
         cmd.SetComputeTextureParam(cs, k, "g_CurrentNormalHistory", (RTHandle)data.CurrentNormalHistory);
+        if (data.giMode)
+        {
+            cmd.SetComputeTextureParam(cs, k, "GiSurfaceTarget", (RTHandle)data.GiSurface);
+            cmd.SetComputeTextureParam(cs, k, "GiKeyTarget", (RTHandle)data.GiKey);
+        }
 
         // The sky provider publishes its cubemap as a plain global, which render graph cannot track
         // (builder.UseGlobalTexture does not see it), so it is fetched directly here.
@@ -349,7 +393,11 @@ public class CaelixGBufferPass : ScriptableRenderPass
         cmd.DispatchCompute(cs, k, (int)((data.width + 7) / 8), (int)((data.height + 7) / 8), 1);
     }
 
-    private static Texture ResolveSkyTexture()
+    /// <summary>
+    /// The sky cubemap the tracer samples: the sky provider's published global, or a white
+    /// fallback while it has not published one yet. Shared with <see cref="CaelixGiPass"/>.
+    /// </summary>
+    internal static Texture ResolveSkyTexture()
     {
         Texture sky = Shader.GetGlobalTexture(CaelixShaderIDs.GlossyEnvironmentCubeMap);
         if (sky != null)

@@ -17,6 +17,9 @@
 // Render group shape. Exactly one keyword is enabled per dispatch by
 // CaelixRayQueryDispatch.SetGroupKeyword; the default variant decodes 16x16x16 bricks.
 #pragma multi_compile _ CAELIX_GROUP_3_3_3 CAELIX_GROUP_5_5_5 CAELIX_GROUP_4_7_4
+// GI resampling mode (CaelixGiRendererFeature): writes the GI key/surface targets and leaves the
+// diffuse lobe of opaque primaries to CaelixGiRQ.compute. Set every frame by CaelixGBufferPass.
+#pragma multi_compile _ CAELIX_GI_MODE
 
 #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
 #include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Packing.hlsl"

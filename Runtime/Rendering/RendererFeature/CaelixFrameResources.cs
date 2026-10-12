@@ -42,6 +42,19 @@ public class CaelixFrameResources : ContextItem
     /// <summary>This frame's normal, persisted for next frame's temporal rejection.</summary>
     public TextureHandle CurrentNormalHistory;
 
+    // --- Produced by CaelixGBufferPass in GI mode only ---
+
+    /// <summary>
+    /// Real world position of the surface the primary delta chain ended on in .xyz, virtual
+    /// distance along the camera ray in .w; (0, 0, 0, K_T_MAX) on a miss. ARGBFloat.
+    /// </summary>
+    public TextureHandle GiSurface;
+    /// <summary>
+    /// .x = path hash16 | instance slot &lt;&lt; 16, .y = instance lifetime token, .z = flags (bit 0 hit,
+    /// bit 1 wants a diffuse GI estimate, bit 2 opaque), .w = block ID; 0 on a miss. R32G32B32A32_UInt.
+    /// </summary>
+    public TextureHandle GiKey;
+
     // --- Produced by CaelixBudgetGBufferPass (budget mode only) ---
 
     /// <summary>
@@ -90,6 +103,8 @@ public class CaelixFrameResources : ContextItem
         MotionVector = TextureHandle.nullHandle;
         CurrentDepthHistory = TextureHandle.nullHandle;
         CurrentNormalHistory = TextureHandle.nullHandle;
+        GiSurface = TextureHandle.nullHandle;
+        GiKey = TextureHandle.nullHandle;
 
         Surface = TextureHandle.nullHandle;
         AOShadowRaw = TextureHandle.nullHandle;

@@ -66,6 +66,7 @@ void CaelixRayQueryTrace(RayDesc ray, out RayPayload payload)
 
     payload.T = T;
     payload.materialID_voxelFaceHash = committedAttrib;
+    payload.instanceId = committedInstance;
     payload.packedWorldNormal = CaelixPackWorldNormal(mul((float3x3)objectToWorld, UnpackObjectNormal(committedAttrib)));
 
     CaelixRayQueryInstance inst = g_Instances[committedInstance];

@@ -22,6 +22,10 @@ public static class CaelixShaderIDs
     public static readonly int MotionVectorTex = Shader.PropertyToID("_MotionVectorTex");
     public static readonly int CurrentDepthHistoryTex = Shader.PropertyToID("_CurrentDepthHistoryTex");
     public static readonly int CurrentNormalHistoryTex = Shader.PropertyToID("_CurrentNormalHistoryTex");
+    /// <summary>GI mode only: real surface world position in .xyz, virtual distance along the camera ray in .w.</summary>
+    public static readonly int GiSurfaceTex = Shader.PropertyToID("_GiSurfaceTex");
+    /// <summary>GI mode only: path hash and instance, lifetime token, flags, block ID (uint4).</summary>
+    public static readonly int GiKeyTex = Shader.PropertyToID("_GiKeyTex");
 
     // --- Denoise ---
     public static readonly int AccumulatedIndirectRadianceTex = Shader.PropertyToID("_AccumulatedIndirectRadianceTex");

@@ -173,12 +173,17 @@ struct GiPixelInfo            // 8 bytes, pixels
     uint hashes;              // centre hash16 | bloom16 << 16 (bloom bit = 1 << (h & 15) of each of the 8 neighbours)
 };
 
-counts buffer (uint, 8 + 128 entries):
+counts buffer (uint, 8 + 2 * 128 entries):
   [0] litHead  [1] unlitHead          // ring write heads, monotonically increased mod capacity
   [2] litValid [3] unlitValid         // valid totals this frame (set by GiPrepareHistory)
   [4] litStart [5] unlitStart         // ring index of the oldest valid sample
   [6] litCoprime [7] unlitCoprime     // odd multipliers for the group shuffle
-  [8 + 2*f], [9 + 2*f]                // per-frame lit / unlit counts, f = frame % 128
+  [8 + 2*f], [9 + 2*f]                // per-frame lit / unlit counts, f = ringFrame % 128
+
+`ringFrame` counts the frames this camera's buffers have run (`CaelixGiResources.RingFrame`,
+pushed as `g_GiRingFrame`), not `Time.frameCount`: a frame on which the camera did not render
+would otherwise leave a stale count from 128 frames earlier inside the history sum. Thread 0 of
+`GiPrepareBuckets` zeroes this frame's two slots before `GiGenerateSamples` adds to them.
 
 indirect args buffer: two DispatchIndirect triples (lit, unlit).
 ```
@@ -289,8 +294,9 @@ if lit + unlitEff < minBucketSamples: stored = 0
 write packed (stored, normalMask kept, totalComp = min(7, (litCount + unlitCount) / 64)), litRatio, maxLum
 ```
 
-The lit ratio and the leveling scale are applied at use time (`radiance * litRatio` in the spatial
-pass), not baked into the compact record, so the record stays reusable for debugging.
+The leveling scale `r` is baked into the compact record's radiance (the spatial pass has no
+per-sample data to recompute it). The lit ratio is applied at use time (`radiance * litRatio` in
+the spatial pass), because it is a bucket property.
 
 ### GiSpatial (8x8 threads per pixel)
 
@@ -353,7 +359,7 @@ verbatim, using `litRatio`, `stored`, `totalComp` and `maxLuminance` from `GiBuc
 | `unlitRingFrames` | 4 | Unlit ring capacity in frames of pixels. |
 | `maxHistoryFrames` | 64 | Oldest frame whose samples are still reprojected (at most 128). |
 | `spatialIterations` | 12 | Reservoir iterations per pixel. |
-| `spatialRadius` | 500 | Neighbour square half-size in pixels, before the adaptive factor. |
+| `spatialRadius` | 500 | Edge length in pixels of the square the neighbour offsets are drawn from (NAADF's `spatialResampleSize`), before the adaptive factor. |
 | `adaptiveRadius` | true | NAADF's varying radius. |
 | `radiusLitFactor` | 3.0 | Knob of the adaptive radius. |
 | `sampleLeveling` | true | Remove dim samples per bucket and boost the rest. |

@@ -73,6 +73,16 @@ RWTexture2D<float4> g_CurrentNormalHistory;
 TextureCube<float4> g_Sky;
 SamplerState sampler_g_Sky;
 
+#if defined(CAELIX_GI_MODE)
+// GI resampling inputs (Documentation~/internals/rendering/GI_RESAMPLING.md).
+// .xyz = real world position of the surface the delta chain ended on, .w = virtual distance along
+// the camera ray (path.T); (0, 0, 0, K_T_MAX) on a miss.
+RWTexture2D<float4> GiSurfaceTarget;
+// .x = pathHash16 | instanceId << 16, .y = instance lifetime token,
+// .z = flags (bit 0 hit, bit 1 wants a diffuse GI estimate, bit 2 opaque), .w = block ID. 0 on a miss.
+RWTexture2D<uint4> GiKeyTarget;
+#endif
+
 struct CaelixPathState
 {
     float3 throughput;
@@ -80,6 +90,9 @@ struct CaelixPathState
     uint bounceIndex;
     uint rngState;
     int previousTransparentMaterial;
+    // Hash of every delta interface the primary chain crossed (material, face, reflect/refract).
+    // 0 = no interface. The GI resampler compares it at a sample's landing pixel.
+    uint pathHash;
 };
 
 #define BOUNCEIDX_IS_SPECULAR 0x80000000
@@ -97,6 +110,7 @@ void CaelixInitPathState(out CaelixPathState path, uint rngState)
     path.bounceIndex = 0u;
     path.rngState = rngState;
     path.previousTransparentMaterial = 0;
+    path.pathHash = 0u;
 }
 
 int PathBounceIndexDeterministic(CaelixPathState path)
@@ -201,6 +215,13 @@ bool AdvanceDeltaRay(RayPayload payload, inout RayDesc ray, inout CaelixPathStat
             path.bounceIndex |= ((doRefraction ? 0 : 1) * BOUNCEIDX_IS_SPECULAR);
             path.bounceIndex |= (canRefract ? BOUNCEIDX_IS_PSR : 0);
         }
+
+        // CaelixHashAvalanche is the same lowbias32 hash as CaelixHashUint (CaelixDenoiseCommon.hlsl),
+        // which is not part of this compile unit.
+        path.pathHash = CaelixHashAvalanche(path.pathHash
+            ^ (uint(materialID) & 0xFFFFu)
+            ^ ((payload.materialID_voxelFaceHash & 63u) << 16)
+            ^ (doRefraction == 1.0f ? 0x800000u : 0u));
         // doRefraction = 0.0f;
         float3 bounceRayDir = SafeNormalize(lerp(reflectionRayDir, refractionRayDir, doRefraction));
         float pushOff = doRefraction == 1.0f ? -K_RAY_ORIGIN_PUSH_OFF : K_RAY_ORIGIN_PUSH_OFF;
@@ -556,6 +577,24 @@ void CaelixPathTraceMain()
         // the denoiser. path.throughput carries the delta chain's transmission.
         DeterministicRadianceTarget[outputLaunchIndex] = float4(CaelixSanitizeRadiance(path.throughput * primaryShade.emission), 1.0f);
 
+#if defined(CAELIX_GI_MODE)
+        // The diffuse lobe of an opaque primary belongs to the GI resampler: no bounce is traced
+        // for it here, and the resampler fills DiffuseRadianceTarget later in the frame.
+        int giMaterialID = int((payload.materialID_voxelFaceHash >> 16) & 0xFFFFu);
+        bool giOpaque = IsOpaque(giMaterialID);
+        bool giDiffuseLobe = giOpaque && primaryShade.specularLobe < half(0.5f) && !PathBounceIndexIsSpecular(path);
+        uint giHash16 = path.pathHash == 0u
+            ? 0u
+            : max(1u, (path.pathHash ^ (path.pathHash >> 16)) & 0xFFFFu);
+        uint giFlags = 1u | (giDiffuseLobe ? 2u : 0u) | (giOpaque ? 4u : 0u);
+        GiSurfaceTarget[outputLaunchIndex] = float4(surfaceWorldPosition, path.T);
+        GiKeyTarget[outputLaunchIndex] = uint4(
+            giHash16 | (payload.instanceId << 16),
+            g_Instances[payload.instanceId].lifetimeToken,
+            giFlags,
+            uint(giMaterialID));
+#endif
+
         // Keep the primary albedo out of the temporal history. It is applied once during final
         // composition so replaced voxels can reuse lighting history.
         half3 indirectIncidentRadiance = half3(0, 0, 0);
@@ -574,6 +613,9 @@ void CaelixPathTraceMain()
         // NOTE: the stochastic counter lives in the low nibble of path.bounceIndex, so
         // g_BounceCountOpaque must stay below 15 — past that the counter wraps and this loop
         // never terminates.
+#if defined(CAELIX_GI_MODE)
+        if (!giDiffuseLobe)
+#endif
         for(; (uint)PathBounceIndexStochastic(path) <= g_BounceCountOpaque;)
         {
             RayPayload bouncePayload;
@@ -635,13 +677,24 @@ void CaelixPathTraceMain()
         // exactly what the old combined buffer held. The unsampled lobe gets 0 radiance and
         // 0 hit distance (no data this frame).
         // bool primaryLobeIsSpecular = primaryShade.specularLobe > half(0.5f);
-        bool primaryLobeIsSpecular = PathBounceIndexIsSpecular(path);
         float4 stochasticOut = float4(CaelixSanitizeRadiance(indirectIncidentRadiance), firstSegmentHitT);
+#if defined(CAELIX_GI_MODE)
+        // GI mode: the diffuse target belongs to the resampler alone, so every traced path
+        // (including an opaque specular-lobe sample) goes to the specular target.
+        DiffuseRadianceTarget[outputLaunchIndex] = giDiffuseLobe ? float4(0, 0, 0, K_T_MAX) : float4(0, 0, 0, 0);
+        SpecularRadianceTarget[outputLaunchIndex] = giDiffuseLobe ? float4(0, 0, 0, 0) : stochasticOut;
+#else
+        bool primaryLobeIsSpecular = PathBounceIndexIsSpecular(path);
         DiffuseRadianceTarget[outputLaunchIndex] = primaryLobeIsSpecular ? float4(0, 0, 0, 0) : stochasticOut;
         SpecularRadianceTarget[outputLaunchIndex] = primaryLobeIsSpecular ? stochasticOut : float4(0, 0, 0, 0);
+#endif
     }
     else
     {
+#if defined(CAELIX_GI_MODE)
+        GiSurfaceTarget[outputLaunchIndex] = float4(0.0f, 0.0f, 0.0f, K_T_MAX);
+        GiKeyTarget[outputLaunchIndex] = uint4(0u, 0u, 0u, 0u);
+#endif
         // Sky pixels carry no stochastic signal. These are pooled render-graph textures created
         // without a clear, so leaving them unwritten feeds a stale frame into the denoiser.
         DiffuseRadianceTarget[outputLaunchIndex] = float4(0, 0, 0, 0);

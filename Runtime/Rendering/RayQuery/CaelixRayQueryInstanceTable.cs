@@ -7,11 +7,12 @@ namespace Caelix.Rendering.RayQuery
 {
     /// <summary>
     /// Per-RTAS-instance record read by the ray query kernel, indexed by <c>InstanceID()</c>.
-    /// Mirrors the HLSL <c>CaelixRayQueryInstance</c> struct in <c>CaelixRayQueryTrace.hlsl</c>.
+    /// Mirrors the HLSL <c>CaelixRayQueryInstance</c> struct in <c>CaelixInstanceRecord.hlsl</c>;
+    /// the field order here must equal the HLSL field order.
     /// </summary>
     /// <remarks>
-    /// The previous transform is stored as four rows rather than a <see cref="Matrix4x4"/> so the
-    /// layout does not depend on HLSL matrix packing rules.
+    /// The transforms are stored as rows rather than a <see cref="Matrix4x4"/> so the layout does
+    /// not depend on HLSL matrix packing rules.
     /// </remarks>
     [StructLayout(LayoutKind.Sequential)]
     public struct CaelixRayQueryInstance
@@ -20,6 +21,13 @@ namespace Caelix.Rendering.RayQuery
         public Vector4 prevRow1;
         public Vector4 prevRow2;
         public Vector4 prevRow3;
+
+        /// <summary>Row 0 of the current object-to-world matrix.</summary>
+        public Vector4 curRow0;
+        /// <summary>Row 1 of the current object-to-world matrix.</summary>
+        public Vector4 curRow1;
+        /// <summary>Row 2 of the current object-to-world matrix. Row 3 is always (0, 0, 0, 1).</summary>
+        public Vector4 curRow2;
 
         /// <summary>Word offset of this sector's first brick inside its brick pool page.</summary>
         public uint brickBase;
@@ -33,10 +41,14 @@ namespace Caelix.Rendering.RayQuery
         /// </summary>
         public uint page;
 
-        public uint pad1;
+        /// <summary>
+        /// Non-zero while the slot is allocated, fresh on every <see cref="CaelixRayQueryInstanceTable.Allocate"/>.
+        /// GI samples store it, so a sample whose slot was freed and reused is rejected.
+        /// </summary>
+        public uint lifetimeToken;
 
         /// <summary>Size of one record in bytes; the structured buffer's stride.</summary>
-        public const int Stride = 80;
+        public const int Stride = 128;
     }
 
     /// <summary>
@@ -67,27 +79,52 @@ namespace Caelix.Rendering.RayQuery
         private int highWater;
         private bool dirty;
 
+        /// <summary>
+        /// Source of <see cref="CaelixRayQueryInstance.lifetimeToken"/>. Static, so a token is never
+        /// reused while a table is recreated within one session either.
+        /// </summary>
+        private static uint s_NextLifetimeToken;
+
         public CaelixRayQueryInstanceTable()
         {
             Grow(InitialCapacity);
         }
 
-        /// <summary>Reserves a slot, reusing a freed one when possible.</summary>
+        /// <summary>
+        /// Reserves a slot, reusing a freed one when possible, and gives it a fresh non-zero
+        /// lifetime token.
+        /// </summary>
         public int Allocate()
         {
+            int slot;
             if (freeSlots.Count > 0)
             {
-                dirty = true;
-                return freeSlots.Pop();
+                slot = freeSlots.Pop();
             }
-
-            if (highWater >= Capacity)
+            else
             {
-                Grow(Capacity * 2);
+                if (highWater >= Capacity)
+                {
+                    Grow(Capacity * 2);
+                }
+
+                slot = highWater++;
             }
 
+            host[slot] = new CaelixRayQueryInstance { lifetimeToken = NextLifetimeToken() };
             dirty = true;
-            return highWater++;
+            return slot;
+        }
+
+        /// <summary>The lifetime token of <paramref name="slot"/>; 0 when the slot is not allocated.</summary>
+        public uint GetLifetimeToken(int slot)
+        {
+            if (slot < 0 || slot >= Capacity)
+            {
+                return 0u;
+            }
+
+            return host[slot].lifetimeToken;
         }
 
         /// <summary>Returns a slot and zeroes its record, so a stale transform cannot be read.</summary>
@@ -103,11 +140,20 @@ namespace Caelix.Rendering.RayQuery
             dirty = true;
         }
 
-        /// <summary>Writes one slot's record. Takes effect on the next <see cref="Flush"/>.</summary>
+        /// <summary>
+        /// Writes one slot's record, keeping its lifetime token. Takes effect on the next <see cref="Flush"/>.
+        /// </summary>
+        /// <param name="prevObjectToWorld">The group's object-to-world matrix on the previous renderer tick.</param>
+        /// <param name="objectToWorld">The group's current object-to-world matrix (rigid, scale 1).</param>
         /// <param name="brickBaseWords">Word offset of the sector's first brick inside <paramref name="page"/>.</param>
         /// <param name="page">Index of the brick pool page holding the sector's bricks.</param>
         public void Set(
-            int slot, in Matrix4x4 prevObjectToWorld, int brickBaseWords, int page, uint hashSeed)
+            int slot,
+            in Matrix4x4 prevObjectToWorld,
+            in Matrix4x4 objectToWorld,
+            int brickBaseWords,
+            int page,
+            uint hashSeed)
         {
             host[slot] = new CaelixRayQueryInstance
             {
@@ -117,7 +163,11 @@ namespace Caelix.Rendering.RayQuery
                 prevRow3 = prevObjectToWorld.GetRow(3),
                 brickBase = (uint)brickBaseWords,
                 hashSeed = hashSeed,
-                page = (uint)page
+                page = (uint)page,
+                lifetimeToken = host[slot].lifetimeToken,
+                curRow0 = objectToWorld.GetRow(0),
+                curRow1 = objectToWorld.GetRow(1),
+                curRow2 = objectToWorld.GetRow(2)
             };
 
             dirty = true;
@@ -133,6 +183,18 @@ namespace Caelix.Rendering.RayQuery
 
             Buffer.SetData(host, 0, 0, Capacity);
             dirty = false;
+        }
+
+        /// <summary>Next non-zero token. 0 is reserved for "slot not allocated", so the counter skips it on wrap.</summary>
+        private static uint NextLifetimeToken()
+        {
+            s_NextLifetimeToken++;
+            if (s_NextLifetimeToken == 0u)
+            {
+                s_NextLifetimeToken = 1u;
+            }
+
+            return s_NextLifetimeToken;
         }
 
         private void Grow(int capacity)
