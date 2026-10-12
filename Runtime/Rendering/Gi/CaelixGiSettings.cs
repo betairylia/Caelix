@@ -61,6 +61,9 @@ public struct CaelixGiSettings
     [Tooltip("Upper bound of the reconnection Jacobian gate.")]
     [Min(0.0f)] public float jacobianMax;
 
+    [Tooltip("When the spatial pass finds no usable candidate, or its chosen candidate is occluded, output the pixel's own fresh sample instead of black. Removes most of the darkening on walls and in recesses at the price of some grain there.")]
+    public bool ownSampleFallback;
+
     [Tooltip("Diagnostic output of the spatial pass into the diffuse target (view it with the StochasticDiffuse debug view): 0 off, 1 candidates found per pixel, 2 outcome (red none, blue occluded, green used), 3 bucket state (R stored, G lit ratio, B sample count), 4 adaptive radius factor.")]
     [Range(0, 4)] public int debugMode;
 
@@ -81,6 +84,7 @@ public struct CaelixGiSettings
         minBucketSamples = 12,
         jacobianMin = 0.3f,
         jacobianMax = 2.5f,
+        ownSampleFallback = true,
         debugMode = 0
     };
 

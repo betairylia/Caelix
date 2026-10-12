@@ -86,6 +86,11 @@ RWStructuredBuffer<GiBucketInfo> g_GiBuckets;
 RWStructuredBuffer<GiPixelInfo> g_GiPixels;
 RWStructuredBuffer<uint> g_GiCounts;
 RWBuffer<uint> g_GiArgs;
+// This frame's own fresh sample per pixel (RGB9E5 incident radiance before the lit/unlit
+// leveling), 0 where no sample was traced. The spatial pass falls back to it instead of writing
+// black when its chosen candidate is occluded or none passed the gates.
+RWTexture2D<uint> g_GiOwnSample;
+uint g_GiOwnSampleFallback;
 
 // Frames this camera's GI buffers have run since allocation; selects the per-frame count slot.
 uint g_GiRingFrame;
@@ -246,10 +251,11 @@ void GiPrepareBuckets(uint3 id : SV_DispatchThreadID)
 
 // Traces one cosine-distributed path from the pixel's primary surface and decides whether it is
 // stored as a lit sample, an unlit sample, or not at all.
-void GiTraceSample(uint2 p, uint4 key, out GiLitSample sample, out bool isLit, out bool isUnlit)
+void GiTraceSample(uint2 p, uint4 key, out GiLitSample sample, out bool isLit, out bool isUnlit, out uint ownRadiance)
 {
     isLit = false;
     isUnlit = false;
+    ownRadiance = 0u;
 
     float4 surface = g_GiSurface[p];
     float3 P = surface.xyz;
@@ -343,6 +349,7 @@ void GiTraceSample(uint2 p, uint4 key, out GiLitSample sample, out bool isLit, o
     }
 
     float3 c = CaelixSanitizeRadiance(radiance);
+    ownRadiance = GiPackRadiance(c);
 
     // Lit / unlit split with NAADF radiance leveling: a dim sample survives with probability
     // keep and is boosted by 1 / keep, so the lit ring holds fewer, brighter samples.
@@ -390,10 +397,13 @@ void GiGenerateSamples(uint3 id : SV_DispatchThreadID)
     GiLitSample sample = (GiLitSample)0;
     bool isLit = false;
     bool isUnlit = false;
+    uint ownRadiance = 0u;
     if (eligible)
     {
-        GiTraceSample(p, key, sample, isLit, isUnlit);
+        GiTraceSample(p, key, sample, isLit, isUnlit, ownRadiance);
     }
+
+    g_GiOwnSample[p] = ownRadiance;
 
     // Wave-aggregated ring append: one atomic per wave per ring. Every lane that passed the range
     // test reaches this point, so the first active lane is the one that owns the atomic.
@@ -910,9 +920,22 @@ void GiSpatial(uint3 id : SV_DispatchThreadID)
         }
     }
 
+    // Fallback for a pixel the reuse cannot serve: its own fresh sample is an unbiased (noisy)
+    // estimate, and writing it instead of black removes most of the darkening that occluded
+    // reconnections cause on walls and in recesses.
+    float4 fallback = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (g_GiOwnSampleFallback != 0u)
+    {
+        uint own = g_GiOwnSample[p];
+        if (own != 0u)
+        {
+            fallback = float4(GiUnpackRadiance(own), K_T_MAX);
+        }
+    }
+
     if (!hasSelected || sumW <= 0.0f || selectedPHat <= 0.0f)
     {
-        DiffuseRadianceTarget[p] = g_GiDebugMode == 2u ? float4(1.0f, 0.0f, 0.0f, K_T_MAX) : float4(0.0f, 0.0f, 0.0f, 0.0f);
+        DiffuseRadianceTarget[p] = g_GiDebugMode == 2u ? float4(1.0f, 0.0f, 0.0f, K_T_MAX) : fallback;
         return;
     }
 
@@ -929,7 +952,7 @@ void GiSpatial(uint3 id : SV_DispatchThreadID)
     CAELIX_TRACE_RAY(ray, payload);
     if (CaelixRayPayloadHasHit(payload))
     {
-        DiffuseRadianceTarget[p] = g_GiDebugMode == 2u ? float4(0.0f, 0.0f, 1.0f, K_T_MAX) : float4(0.0f, 0.0f, 0.0f, 0.0f);
+        DiffuseRadianceTarget[p] = g_GiDebugMode == 2u ? float4(0.0f, 0.0f, 1.0f, K_T_MAX) : fallback;
         return;
     }
 

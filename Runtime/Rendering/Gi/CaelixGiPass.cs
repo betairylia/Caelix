@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Experimental.Rendering;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.RenderGraphModule;
 using UnityEngine.Rendering.Universal;
@@ -86,6 +87,8 @@ public class CaelixGiPass : ScriptableRenderPass, IDisposable
         internal TextureHandle GiKey;
         internal TextureHandle Normal;
         internal TextureHandle DiffuseRadiance;
+        /// <summary>This frame's own sample per pixel, RGB9E5, for the spatial pass's fallback.</summary>
+        internal TextureHandle OwnSample;
 
         internal BufferHandle litRing;
         internal BufferHandle unlitRing;
@@ -179,6 +182,12 @@ public class CaelixGiPass : ScriptableRenderPass, IDisposable
             passData.Normal = resources.Normal;
             passData.DiffuseRadiance = resources.StochasticDiffuse;
 
+            RenderTextureDescriptor ownDesc = CaelixFrameResources.BaseDescriptor(cameraData);
+            ownDesc.graphicsFormat = GraphicsFormat.R32_UInt;
+            ownDesc.enableRandomWrite = true;
+            passData.OwnSample = UniversalRenderer.CreateRenderGraphTexture(
+                renderGraph, ownDesc, "Caelix_GiOwnSample", false, FilterMode.Point);
+
             passData.litRing = renderGraph.ImportBuffer(gi.LitRing);
             passData.unlitRing = renderGraph.ImportBuffer(gi.UnlitRing);
             passData.refined = renderGraph.ImportBuffer(gi.Refined);
@@ -201,6 +210,7 @@ public class CaelixGiPass : ScriptableRenderPass, IDisposable
             builder.UseTexture(resources.DeterministicRadiance, AccessFlags.Read);
             // Every pixel is written: the resampled estimate, or 0 where no estimate is wanted.
             builder.UseTexture(resources.StochasticDiffuse, AccessFlags.Write);
+            builder.UseTexture(passData.OwnSample, AccessFlags.ReadWrite);
 
             builder.UseBuffer(passData.litRing, AccessFlags.ReadWrite);
             builder.UseBuffer(passData.unlitRing, AccessFlags.ReadWrite);
@@ -314,6 +324,7 @@ public class CaelixGiPass : ScriptableRenderPass, IDisposable
             cmd.SetComputeTextureParam(cs, kernel, "g_GiKey", (RTHandle)data.GiKey);
             cmd.SetComputeTextureParam(cs, kernel, "g_GiNormal", (RTHandle)data.Normal);
             cmd.SetComputeTextureParam(cs, kernel, "DiffuseRadianceTarget", (RTHandle)data.DiffuseRadiance);
+            cmd.SetComputeTextureParam(cs, kernel, "g_GiOwnSample", (RTHandle)data.OwnSample);
             cmd.SetComputeTextureParam(cs, kernel, "g_Sky", sky);
             if (data.blueNoiseTexture != null)
             {
@@ -361,6 +372,7 @@ public class CaelixGiPass : ScriptableRenderPass, IDisposable
         cmd.SetComputeFloatParam(cs, "g_GiJacobianMin", s.jacobianMin);
         cmd.SetComputeFloatParam(cs, "g_GiJacobianMax", s.jacobianMax);
         cmd.SetComputeIntParam(cs, "g_GiDebugMode", s.debugMode);
+        cmd.SetComputeIntParam(cs, "g_GiOwnSampleFallback", s.ownSampleFallback ? 1 : 0);
 
         int pixelGroupsX = (data.width + 7) / 8;
         int pixelGroupsY = (data.height + 7) / 8;
