@@ -107,6 +107,10 @@ uint g_GiSampleLeveling;
 uint g_GiMinBucketSamples;
 float g_GiJacobianMin;
 float g_GiJacobianMax;
+// Diagnostic output of GiSpatial into DiffuseRadianceTarget (CaelixGiSettings.debugMode):
+// 0 off, 1 candidates found / iterations as grey, 2 outcome (red none, blue occluded, green used),
+// 3 this pixel's bucket (R stored / 8, G lit ratio, B total samples / 448), 4 adaptive radius factor.
+uint g_GiDebugMode;
 
 // Kernel ids for the PCG streams.
 #define GI_RAND_REPROJECT 5u
@@ -892,9 +896,23 @@ void GiSpatial(uint3 id : SV_DispatchThreadID)
         }
     }
 
+    if (g_GiDebugMode != 0u)
+    {
+        float3 dbg = float3(0.0f, 0.0f, 0.0f);
+        GiBucketInfo own = g_GiBuckets[GiBucketIndex(p)];
+        if (g_GiDebugMode == 1u) dbg = M / float(max(1u, g_GiSpatialIterations));
+        else if (g_GiDebugMode == 3u) dbg = float3(float(own.packed & 15u) / 8.0f, own.litRatio, float((own.packed >> 10) & 7u) / 7.0f);
+        else if (g_GiDebugMode == 4u) dbg = radius / g_GiSpatialRadius;
+        if (g_GiDebugMode != 2u)
+        {
+            DiffuseRadianceTarget[p] = float4(dbg, K_T_MAX);
+            return;
+        }
+    }
+
     if (!hasSelected || sumW <= 0.0f || selectedPHat <= 0.0f)
     {
-        DiffuseRadianceTarget[p] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        DiffuseRadianceTarget[p] = g_GiDebugMode == 2u ? float4(1.0f, 0.0f, 0.0f, K_T_MAX) : float4(0.0f, 0.0f, 0.0f, 0.0f);
         return;
     }
 
@@ -911,7 +929,13 @@ void GiSpatial(uint3 id : SV_DispatchThreadID)
     CAELIX_TRACE_RAY(ray, payload);
     if (CaelixRayPayloadHasHit(payload))
     {
-        DiffuseRadianceTarget[p] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        DiffuseRadianceTarget[p] = g_GiDebugMode == 2u ? float4(0.0f, 0.0f, 1.0f, K_T_MAX) : float4(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+
+    if (g_GiDebugMode == 2u)
+    {
+        DiffuseRadianceTarget[p] = float4(0.0f, 1.0f, 0.0f, K_T_MAX);
         return;
     }
 

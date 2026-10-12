@@ -61,6 +61,9 @@ public struct CaelixGiSettings
     [Tooltip("Upper bound of the reconnection Jacobian gate.")]
     [Min(0.0f)] public float jacobianMax;
 
+    [Tooltip("Diagnostic output of the spatial pass into the diffuse target (view it with the StochasticDiffuse debug view): 0 off, 1 candidates found per pixel, 2 outcome (red none, blue occluded, green used), 3 bucket state (R stored, G lit ratio, B sample count), 4 adaptive radius factor.")]
+    [Range(0, 4)] public int debugMode;
+
     public static CaelixGiSettings Default => new CaelixGiSettings
     {
         sampleRateDivisor = 1,
@@ -77,7 +80,8 @@ public struct CaelixGiSettings
         sampleLeveling = true,
         minBucketSamples = 12,
         jacobianMin = 0.3f,
-        jacobianMax = 2.5f
+        jacobianMax = 2.5f,
+        debugMode = 0
     };
 
     /// <summary>Clamps user-authored values into ranges the shaders can handle.</summary>
@@ -97,6 +101,7 @@ public struct CaelixGiSettings
         v.minBucketSamples = Mathf.Max(0, v.minBucketSamples);
         v.jacobianMin = Mathf.Max(0.0f, v.jacobianMin);
         v.jacobianMax = Mathf.Max(v.jacobianMin, v.jacobianMax);
+        v.debugMode = Mathf.Clamp(v.debugMode, 0, 4);
         return v;
     }
 }

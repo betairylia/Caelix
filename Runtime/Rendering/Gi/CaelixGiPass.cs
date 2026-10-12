@@ -360,6 +360,7 @@ public class CaelixGiPass : ScriptableRenderPass, IDisposable
         cmd.SetComputeIntParam(cs, "g_GiMinBucketSamples", s.minBucketSamples);
         cmd.SetComputeFloatParam(cs, "g_GiJacobianMin", s.jacobianMin);
         cmd.SetComputeFloatParam(cs, "g_GiJacobianMax", s.jacobianMax);
+        cmd.SetComputeIntParam(cs, "g_GiDebugMode", s.debugMode);
 
         int pixelGroupsX = (data.width + 7) / 8;
         int pixelGroupsY = (data.height + 7) / 8;
