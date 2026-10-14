@@ -73,6 +73,7 @@ public class CaelixGiPass : ScriptableRenderPass, IDisposable
         internal int unlitCapacity;
         internal uint ringFrame;
         internal int frameIndex;
+        internal bool historyValid;
 
         internal Vector2 jitter;
         internal Vector2 projection;
@@ -87,6 +88,8 @@ public class CaelixGiPass : ScriptableRenderPass, IDisposable
         internal TextureHandle GiKey;
         internal TextureHandle Normal;
         internal TextureHandle DiffuseRadiance;
+        internal TextureHandle MotionVector;
+        internal TextureHandle PreviousIndirect;
         /// <summary>This frame's own sample per pixel, RGB9E5, for the spatial pass's fallback.</summary>
         internal TextureHandle OwnSample;
 
@@ -181,6 +184,11 @@ public class CaelixGiPass : ScriptableRenderPass, IDisposable
             passData.GiKey = resources.GiKey;
             passData.Normal = resources.Normal;
             passData.DiffuseRadiance = resources.StochasticDiffuse;
+            // Sample rate by pixel age (NAADF rayQueueCalc.fx): the previous temporal history holds
+            // the per-pixel accumulated frame count in alpha, reached through this frame's motion vector.
+            passData.MotionVector = resources.MotionVector;
+            passData.PreviousIndirect = renderGraph.ImportTexture(history.PreviousIndirectRadiance);
+            passData.historyValid = history.IsValid;
 
             RenderTextureDescriptor ownDesc = CaelixFrameResources.BaseDescriptor(cameraData);
             ownDesc.graphicsFormat = GraphicsFormat.R32_UInt;
@@ -208,6 +216,8 @@ public class CaelixGiPass : ScriptableRenderPass, IDisposable
             builder.UseTexture(resources.GiKey, AccessFlags.Read);
             builder.UseTexture(resources.Normal, AccessFlags.Read);
             builder.UseTexture(resources.DeterministicRadiance, AccessFlags.Read);
+            builder.UseTexture(passData.MotionVector, AccessFlags.Read);
+            builder.UseTexture(passData.PreviousIndirect, AccessFlags.Read);
             // Every pixel is written: the resampled estimate, or 0 where no estimate is wanted.
             builder.UseTexture(resources.StochasticDiffuse, AccessFlags.Write);
             builder.UseTexture(passData.OwnSample, AccessFlags.ReadWrite);
@@ -325,6 +335,8 @@ public class CaelixGiPass : ScriptableRenderPass, IDisposable
             cmd.SetComputeTextureParam(cs, kernel, "g_GiNormal", (RTHandle)data.Normal);
             cmd.SetComputeTextureParam(cs, kernel, "DiffuseRadianceTarget", (RTHandle)data.DiffuseRadiance);
             cmd.SetComputeTextureParam(cs, kernel, "g_GiOwnSample", (RTHandle)data.OwnSample);
+            cmd.SetComputeTextureParam(cs, kernel, "g_GiMotionVector", (RTHandle)data.MotionVector);
+            cmd.SetComputeTextureParam(cs, kernel, "g_GiPrevIndirect", (RTHandle)data.PreviousIndirect);
             cmd.SetComputeTextureParam(cs, kernel, "g_Sky", sky);
             if (data.blueNoiseTexture != null)
             {
@@ -359,6 +371,8 @@ public class CaelixGiPass : ScriptableRenderPass, IDisposable
 
         CaelixGiSettings s = data.settings;
         cmd.SetComputeIntParam(cs, "g_GiSampleRateDivisor", s.sampleRateDivisor);
+        cmd.SetComputeIntParam(cs, "g_GiUniformSampleRate", s.uniformSampleRate ? 1 : 0);
+        cmd.SetComputeIntParam(cs, "g_GiHistoryValid", data.historyValid ? 1 : 0);
         cmd.SetComputeFloatParam(cs, "g_GiSkySampleProbability", s.skySampleProbability);
         cmd.SetComputeFloatParam(cs, "g_GiLitThreshold", s.litThreshold);
         cmd.SetComputeIntParam(cs, "g_GiUnlitKeepDivisor", s.unlitKeepDivisor);

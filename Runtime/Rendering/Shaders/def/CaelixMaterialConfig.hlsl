@@ -5,6 +5,6 @@
 // #define CAELIX_PACKED_SCENE_COLOR
 
 // Source emissive values are quantized to 1, 8, 64, 512. Global exposure adjustment only.
-#define CAELIX_PACKED_EMISSION_SCALE 0.1
+#define CAELIX_PACKED_EMISSION_SCALE 1.0
 
 #endif

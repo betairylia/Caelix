@@ -19,6 +19,9 @@ public struct CaelixGiSettings
     [Tooltip("A pixel traces a new GI sample every N frames (1 = every frame).")]
     [Min(1)] public int sampleRateDivisor;
 
+    [Tooltip("Apply the divisor to every pixel. Off (NAADF): a pixel with n frames of temporal history traces every min(n + 1, divisor) frames, so pixels that just appeared sample every frame and their bucket is full after one frame.")]
+    public bool uniformSampleRate;
+
     [Tooltip("Chance a sky hit is kept, weighted by 1/p. Lower it when the sky is bright and storage is tight.")]
     [Range(0.001f, 1.0f)] public float skySampleProbability;
 
@@ -70,6 +73,7 @@ public struct CaelixGiSettings
     public static CaelixGiSettings Default => new CaelixGiSettings
     {
         sampleRateDivisor = 1,
+        uniformSampleRate = false,
         skySampleProbability = 1.0f,
         litThreshold = 1.0f,
         unlitKeepDivisor = 8,

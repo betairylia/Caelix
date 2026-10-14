@@ -90,6 +90,8 @@ RWBuffer<uint> g_GiArgs;
 // leveling), 0 where no sample was traced. The spatial pass falls back to it instead of writing
 // black when its chosen candidate is occluded or none passed the gates.
 RWTexture2D<uint> g_GiOwnSample;
+Texture2D<float4> g_GiMotionVector;  // .xy previousUV - currentUV (NRD convention), from the tracer
+Texture2D<float4> g_GiPrevIndirect;  // last frame's temporal history: .a = accumulated frame count
 uint g_GiOwnSampleFallback;
 
 // Frames this camera's GI buffers have run since allocation; selects the per-frame count slot.
@@ -100,6 +102,8 @@ uint g_GiBucketCount;
 
 // Settings (CaelixGiSettings).
 uint g_GiSampleRateDivisor;
+uint g_GiUniformSampleRate;
+uint g_GiHistoryValid;
 float g_GiSkySampleProbability;
 float g_GiLitThreshold;
 uint g_GiUnlitKeepDivisor;
@@ -379,6 +383,38 @@ void GiTraceSample(uint2 p, uint4 key, out GiLitSample sample, out bool isLit, o
     }
 }
 
+// NAADF rayQueueCalc.fx shouldRay: a pixel with n frames of valid temporal history traces every
+// min(n + 1, divisor) frames. A pixel that just appeared (screen edge, disocclusion) therefore
+// samples every frame and its bucket is full after one frame instead of after `divisor` frames,
+// which is what keeps the revealed band of a moving camera from going dark.
+uint GiSampleModulo(uint2 p)
+{
+    if (g_GiSampleRateDivisor <= 1u)
+    {
+        return 1u;
+    }
+
+    if (g_GiUniformSampleRate != 0u)
+    {
+        return g_GiSampleRateDivisor;
+    }
+
+    if (g_GiHistoryValid == 0u)
+    {
+        return 1u;
+    }
+
+    float2 previousUV = (float2(p) + 0.5f + g_GiJitter) / float2(g_GiFrameSize) + g_GiMotionVector[p].xy;
+    if (any(previousUV < 0.0f) || any(previousUV > 1.0f))
+    {
+        return 1u;
+    }
+
+    int2 q = clamp(int2(floor(previousUV * float2(g_GiFrameSize))), int2(0, 0), int2(g_GiFrameSize) - 1);
+    float age = g_GiPrevIndirect[q].a;
+    return clamp(uint(age) + 1u, 1u, g_GiSampleRateDivisor);
+}
+
 [numthreads(8, 8, 1)]
 void GiGenerateSamples(uint3 id : SV_DispatchThreadID)
 {
@@ -392,7 +428,7 @@ void GiGenerateSamples(uint3 id : SV_DispatchThreadID)
 
     uint4 key = g_GiKey[p];
     bool eligible = (key.z & (GI_KEY_FLAG_HIT | GI_KEY_FLAG_DIFFUSE)) == (GI_KEY_FLAG_HIT | GI_KEY_FLAG_DIFFUSE)
-        && ((g_FrameIndex + p.x + p.y) % g_GiSampleRateDivisor) == 0u;
+        && ((g_FrameIndex + p.x + p.y) % GiSampleModulo(p)) == 0u;
 
     GiLitSample sample = (GiLitSample)0;
     bool isLit = false;

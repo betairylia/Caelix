@@ -203,7 +203,17 @@ the normal mask (normal from `_NormalTex`), min/max of the virtual distance. Wri
 
 ### GiGenerateSamples (8x8 threads per pixel)
 
-Eligible: key flags bit 0 and bit 1 set, and `((g_FrameIndex + x + y) % sampleRateDivisor) == 0`.
+Eligible: key flags bit 0 and bit 1 set, and `((g_FrameIndex + x + y) % GiSampleModulo(p)) == 0`.
+
+`GiSampleModulo` is NAADF's `rayQueueCalc.fx` rule: the modulo is `min(age + 1, sampleRateDivisor)`
+where `age` is the pixel's accumulated temporal-denoiser frame count from the previous frame
+(`CaelixCameraHistory.PreviousIndirectRadiance`, alpha channel), fetched through this frame's
+motion vector. A pixel that just appeared (screen edge under camera motion, a disocclusion, the
+first frame) has age 0 and traces every frame, so its bucket holds a full frame of samples at once;
+only pixels with `sampleRateDivisor - 1` or more frames of history run at the divisor rate.
+Without this rule (`uniformSampleRate` on) a revealed band of buckets stays below
+`minBucketSamples` for several frames, every probe into it counts as a zero sample, and the band
+renders visibly darker than the rest of the screen (seen on Bistro at divisor 8, 2026-10-12).
 
 ```
 P = GiSurface.xyz; n = normal; T = GiSurface.w
@@ -351,7 +361,8 @@ verbatim, using `litRatio`, `stored`, `totalComp` and `maxLuminance` from `GiBuc
 
 | Field | Default | Meaning |
 |---|---|---|
-| `sampleRateDivisor` | 1 | A pixel traces a new sample every N frames (1 = every frame). |
+| `sampleRateDivisor` | 1 | A pixel traces a new sample every N frames (1 = every frame). Pixels with fewer than N - 1 frames of temporal history trace more often, see `GiGenerateSamples`. |
+| `uniformSampleRate` | off | Apply the divisor to every pixel regardless of history age. Not NAADF; for comparison only. |
 | `skySampleProbability` | 1.0 | Chance a sky hit is kept (weighted by 1/p). Lower it when the sky is bright and storage is tight. |
 | `litThreshold` | 1.0 | Luminance below which a sample is stochastically dropped or boosted (NAADF leveling). |
 | `unlitKeepDivisor` | 8 | One unlit sample in N is stored, weighted N. |
