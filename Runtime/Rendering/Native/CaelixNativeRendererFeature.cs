@@ -14,7 +14,8 @@ namespace Caelix.Rendering.Native
     /// this frame's packet; the plugin records the trace into Unity's command buffer and writes the
     /// colour target. <see cref="PresentPass"/> (after the skybox, so the skybox does not cover it)
     /// copies the colour target onto the camera colour, full coverage, flipped vertically (the
-    /// plugin's row 0 is the top row). P1 draws no depth.
+    /// plugin's row 0 is the top row). No depth yet (P3). The scene itself is fed by
+    /// <see cref="CaelixNativeRenderer.Tick"/> through the same packets.
     /// <para>
     /// Enable exactly one Caelix feature per renderer asset. Game cameras only: the plugin counts
     /// one frame per render event, and the Scene view would double the frames in flight.
@@ -118,7 +119,9 @@ namespace Caelix.Rendering.Native
                         CommandBuffer cmd = CommandBufferHelpers.GetNativeCommandBuffer(context.cmd);
                         if (data.ReleaseViews)
                         {
-                            cmd.IssuePluginEventAndData(data.EventFunc, data.ReleaseEventId, IntPtr.Zero);
+                            // The packet goes along: when its encoding differs from the plugin's
+                            // scene, the release event (queue idle) also recreates the scene.
+                            cmd.IssuePluginEventAndData(data.EventFunc, data.ReleaseEventId, data.Packet);
                         }
                         cmd.IssuePluginEventAndData(data.EventFunc, data.RenderEventId, data.Packet);
                     });

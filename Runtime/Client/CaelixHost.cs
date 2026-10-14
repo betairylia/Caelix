@@ -63,6 +63,9 @@ namespace Caelix
 
         [SerializeField] protected VoxelMeshRendererComponent meshingRenderer;
 
+        [Tooltip("Native Vulkan plugin renderer. When empty, the active CaelixNativeRenderer of this host is ticked.")]
+        [SerializeField] protected Caelix.Rendering.Native.CaelixNativeRenderer nativeRenderer;
+
         // ---------------- SIMULATION ------------------
         [Header("Simulation")]
         [Tooltip("Server ticks per second. The fixed step is 1 / TPS. Ticks run from FixedUpdate, " +
@@ -320,10 +323,13 @@ namespace Caelix
 
             bool usedRayQuery = rayQueryRenderer != null && rayQueryRenderer.enabled;
             bool usedMeshing = meshingRenderer != null && meshingRenderer.enabled;
+            Caelix.Rendering.Native.CaelixNativeRenderer native = ResolveNativeRenderer();
             using (s_RenderersMarker.Auto())
             {
                 if (usedRayQuery) rayQueryRenderer.Tick();
                 if (usedMeshing) meshingRenderer.Tick();
+                // Reads the same change lists as the renderers above and clears nothing.
+                if (native != null) native.Tick();
             }
 
             long renderEnd = Stopwatch.GetTimestamp();
@@ -351,6 +357,18 @@ namespace Caelix
                 RenderingMilliseconds = TicksToMilliseconds(renderEnd - clientEnd),
                 TotalMilliseconds = TicksToMilliseconds(serverElapsed + (Stopwatch.GetTimestamp() - frameStart)),
             };
+        }
+
+        /// <summary>
+        /// The native renderer to tick: the serialized one when set and enabled, otherwise the
+        /// active instance when it draws this host (its own host field is empty or this host).
+        /// </summary>
+        private Caelix.Rendering.Native.CaelixNativeRenderer ResolveNativeRenderer()
+        {
+            if (nativeRenderer != null) return nativeRenderer.isActiveAndEnabled ? nativeRenderer : null;
+            Caelix.Rendering.Native.CaelixNativeRenderer active = Caelix.Rendering.Native.CaelixNativeRenderer.Active;
+            if (active == null || !active.isActiveAndEnabled) return null;
+            return active.Host == null || active.Host == this ? active : null;
         }
 
         private static double TicksToMilliseconds(long ticks)

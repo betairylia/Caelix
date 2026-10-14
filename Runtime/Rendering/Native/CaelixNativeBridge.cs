@@ -57,7 +57,11 @@ namespace Caelix.Rendering.Native
         public uint height;
     }
 
-    /// <summary>Mirror of <c>CaelixUnityPacket</c> (caelix_unity.h). 320 bytes.</summary>
+    /// <summary>Mirror of <c>CaelixUnityPacket</c> (caelix_unity.h). 368 bytes.</summary>
+    /// <remarks>
+    /// The fixed part of a packet. The scene records follow it in the same memory block; the
+    /// offsets are bytes from the packet start (see caelix_unity.h for the apply order).
+    /// </remarks>
     [StructLayout(LayoutKind.Sequential)]
     public struct CaelixNativePacket
     {
@@ -69,9 +73,83 @@ namespace Caelix.Rendering.Native
         public CaelixNativeTarget color;
         public CaelixNativeCamera camera;
         public CaelixNativeRenderOptions options;
+
+        // Scene section (version 2).
+        public CaelixNativeSceneSection scene;
     }
 
-    /// <summary>Mirror of <c>CaelixUnityStatus</c> (caelix_unity.h). 104 bytes.</summary>
+    /// <summary>The scene section of <see cref="CaelixNativePacket"/> (version 2). 48 bytes.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct CaelixNativeSceneSection
+    {
+        /// <summary><c>CAELIX_UNITY_SCENE_*</c>.</summary>
+        public uint sceneFlags;
+        /// <summary>The whole block: the packet struct plus every record.</summary>
+        public uint totalBytes;
+        public uint entityCount;
+        public uint entitiesOffset;
+        public uint removeCount;
+        public uint removesOffset;
+        public uint uploadCount;
+        public uint uploadsOffset;
+        /// <summary><c>CAELIX_UNITY_MATERIALS_*</c>.</summary>
+        public uint materialMode;
+        public uint materialCount;
+        public uint materialsOffset;
+        public uint pad;
+    }
+
+    /// <summary>Mirror of <c>CaelixUnityEntity</c> (caelix_unity.h). 48 bytes.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public unsafe struct CaelixNativeEntity
+    {
+        public fixed byte guid[16];
+        public fixed float position[3];
+        public fixed float rotation[4];
+        /// <summary><c>CAELIX_UNITY_ENTITY_*</c>; 0 = a reference only.</summary>
+        public uint flags;
+    }
+
+    /// <summary>Mirror of <c>CaelixUnityBrickRemove</c> (caelix_unity.h). 16 bytes.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct CaelixNativeBrickRemove
+    {
+        public uint entityIndex;
+        public int keyX, keyY, keyZ;
+    }
+
+    /// <summary>Mirror of <c>CaelixUnityUpload</c> (caelix_unity.h). 16 bytes.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct CaelixNativeUpload
+    {
+        public uint entityIndex;
+        public uint brickCount;
+        public uint keysOffset;
+        public uint blocksOffset;
+    }
+
+    /// <summary>Mirror of <c>CaelixMaterial</c> (caelix.h). 48 bytes, linear values.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public unsafe struct CaelixNativeMaterial
+    {
+        public fixed float albedo[3];
+        public float smoothness;
+        public fixed float emission[3];
+        public float metallic;
+        public float ior;
+        public float extinction;
+        public fixed float pad[2];
+    }
+
+    /// <summary>Mirror of <c>CaelixUnityMaterialEntry</c> (caelix_unity.h). 52 bytes.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct CaelixNativeMaterialEntry
+    {
+        public uint code;
+        public CaelixNativeMaterial material;
+    }
+
+    /// <summary>Mirror of <c>CaelixUnityStatus</c> (caelix_unity.h). 208 bytes.</summary>
     [StructLayout(LayoutKind.Sequential)]
     public struct CaelixNativeStatus
     {
@@ -94,6 +172,25 @@ namespace Caelix.Rendering.Native
         public ulong renders;
         public ulong failedEvents;
         public ulong viewReleases;
+        // Version 2: the scene, as of the newest flush.
+        /// <summary>Encoding of the live scene; 0xFFFFFFFF = no scene.</summary>
+        public uint sceneEncoding;
+        public uint entities;
+        public uint groups;
+        public uint sceneRecreations;
+        public ulong bricksResident;
+        public ulong bricksPendingPlugin;
+        public ulong asBuildsPending;
+        public ulong uploadedTotal;
+        public ulong removedTotal;
+        public ulong scenePackets;
+        public ulong recordBytes;
+        public ulong blasBytes;
+        public float flushMs;
+        public float traceMs;
+        public float compositeMs;
+        public float denoiseMs;
+        public ulong timingsFrame;
     }
 
     /// <summary>
@@ -109,7 +206,16 @@ namespace Caelix.Rendering.Native
         private const string Dll = "caelix_unity";
 
         /// <summary>Must equal <c>CAELIX_UNITY_PACKET_VERSION</c>.</summary>
-        public const uint PacketVersion = 1;
+        public const uint PacketVersion = 2;
+
+        // caelix_unity.h constants.
+        public const uint EntityAdd = 1u;
+        public const uint EntityRemove = 2u;
+        public const uint EntityTransform = 4u;
+        public const uint SceneReset = 1u;
+        public const uint MaterialsNone = 0u;
+        public const uint MaterialsFull = 1u;
+        public const uint MaterialsPartial = 2u;
 
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         private static extern IntPtr caelix_unity_get_render_event_func();
@@ -178,6 +284,14 @@ namespace Caelix.Rendering.Native
 
             int packetSize = Marshal.SizeOf<CaelixNativePacket>();
             int statusSize = Marshal.SizeOf<CaelixNativeStatus>();
+            bool recordsOk = Marshal.SizeOf<CaelixNativeEntity>() == 48 && Marshal.SizeOf<CaelixNativeBrickRemove>() == 16 &&
+                             Marshal.SizeOf<CaelixNativeUpload>() == 16 && Marshal.SizeOf<CaelixNativeMaterial>() == 48 &&
+                             Marshal.SizeOf<CaelixNativeMaterialEntry>() == 52 && packetSize == 368 && statusSize == 208;
+            if (!recordsOk)
+            {
+                Debug.LogError("Caelix native: a record struct of CaelixNativeBridge.cs has the wrong size (see caelix_unity.h).");
+                return;
+            }
             if (status.size != statusSize || status.packetSize != packetSize || status.packetVersion != PacketVersion)
             {
                 Debug.LogError(
