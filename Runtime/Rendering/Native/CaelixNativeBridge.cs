@@ -4,7 +4,7 @@ using UnityEngine;
 
 namespace Caelix.Rendering.Native
 {
-    /// <summary>Mirror of <c>CaelixCamera</c> (caelix.h). 144 bytes.</summary>
+    /// <summary>Mirror of <c>CaelixCamera</c> (caelix.h). 152 bytes.</summary>
     [StructLayout(LayoutKind.Sequential)]
     public unsafe struct CaelixNativeCamera
     {
@@ -17,8 +17,10 @@ namespace Caelix.Rendering.Native
         public float aspect;
         public float nearZ;
         public float farZ;
-        /// <summary>Column-major 4x4: element (row r, column c) = projection[c * 4 + r].</summary>
+        /// <summary>Column-major 4x4: element (row r, column c) = projection[c * 4 + r]. Without jitter.</summary>
         public fixed float projection[16];
+        /// <summary>Sub-pixel offset of the primary sample in pixels, x right, y DOWN (caelix.h).</summary>
+        public fixed float jitter[2];
     }
 
     /// <summary>Mirror of <c>CaelixRenderOptions</c> (caelix.h). 128 bytes.</summary>
@@ -57,7 +59,7 @@ namespace Caelix.Rendering.Native
         public uint height;
     }
 
-    /// <summary>Mirror of <c>CaelixUnityPacket</c> (caelix_unity.h). 368 bytes.</summary>
+    /// <summary>Mirror of <c>CaelixUnityPacket</c> (caelix_unity.h). 448 bytes (version 3).</summary>
     /// <remarks>
     /// The fixed part of a packet. The scene records follow it in the same memory block; the
     /// offsets are bytes from the packet start (see caelix_unity.h for the apply order).
@@ -71,6 +73,10 @@ namespace Caelix.Rendering.Native
         public uint encoding;
         public uint targetGeneration;
         public CaelixNativeTarget color;
+        // Version 3: optional geometry targets (nativeTexture zero = absent).
+        public CaelixNativeTarget depth;
+        public CaelixNativeTarget motion;
+        public CaelixNativeTarget albedo;
         public CaelixNativeCamera camera;
         public CaelixNativeRenderOptions options;
 
@@ -206,7 +212,7 @@ namespace Caelix.Rendering.Native
         private const string Dll = "caelix_unity";
 
         /// <summary>Must equal <c>CAELIX_UNITY_PACKET_VERSION</c>.</summary>
-        public const uint PacketVersion = 2;
+        public const uint PacketVersion = 3;
 
         // caelix_unity.h constants.
         public const uint EntityAdd = 1u;
@@ -286,7 +292,8 @@ namespace Caelix.Rendering.Native
             int statusSize = Marshal.SizeOf<CaelixNativeStatus>();
             bool recordsOk = Marshal.SizeOf<CaelixNativeEntity>() == 48 && Marshal.SizeOf<CaelixNativeBrickRemove>() == 16 &&
                              Marshal.SizeOf<CaelixNativeUpload>() == 16 && Marshal.SizeOf<CaelixNativeMaterial>() == 48 &&
-                             Marshal.SizeOf<CaelixNativeMaterialEntry>() == 52 && packetSize == 368 && statusSize == 208;
+                             Marshal.SizeOf<CaelixNativeMaterialEntry>() == 52 && Marshal.SizeOf<CaelixNativeCamera>() == 152 &&
+                             packetSize == 448 && statusSize == 208;
             if (!recordsOk)
             {
                 Debug.LogError("Caelix native: a record struct of CaelixNativeBridge.cs has the wrong size (see caelix_unity.h).");

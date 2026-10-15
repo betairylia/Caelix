@@ -20,13 +20,15 @@ namespace Caelix.Rendering.Native
     /// Scene renderer backed by the native Vulkan plugin <c>caelix_unity</c> (Caelix-Renderer).
     /// </summary>
     /// <remarks>
-    /// Owns the colour target and a ring of packets. <see cref="Tick"/> (called by
+    /// Owns the four targets the plugin writes (colour RGBA16F, depth R32F, motion RGBA16F, albedo
+    /// RGBA8 with coverage in alpha; the library writes them with <c>CAELIX_RENDER_FLAG_FLIP_Y</c>,
+    /// so they have Unity's row order) and a ring of packets. <see cref="Tick"/> (called by
     /// <see cref="CaelixHost"/> after the client's <c>PrepareRender</c>, like the ray query
     /// renderer) fills the scene section of the next packet: entity records, brick removes, and
     /// brick uploads copied from the client store by a Burst job, up to <see cref="BrickBudgetBytes"/>
     /// per packet. Each Game camera render, <see cref="CaelixNativeRendererFeature"/> asks for a
-    /// packet (<see cref="TryPrepareFrame"/>), which adds the camera, the options and the target to
-    /// the filled packet, and issues the plugin's render event with it.
+    /// packet (<see cref="TryPrepareFrame"/>), which adds the camera (with URP's TAA jitter), the
+    /// options and the targets to the filled packet, and issues the plugin's render event with it.
     /// <para>
     /// Packets live in unmanaged memory. The render thread reads a packet during its event and then
     /// publishes the packet's sequence number; a slot is reused only after that. Brick data is
@@ -81,6 +83,8 @@ namespace Caelix.Rendering.Native
         private const uint FlagSkyOnMiss = 1u << 1;
         private const uint FlagSunNee = 1u << 2;
         private const uint FlagDeltaCheckerboard = 1u << 3;
+        /// <summary>Unity render textures store row 0 at the bottom; the library writes them flipped.</summary>
+        private const uint FlagFlipY = 1u << 4;
 
         private const int RingSize = 3;
         /// <summary>A slot whose packet was never consumed (its event was dropped) is reused after this many frames.</summary>
@@ -124,7 +128,10 @@ namespace Caelix.Rendering.Native
 
         [Header("Exposure, Sun and Sky (linear RGB)")]
         [SerializeField, Min(0.0f)] private float exposure = 1.0f;
-        [SerializeField] private Vector3 sunDirection = new Vector3(0.45f, 0.7f, 0.55f);
+        [SerializeField, Tooltip("Lighting modes: direction toward the sun (normalized by the library).")]
+        private Vector3 sunDirection = new Vector3(0.45f, 0.7f, 0.55f);
+        [SerializeField, Tooltip("Primary mode: direction of the Lambert shading.")]
+        private Vector3 primarySunDirection = new Vector3(-0.45f, 0.8f, -0.3f);
         [SerializeField, Tooltip("Radiance of the sun disk. 0 = sun off (sky light only). Suggested 2e4, 1.9e4, 1.8e4.")]
         private Vector3 sunRadiance = Vector3.zero;
         [SerializeField, Min(0.0f)] private float sunAngularRadiusDegrees = 0.5f;
@@ -138,7 +145,27 @@ namespace Caelix.Rendering.Native
         public static CaelixNativeRenderer Active { get; private set; }
 
         /// <summary>The colour target the plugin writes (RGBA16F, random write). Null before the first frame.</summary>
-        public RTHandle ColorHandle => colorHandle;
+        public RTHandle ColorHandle => colorTarget.Handle;
+
+        /// <summary>Device depth of Unity's GPU projection (R32F); a miss is the far plane.</summary>
+        public RTHandle DepthHandle => depthTarget.Handle;
+
+        /// <summary>Motion of the primary hit in pixels, previous - current, y up (flipped rows); w = checkerboard flag.</summary>
+        public RTHandle MotionHandle => motionTarget.Handle;
+
+        /// <summary>Albedo (RGBA8); alpha = coverage (1 hit, 0 miss).</summary>
+        public RTHandle AlbedoHandle => albedoTarget.Handle;
+
+        /// <summary>
+        /// True when the colour target holds values meant to be shown as they are (the primary mode's
+        /// debug views, the path trace mode's motion view), not linear radiance. The present pass then
+        /// decodes them from sRGB so that Unity's own output encode shows the stored value.
+        /// </summary>
+        public bool ColorIsDisplayEncoded =>
+            mode == RenderMode.Primary || (mode == RenderMode.PathTrace && debugView == DebugView.Motion);
+
+        /// <summary>The jitter of the newest prepared frame, in pixels (x right, y down).</summary>
+        public Vector2 LastJitter { get; private set; }
 
         /// <summary>Packets issued since this component was enabled.</summary>
         public ulong PacketsIssued { get; private set; }
@@ -163,6 +190,31 @@ namespace Caelix.Rendering.Native
 
         public RenderMode Mode { get => mode; set => mode = value; }
         public DebugView View { get => debugView; set => debugView = value; }
+        public int Bounces { get => bounces; set => bounces = Mathf.Clamp(value, 0, 14); }
+        public int BouncesTransparent { get => bouncesTransparent; set => bouncesTransparent = Mathf.Clamp(value, 0, 15); }
+        public bool Denoise { get => denoise; set => denoise = value; }
+        public bool SunNextEventEstimation { get => sunNextEventEstimation; set => sunNextEventEstimation = value; }
+        public bool DeltaCheckerboard { get => deltaCheckerboard; set => deltaCheckerboard = value; }
+        public bool SkyOnMiss { get => skyOnMiss; set => skyOnMiss = value; }
+        public bool Shading { get => shading; set => shading = value; }
+        public float Exposure { get => exposure; set => exposure = Mathf.Max(0f, value); }
+        public Vector3 SunDirection { get => sunDirection; set => sunDirection = value; }
+        public Vector3 PrimarySunDirection { get => primarySunDirection; set => primarySunDirection = value; }
+        public Vector3 SunRadiance { get => sunRadiance; set => sunRadiance = value; }
+        public float SunAngularRadiusDegrees { get => sunAngularRadiusDegrees; set => sunAngularRadiusDegrees = Mathf.Max(0f, value); }
+        public Vector3 SkyZenith { get => skyZenith; set => skyZenith = value; }
+        public Vector3 SkyHorizon { get => skyHorizon; set => skyHorizon = value; }
+        public Vector3 SkyGround { get => skyGround; set => skyGround = value; }
+        public Vector3 PrimarySkyColor { get => primarySkyColor; set => primarySkyColor = value; }
+        public int BrickBudgetMiB { get => brickBudgetMiB; set => brickBudgetMiB = Mathf.Max(1, value); }
+
+        /// <summary>
+        /// Restarts the reference accumulation and the NRD history with the next frame (the Rust
+        /// host's "Reset accumulation" button). The reference mode also restarts by itself when the
+        /// camera or an option changes.
+        /// </summary>
+        [ContextMenu("Reset Accumulation")]
+        public void ResetAccumulation() => resetRequested = true;
         public EncodingOverride Encoding { get => encodingOverride; set => encodingOverride = value; }
         public TextAsset MaterialsJson { get => materialsJson; set => materialsJson = value; }
         public int StatusLogInterval { get => statusLogInterval; set => statusLogInterval = Mathf.Max(0, value); }
@@ -172,10 +224,64 @@ namespace Caelix.Rendering.Native
         public CaelixHost Host => host;
 
         // ---------------- packets ----------------
-        private RenderTexture color;
-        private RTHandle colorHandle;
-        private IntPtr colorTexturePtr;
-        private IntPtr colorRenderBufferPtr;
+        /// <summary>One render texture the plugin writes, with its native pointers.</summary>
+        private sealed class NativeTarget
+        {
+            public RenderTexture Texture;
+            public RTHandle Handle;
+            public IntPtr TexturePtr;
+            public IntPtr RenderBufferPtr;
+
+            public bool Matches(int width, int height) =>
+                Texture != null && Texture.width == width && Texture.height == height && Texture.IsCreated();
+
+            public void Create(string name, GraphicsFormat format, int width, int height)
+            {
+                Texture = new RenderTexture(width, height, format, GraphicsFormat.None)
+                {
+                    name = name,
+                    enableRandomWrite = true,
+                    filterMode = FilterMode.Point,
+                    wrapMode = TextureWrapMode.Clamp,
+                    hideFlags = HideFlags.HideAndDontSave,
+                };
+                Texture.Create();
+                Handle = RTHandles.Alloc(Texture);
+                // GetNativeTexturePtr may synchronize with the render thread: once per target.
+                TexturePtr = Texture.GetNativeTexturePtr();
+                RenderBufferPtr = Texture.colorBuffer.GetNativeRenderBufferPtr();
+            }
+
+            public void Release()
+            {
+                if (Handle != null)
+                {
+                    RTHandles.Release(Handle);
+                    Handle = null;
+                }
+                if (Texture != null)
+                {
+                    Texture.Release();
+                    DestroyImmediate(Texture);
+                    Texture = null;
+                }
+                TexturePtr = IntPtr.Zero;
+                RenderBufferPtr = IntPtr.Zero;
+            }
+
+            public CaelixNativeTarget ToPacket(int width, int height) => new CaelixNativeTarget
+            {
+                nativeTexture = TexturePtr,
+                nativeRenderBuffer = RenderBufferPtr,
+                width = (uint)width,
+                height = (uint)height,
+            };
+        }
+
+        private readonly NativeTarget colorTarget = new NativeTarget();
+        private readonly NativeTarget depthTarget = new NativeTarget();
+        private readonly NativeTarget motionTarget = new NativeTarget();
+        private readonly NativeTarget albedoTarget = new NativeTarget();
         private uint generation;
 
         private readonly IntPtr[] slots = new IntPtr[RingSize];
@@ -191,6 +297,11 @@ namespace Caelix.Rendering.Native
         private uint frameSeed;
         private int lastPreparedFrame = -1;
         private RenderMode lastMode;
+        private bool resetRequested;
+        private bool hasLastFrame;
+        private CaelixNativeCamera lastCamera;
+        private CaelixNativeRenderOptions lastOptions;
+        private bool warnedJitter;
 
         // ---------------- scene feed ----------------
         private ClientWorld source;
@@ -947,7 +1058,8 @@ namespace Caelix.Rendering.Native
         /// issues the plugin's release event, with the packet as its data, before the render event.
         /// False when no packet slot is free (the frame is skipped).
         /// </summary>
-        public bool TryPrepareFrame(Camera camera, int width, int height, out IntPtr packet, out bool releaseViews)
+        public bool TryPrepareFrame(Camera camera, Matrix4x4 jitteredProjection, int width, int height, out IntPtr packet,
+            out bool releaseViews)
         {
             packet = IntPtr.Zero;
             releaseViews = false;
@@ -1000,17 +1112,14 @@ namespace Caelix.Rendering.Native
                 sequence = ++s_sequence,
                 encoding = slotEncoding[slot],
                 targetGeneration = generation,
-                color = new CaelixNativeTarget
-                {
-                    nativeTexture = colorTexturePtr,
-                    nativeRenderBuffer = colorRenderBufferPtr,
-                    width = (uint)width,
-                    height = (uint)height,
-                },
-                camera = BuildCamera(camera, width, height),
-                options = BuildOptions(),
+                color = colorTarget.ToPacket(width, height),
+                depth = depthTarget.ToPacket(width, height),
+                motion = motionTarget.ToPacket(width, height),
+                albedo = albedoTarget.ToPacket(width, height),
                 scene = scene,
             };
+            data.camera = BuildCamera(camera, jitteredProjection, width, height);
+            data.options = BuildOptions(data.camera);
             unsafe
             {
                 *(CaelixNativePacket*)slots[slot] = data;
@@ -1066,47 +1175,45 @@ namespace Caelix.Rendering.Native
             }
         }
 
+        /// <summary>
+        /// The four targets at the camera size: colour RGBA16F, depth R32F, motion RGBA16F, albedo
+        /// RGBA8 UNORM (the library's accepted formats), all with random write. Replacing them bumps
+        /// the generation, which makes the feature issue the release event first.
+        /// </summary>
         private void EnsureTarget(int width, int height)
         {
-            if (color != null && color.width == width && color.height == height && color.IsCreated())
+            if (colorTarget.Matches(width, height) && depthTarget.Matches(width, height) &&
+                motionTarget.Matches(width, height) && albedoTarget.Matches(width, height))
             {
                 return;
             }
             ReleaseTarget();
-            color = new RenderTexture(width, height, GraphicsFormat.R16G16B16A16_SFloat, GraphicsFormat.None)
-            {
-                name = "Caelix Native Colour",
-                enableRandomWrite = true,
-                filterMode = FilterMode.Point,
-                wrapMode = TextureWrapMode.Clamp,
-                hideFlags = HideFlags.HideAndDontSave,
-            };
-            color.Create();
-            colorHandle = RTHandles.Alloc(color);
-            // GetNativeTexturePtr may synchronize with the render thread: once per target.
-            colorTexturePtr = color.GetNativeTexturePtr();
-            colorRenderBufferPtr = color.colorBuffer.GetNativeRenderBufferPtr();
+            colorTarget.Create("Caelix Native Colour", GraphicsFormat.R16G16B16A16_SFloat, width, height);
+            depthTarget.Create("Caelix Native Depth", GraphicsFormat.R32_SFloat, width, height);
+            motionTarget.Create("Caelix Native Motion", GraphicsFormat.R16G16B16A16_SFloat, width, height);
+            albedoTarget.Create("Caelix Native Albedo", GraphicsFormat.R8G8B8A8_UNorm, width, height);
             generation = ++s_generation;
         }
 
         private void ReleaseTarget()
         {
-            if (colorHandle != null)
-            {
-                RTHandles.Release(colorHandle);
-                colorHandle = null;
-            }
-            if (color != null)
-            {
-                color.Release();
-                DestroyImmediate(color);
-                color = null;
-            }
-            colorTexturePtr = IntPtr.Zero;
-            colorRenderBufferPtr = IntPtr.Zero;
+            colorTarget.Release();
+            depthTarget.Release();
+            motionTarget.Release();
+            albedoTarget.Release();
         }
 
-        private static unsafe CaelixNativeCamera BuildCamera(Camera camera, int width, int height)
+        /// <summary>
+        /// The library camera of this frame. <paramref name="jitteredProjection"/> is URP's projection
+        /// of the frame (<c>UniversalCameraData.GetProjectionMatrix()</c>): with TAA it is
+        /// <c>Translate(o) * P</c>, which moves every projected point by o (NDC, y up, o = 2 * jitter /
+        /// size). A pixel centre then sees the point that the unjittered projection puts o further
+        /// back, so the library's sample offset is -o: in pixels (y down) jitter = ((P'02 - P02) * w / 2,
+        /// -(P'12 - P12) * h / 2), because P'02 = P02 - o.x (P32 = -1) and likewise for y.
+        /// Sign verified in Play Mode (P3): with this sign the TAA image of a static camera is sharp,
+        /// with the opposite sign visibly blurred (Laplacian variance 169 vs 124).
+        /// </summary>
+        private unsafe CaelixNativeCamera BuildCamera(Camera camera, Matrix4x4 jitteredProjection, int width, int height)
         {
             var result = new CaelixNativeCamera();
             Transform t = camera.transform;
@@ -1120,24 +1227,49 @@ namespace Caelix.Rendering.Native
             result.nearZ = camera.nearClipPlane;
             result.farZ = camera.farClipPlane;
 
-            // Unity's view space looks down -Z; the library's view z is +forward. So the library's
-            // projection is Unity's GPU projection times diag(1, 1, -1, 1): column 2 negated.
-            Matrix4x4 gpu = GL.GetGPUProjectionMatrix(camera.projectionMatrix, true);
+            // Unity's view space looks down -Z; the library's view z is +forward, so every row is
+            // multiplied by diag(1, 1, -1, 1) (column 2 negated). Rows 0 and 1 come from the
+            // unjittered GL projection (clip y up, as NRD's viewToClipMatrix expects; the GPU
+            // projection of a render texture has row 1 negated on Vulkan). Rows 2 and 3 come from
+            // the GPU projection: its z is the device depth Unity's rasterizer writes (reversed Z
+            // on Vulkan), which the depth target must match.
+            Matrix4x4 gl = camera.projectionMatrix;
+            Matrix4x4 gpu = GL.GetGPUProjectionMatrix(gl, true);
             for (int c = 0; c < 4; c++)
             {
                 float sign = c == 2 ? -1.0f : 1.0f;
                 for (int row = 0; row < 4; row++)
                 {
-                    result.projection[c * 4 + row] = sign * gpu[row, c];
+                    float value = row < 2 ? gl[row, c] : gpu[row, c];
+                    result.projection[c * 4 + row] = sign * value;
                 }
             }
+
+            float jitterX = (jitteredProjection.m02 - gl.m02) * 0.5f * width;
+            float jitterY = -(jitteredProjection.m12 - gl.m12) * 0.5f * height;
+            if (!(Mathf.Abs(jitterX) <= 1.0f && Mathf.Abs(jitterY) <= 1.0f))
+            {
+                // Not a TAA jitter (an oblique or off-centre projection that differs from
+                // camera.projectionMatrix in another way): render unjittered.
+                if (!warnedJitter)
+                {
+                    warnedJitter = true;
+                    Debug.LogWarning($"Caelix native: the frame's projection differs from camera.projectionMatrix by " +
+                                     $"({jitterX:F3}, {jitterY:F3}) px, more than a TAA jitter; the jitter is ignored.", this);
+                }
+                jitterX = 0.0f;
+                jitterY = 0.0f;
+            }
+            result.jitter[0] = jitterX;
+            result.jitter[1] = jitterY;
+            LastJitter = new Vector2(jitterX, jitterY);
             return result;
         }
 
-        private unsafe CaelixNativeRenderOptions BuildOptions()
+        private unsafe CaelixNativeRenderOptions BuildOptions(in CaelixNativeCamera camera)
         {
             bool lighting = mode != RenderMode.Primary;
-            uint flags = 0;
+            uint flags = FlagFlipY;
             if (mode == RenderMode.Primary && shading) flags |= FlagShading;
             if (lighting && skyOnMiss) flags |= FlagSkyOnMiss;
             if (lighting && sunNextEventEstimation) flags |= FlagSunNee;
@@ -1153,18 +1285,30 @@ namespace Caelix.Rendering.Native
                 mode = (uint)mode,
                 bounceCount = (uint)Mathf.Clamp(bounces, 0, 14),
                 denoise = mode == RenderMode.PathTrace && denoise ? 1u : 0u,
-                resetAccumulation = mode != lastMode ? 1u : 0u,
                 exposure = exposure,
                 sunAngularRadius = sunAngularRadiusDegrees * Mathf.Deg2Rad,
-                frameSeed = frameSeed,
                 bounceCountTransparent = (uint)Mathf.Clamp(bouncesTransparent, 0, 15),
             };
-            o.sunDir[0] = sunDirection.x; o.sunDir[1] = sunDirection.y; o.sunDir[2] = sunDirection.z;
+            Vector3 sun = lighting ? sunDirection : primarySunDirection;
+            o.sunDir[0] = sun.x; o.sunDir[1] = sun.y; o.sunDir[2] = sun.z;
             o.skyColor[0] = primarySkyColor.x; o.skyColor[1] = primarySkyColor.y; o.skyColor[2] = primarySkyColor.z;
             o.sunRadiance[0] = sunRadiance.x; o.sunRadiance[1] = sunRadiance.y; o.sunRadiance[2] = sunRadiance.z;
             o.skyZenith[0] = skyZenith.x; o.skyZenith[1] = skyZenith.y; o.skyZenith[2] = skyZenith.z;
             o.skyHorizon[0] = skyHorizon.x; o.skyHorizon[1] = skyHorizon.y; o.skyHorizon[2] = skyHorizon.z;
             o.skyGround[0] = skyGround.x; o.skyGround[1] = skyGround.y; o.skyGround[2] = skyGround.z;
+
+            // Reset rules of the Rust host: the reference mode restarts when the camera (jitter
+            // excluded) or an option changes; both lighting modes on a mode change and on
+            // ResetAccumulation. The path trace mode's NRD follows the camera through the motion.
+            bool cameraChanged = !hasLastFrame || !SameCamera(lastCamera, camera);
+            bool optionsChanged = !hasLastFrame || !SameOptions(lastOptions, o);
+            bool reset = resetRequested || mode != lastMode ||
+                         (mode == RenderMode.Reference && (cameraChanged || optionsChanged));
+            o.resetAccumulation = reset ? 1u : 0u;
+            resetRequested = false;
+            lastCamera = camera;
+            lastOptions = o;
+            hasLastFrame = true;
 
             // One new seed per Unity frame, not per camera.
             if (Time.frameCount != lastPreparedFrame)
@@ -1172,8 +1316,25 @@ namespace Caelix.Rendering.Native
                 lastPreparedFrame = Time.frameCount;
                 frameSeed++;
             }
+            o.frameSeed = frameSeed;
             lastMode = mode;
             return o;
+        }
+
+        /// <summary>Same pose and frustum (the jitter is ignored: TAA moves it every frame).</summary>
+        private static unsafe bool SameCamera(CaelixNativeCamera a, CaelixNativeCamera b)
+        {
+            a.jitter[0] = a.jitter[1] = 0f;
+            b.jitter[0] = b.jitter[1] = 0f;
+            return UnsafeUtility.MemCmp(&a, &b, sizeof(CaelixNativeCamera)) == 0;
+        }
+
+        /// <summary>Same options, the frame seed and the reset flag ignored.</summary>
+        private static unsafe bool SameOptions(CaelixNativeRenderOptions a, CaelixNativeRenderOptions b)
+        {
+            a.frameSeed = b.frameSeed = 0;
+            a.resetAccumulation = b.resetAccumulation = 0;
+            return UnsafeUtility.MemCmp(&a, &b, sizeof(CaelixNativeRenderOptions)) == 0;
         }
 
         #endregion
