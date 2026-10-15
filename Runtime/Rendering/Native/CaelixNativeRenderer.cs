@@ -20,15 +20,18 @@ namespace Caelix.Rendering.Native
     /// Scene renderer backed by the native Vulkan plugin <c>caelix_unity</c> (Caelix-Renderer).
     /// </summary>
     /// <remarks>
-    /// Owns the four targets the plugin writes (colour RGBA16F, depth R32F, motion RGBA16F, albedo
-    /// RGBA8 with coverage in alpha; the library writes them with <c>CAELIX_RENDER_FLAG_FLIP_Y</c>,
-    /// so they have Unity's row order) and a ring of packets. <see cref="Tick"/> (called by
-    /// <see cref="CaelixHost"/> after the client's <c>PrepareRender</c>, like the ray query
-    /// renderer) fills the scene section of the next packet: entity records, brick removes, and
-    /// brick uploads copied from the client store by a Burst job, up to <see cref="BrickBudgetBytes"/>
-    /// per packet. Each Game camera render, <see cref="CaelixNativeRendererFeature"/> asks for a
-    /// packet (<see cref="TryPrepareFrame"/>), which adds the camera (with URP's TAA jitter), the
-    /// options and the targets to the filled packet, and issues the plugin's render event with it.
+    /// Owns, per view, the four targets the plugin writes (colour RGBA16F, depth R32F, motion
+    /// RGBA16F, albedo RGBA8 with coverage in alpha; the library writes them with
+    /// <c>CAELIX_RENDER_FLAG_FLIP_Y</c>, so they have Unity's row order) and a ring of packets.
+    /// <see cref="Tick"/> (called by <see cref="CaelixHost"/> after the client's
+    /// <c>PrepareRender</c>, like the ray query renderer) fills the scene section of the next
+    /// packet: entity records, brick removes, and brick uploads copied from the client store by a
+    /// Burst job, up to <see cref="BrickBudgetBytes"/> per packet. Each camera render,
+    /// <see cref="CaelixNativeRendererFeature"/> asks for a packet (<see cref="TryPrepareFrame"/>),
+    /// which adds the view index, the camera (with URP's TAA jitter), the options and the view's
+    /// targets to the filled packet, and issues the plugin's render event with it. View 0 is the
+    /// Game view, view 1 the Scene view (<see cref="SceneView"/>); the plugin has one renderer per
+    /// view (own internal targets and denoiser history) over one shared scene.
     /// <para>
     /// Packets live in unmanaged memory. The render thread reads a packet during its event and then
     /// publishes the packet's sequence number; a slot is reused only after that. Brick data is
@@ -50,6 +53,17 @@ namespace Caelix.Rendering.Native
             Primary = 0,
             PathTrace = 1,
             Reference = 2,
+        }
+
+        /// <summary>How the Editor Scene view is drawn (view 1).</summary>
+        public enum SceneViewMode
+        {
+            /// <summary>The Scene view is not drawn.</summary>
+            Off = 0,
+            /// <summary>The Game view's mode and debug view, with its own denoiser history.</summary>
+            Lit = 1,
+            /// <summary>The primary mode's albedo view: no denoiser, no history.</summary>
+            Primary = 2,
         }
 
         public enum DebugView
@@ -86,7 +100,11 @@ namespace Caelix.Rendering.Native
         /// <summary>Unity render textures store row 0 at the bottom; the library writes them flipped.</summary>
         private const uint FlagFlipY = 1u << 4;
 
-        private const int RingSize = 3;
+        /// <summary>
+        /// Packet slots. Every view issues one packet per frame and the render thread may be a frame
+        /// behind, so two views need about four slots in flight; six leaves room for a third view.
+        /// </summary>
+        private const int RingSize = 6;
         /// <summary>A slot whose packet was never consumed (its event was dropped) is reused after this many frames.</summary>
         private const int StaleSlotFrames = 8;
 
@@ -111,6 +129,15 @@ namespace Caelix.Rendering.Native
 
         [SerializeField, Min(0), Tooltip("Logs the plugin status every N frames (0 = off).")]
         private int statusLogInterval = 0;
+
+        [SerializeField, Tooltip("Logs stream completion, encoding changes and material table loads to the Console.")]
+        private bool verboseLogging = false;
+
+        [Header("Scene View")]
+        [SerializeField, Tooltip("Editor Scene view: Off = not drawn; Lit = the same mode as the Game view with its own " +
+                                 "denoiser history; Primary = the fast albedo debug view (no denoiser, no history). Costs " +
+                                 "one more render per Scene view repaint.")]
+        private SceneViewMode sceneView = SceneViewMode.Lit;
 
         [Header("Mode")]
         [SerializeField] private RenderMode mode = RenderMode.PathTrace;
@@ -144,27 +171,46 @@ namespace Caelix.Rendering.Native
         /// <summary>The enabled instance the renderer feature draws. One at a time.</summary>
         public static CaelixNativeRenderer Active { get; private set; }
 
-        /// <summary>The colour target the plugin writes (RGBA16F, random write). Null before the first frame.</summary>
-        public RTHandle ColorHandle => colorTarget.Handle;
+        /// <summary>
+        /// The colour target the plugin writes for <paramref name="view"/> (RGBA16F, random write).
+        /// Null before the view's first frame.
+        /// </summary>
+        public RTHandle ColorHandle(int view) => viewTargets[view].Color.Handle;
 
-        /// <summary>Device depth of Unity's GPU projection (R32F); a miss is the far plane.</summary>
-        public RTHandle DepthHandle => depthTarget.Handle;
-
-        /// <summary>Motion of the primary hit in pixels, previous - current, y up (flipped rows); w = checkerboard flag.</summary>
-        public RTHandle MotionHandle => motionTarget.Handle;
-
-        /// <summary>Albedo (RGBA8); alpha = coverage (1 hit, 0 miss).</summary>
-        public RTHandle AlbedoHandle => albedoTarget.Handle;
+        /// <summary>Device depth of Unity's GPU projection (R32F) for <paramref name="view"/>; a miss is the far plane.</summary>
+        public RTHandle DepthHandle(int view) => viewTargets[view].Depth.Handle;
 
         /// <summary>
-        /// True when the colour target holds values meant to be shown as they are (the primary mode's
-        /// debug views, the path trace mode's motion view), not linear radiance. The present pass then
-        /// decodes them from sRGB so that Unity's own output encode shows the stored value.
+        /// Motion of the primary hit for <paramref name="view"/> in pixels, previous - current, y up
+        /// (flipped rows); w = checkerboard flag.
         /// </summary>
-        public bool ColorIsDisplayEncoded =>
-            mode == RenderMode.Primary || (mode == RenderMode.PathTrace && debugView == DebugView.Motion);
+        public RTHandle MotionHandle(int view) => viewTargets[view].Motion.Handle;
 
-        /// <summary>The jitter of the newest prepared frame, in pixels (x right, y down).</summary>
+        /// <summary>Albedo (RGBA8) for <paramref name="view"/>; alpha = coverage (1 hit, 0 miss).</summary>
+        public RTHandle AlbedoHandle(int view) => viewTargets[view].Albedo.Handle;
+
+        /// <summary>
+        /// True when the colour target of <paramref name="view"/> holds values meant to be shown as
+        /// they are (the primary mode's debug views, the path trace mode's motion view), not linear
+        /// radiance. The present pass then decodes them from sRGB so that Unity's own output encode
+        /// shows the stored value.
+        /// </summary>
+        public bool ColorIsDisplayEncoded(int view)
+        {
+            RenderMode viewMode = ModeForView(view);
+            return viewMode == RenderMode.Primary ||
+                   (viewMode == RenderMode.PathTrace && DebugViewForView(view) == DebugView.Motion);
+        }
+
+        /// <summary>The render mode of <paramref name="view"/>: the Scene view (1) may use the primary mode.</summary>
+        private RenderMode ModeForView(int view) =>
+            view == 1 && sceneView == SceneViewMode.Primary ? RenderMode.Primary : mode;
+
+        /// <summary>The debug view of <paramref name="view"/>: albedo for the Scene view's primary mode.</summary>
+        private DebugView DebugViewForView(int view) =>
+            view == 1 && sceneView == SceneViewMode.Primary ? DebugView.Albedo : debugView;
+
+        /// <summary>The jitter of the newest prepared Game view (view 0) frame, in pixels (x right, y down).</summary>
         public Vector2 LastJitter { get; private set; }
 
         /// <summary>Packets issued since this component was enabled.</summary>
@@ -189,6 +235,7 @@ namespace Caelix.Rendering.Native
         public uint SceneEncoding => tickEncoding;
 
         public RenderMode Mode { get => mode; set => mode = value; }
+        public SceneViewMode SceneView { get => sceneView; set => sceneView = value; }
         public DebugView View { get => debugView; set => debugView = value; }
         public int Bounces { get => bounces; set => bounces = Mathf.Clamp(value, 0, 14); }
         public int BouncesTransparent { get => bouncesTransparent; set => bouncesTransparent = Mathf.Clamp(value, 0, 15); }
@@ -214,10 +261,15 @@ namespace Caelix.Rendering.Native
         /// camera or an option changes.
         /// </summary>
         [ContextMenu("Reset Accumulation")]
-        public void ResetAccumulation() => resetRequested = true;
+        public void ResetAccumulation()
+        {
+            foreach (ViewFrameState state in viewFrames) state.ResetRequested = true;
+        }
+
         public EncodingOverride Encoding { get => encodingOverride; set => encodingOverride = value; }
         public TextAsset MaterialsJson { get => materialsJson; set => materialsJson = value; }
         public int StatusLogInterval { get => statusLogInterval; set => statusLogInterval = Mathf.Max(0, value); }
+        public bool VerboseLogging { get => verboseLogging; set => verboseLogging = value; }
         public long BrickBudgetBytes => (long)Mathf.Max(1, brickBudgetMiB) << 20;
 
         /// <summary>The host whose client world this renderer draws, once resolved.</summary>
@@ -278,10 +330,65 @@ namespace Caelix.Rendering.Native
             };
         }
 
-        private readonly NativeTarget colorTarget = new NativeTarget();
-        private readonly NativeTarget depthTarget = new NativeTarget();
-        private readonly NativeTarget motionTarget = new NativeTarget();
-        private readonly NativeTarget albedoTarget = new NativeTarget();
+        /// <summary>
+        /// The four targets of one view at the view's camera size: colour RGBA16F, depth R32F, motion
+        /// RGBA16F, albedo RGBA8 UNORM (the library's accepted formats), all with random write.
+        /// </summary>
+        private sealed class ViewTargets
+        {
+            public readonly NativeTarget Color = new NativeTarget();
+            public readonly NativeTarget Depth = new NativeTarget();
+            public readonly NativeTarget Motion = new NativeTarget();
+            public readonly NativeTarget Albedo = new NativeTarget();
+
+            public bool Matches(int width, int height) =>
+                Color.Matches(width, height) && Depth.Matches(width, height) &&
+                Motion.Matches(width, height) && Albedo.Matches(width, height);
+
+            /// <summary>Recreates all four when any does not match the size. True when they were replaced.</summary>
+            public bool Ensure(int width, int height, int view)
+            {
+                if (Matches(width, height)) return false;
+                Release();
+                Color.Create($"Caelix Native Colour (view {view})", GraphicsFormat.R16G16B16A16_SFloat, width, height);
+                Depth.Create($"Caelix Native Depth (view {view})", GraphicsFormat.R32_SFloat, width, height);
+                Motion.Create($"Caelix Native Motion (view {view})", GraphicsFormat.R16G16B16A16_SFloat, width, height);
+                Albedo.Create($"Caelix Native Albedo (view {view})", GraphicsFormat.R8G8B8A8_UNorm, width, height);
+                return true;
+            }
+
+            public void Release()
+            {
+                Color.Release();
+                Depth.Release();
+                Motion.Release();
+                Albedo.Release();
+            }
+        }
+
+        /// <summary>The reset state of one view: what its previous frame used.</summary>
+        private sealed class ViewFrameState
+        {
+            public bool HasLastFrame;
+            public CaelixNativeCamera LastCamera;
+            public CaelixNativeRenderOptions LastOptions;
+            public RenderMode LastMode;
+            public bool ResetRequested;
+        }
+
+        private static T[] PerView<T>() where T : new()
+        {
+            var array = new T[CaelixNativeBridge.MaxViews];
+            for (int i = 0; i < array.Length; i++) array[i] = new T();
+            return array;
+        }
+
+        private readonly ViewTargets[] viewTargets = PerView<ViewTargets>();
+        private readonly ViewFrameState[] viewFrames = PerView<ViewFrameState>();
+        /// <summary>
+        /// One generation for every view: the plugin releases the cached views of every renderer on
+        /// one release event, so a target replaced in any view needs that event.
+        /// </summary>
         private uint generation;
 
         private readonly IntPtr[] slots = new IntPtr[RingSize];
@@ -296,11 +403,6 @@ namespace Caelix.Rendering.Native
         private readonly uint[] slotEncoding = new uint[RingSize];
         private uint frameSeed;
         private int lastPreparedFrame = -1;
-        private RenderMode lastMode;
-        private bool resetRequested;
-        private bool hasLastFrame;
-        private CaelixNativeCamera lastCamera;
-        private CaelixNativeRenderOptions lastOptions;
         private bool warnedJitter;
 
         // ---------------- scene feed ----------------
@@ -378,7 +480,7 @@ namespace Caelix.Rendering.Native
                 slotFilled[i] = false;
                 slotHadScene[i] = false;
             }
-            lastMode = mode;
+            for (int v = 0; v < viewFrames.Length; v++) viewFrames[v].LastMode = ModeForView(v);
             frameDedupe = new NativeHashSet<int3>(1024, Allocator.Persistent);
             sceneReset = true;
             materialsDirty = true;
@@ -406,7 +508,7 @@ namespace Caelix.Rendering.Native
                 slotCapacity[i] = 0;
                 slotFilled[i] = false;
             }
-            ReleaseTarget();
+            foreach (ViewTargets targets in viewTargets) targets.Release();
             UnbindSource();
             if (frameDedupe.IsCreated) frameDedupe.Dispose();
         }
@@ -497,7 +599,10 @@ namespace Caelix.Rendering.Native
             uint encoding = ResolveEncoding();
             if (encoding != tickEncoding)
             {
-                Debug.Log($"Caelix native: scene encoding {tickEncoding} -> {encoding}; the plugin recreates its scene and the world is sent again.", this);
+                if (verboseLogging)
+                {
+                    Debug.Log($"Caelix native: scene encoding {tickEncoding} -> {encoding}; the plugin recreates its scene and the world is sent again.", this);
+                }
                 tickEncoding = encoding;
                 ResendEverything();
             }
@@ -840,7 +945,10 @@ namespace Caelix.Rendering.Native
             slotCapacity[slot] = bytes;
         }
 
-        /// <summary>Logs one line when a burst of uploads is resident and traceable in the plugin.</summary>
+        /// <summary>
+        /// Ends the stream statistics when a burst of uploads is resident and traceable in the
+        /// plugin, and logs one line then (only with <see cref="VerboseLogging"/>).
+        /// </summary>
         private void TrackStream(in CaelixNativeStatus status)
         {
             if (!streaming || BricksPendingCSharp > 0 || lastUploadSlot < 0) return;
@@ -861,6 +969,7 @@ namespace Caelix.Rendering.Native
             }
             if (status.renders < settleRenders) return;
             streaming = false;
+            if (!verboseLogging) return;
             double seconds = (Stopwatch.GetTimestamp() - streamStartTicks) / (double)Stopwatch.Frequency;
             Debug.Log($"Caelix native: stream complete after {Time.frameCount - streamStartFrame} frames ({seconds:F2} s): " +
                       $"{streamBricks} bricks sent, plugin resident {status.bricksResident}, {status.entities} entities, " +
@@ -942,7 +1051,10 @@ namespace Caelix.Rendering.Native
                 entries.Add(entry);
             }
             parsedMaterials = entries.ToArray();
-            Debug.Log($"Caelix native: {parsedMaterials.Length} material entries from {materialsJson.name}.", this);
+            if (verboseLogging)
+            {
+                Debug.Log($"Caelix native: {parsedMaterials.Length} material entries from {materialsJson.name}.", this);
+            }
         }
 
         private static float Element(float[] values, int index, float fallback)
@@ -1052,17 +1164,19 @@ namespace Caelix.Rendering.Native
         #region Packets
 
         /// <summary>
-        /// Fills the next packet for <paramref name="camera"/> at <paramref name="width"/> x
-        /// <paramref name="height"/> pixels and returns its address. <paramref name="releaseViews"/>
-        /// is true when the colour target was replaced or the scene encoding changed: the caller then
-        /// issues the plugin's release event, with the packet as its data, before the render event.
-        /// False when no packet slot is free (the frame is skipped).
+        /// Fills the next packet of <paramref name="view"/> (0 Game view, 1 Scene view) for
+        /// <paramref name="camera"/> at <paramref name="width"/> x <paramref name="height"/> pixels
+        /// and returns its address. <paramref name="releaseViews"/> is true when a target was
+        /// replaced or the scene encoding changed: the caller then issues the plugin's release event,
+        /// with the packet as its data, before the render event. False when the view index is out of
+        /// range or no packet slot is free (the frame is skipped).
         /// </summary>
-        public bool TryPrepareFrame(Camera camera, Matrix4x4 jitteredProjection, int width, int height, out IntPtr packet,
-            out bool releaseViews)
+        public bool TryPrepareFrame(int view, Camera camera, Matrix4x4 jitteredProjection, int width, int height,
+            out IntPtr packet, out bool releaseViews)
         {
             packet = IntPtr.Zero;
             releaseViews = false;
+            if (view < 0 || view >= (int)CaelixNativeBridge.MaxViews) return false;
             if (width <= 0 || height <= 0) return false;
 
             CaelixNativeBridge.TryGetStatus(out CaelixNativeStatus status);
@@ -1072,7 +1186,8 @@ namespace Caelix.Rendering.Native
             // thread may still read it.
             if (s_sequence < status.lastConsumedSequence) s_sequence = status.lastConsumedSequence;
 
-            // The scene packet Tick filled goes first; otherwise a free slot with an empty scene section.
+            // The scene packet Tick filled goes with the first view prepared in the frame; otherwise
+            // (also for the next view) a free slot with an empty scene section.
             int slot = -1;
             for (int i = 0; i < RingSize; i++)
             {
@@ -1091,7 +1206,9 @@ namespace Caelix.Rendering.Native
                 slotEncoding[slot] = tickEncoding == uint.MaxValue ? ResolveEncoding() : tickEncoding;
             }
 
-            EnsureTarget(width, height);
+            ViewTargets targets = viewTargets[view];
+            // Replacing a target bumps the generation, which makes the feature issue the release event first.
+            if (targets.Ensure(width, height, view)) generation = ++s_generation;
             if (generation != s_releasedGeneration)
             {
                 releaseViews = true;
@@ -1104,7 +1221,9 @@ namespace Caelix.Rendering.Native
                 s_issuedEncoding = slotEncoding[slot];
             }
 
+            // A copy: the slot's stored section stays as Tick wrote it.
             CaelixNativeSceneSection scene = slotScene[slot];
+            scene.view = (uint)view;
             var data = new CaelixNativePacket
             {
                 size = (uint)Marshal.SizeOf<CaelixNativePacket>(),
@@ -1112,14 +1231,14 @@ namespace Caelix.Rendering.Native
                 sequence = ++s_sequence,
                 encoding = slotEncoding[slot],
                 targetGeneration = generation,
-                color = colorTarget.ToPacket(width, height),
-                depth = depthTarget.ToPacket(width, height),
-                motion = motionTarget.ToPacket(width, height),
-                albedo = albedoTarget.ToPacket(width, height),
+                color = targets.Color.ToPacket(width, height),
+                depth = targets.Depth.ToPacket(width, height),
+                motion = targets.Motion.ToPacket(width, height),
+                albedo = targets.Albedo.ToPacket(width, height),
                 scene = scene,
             };
-            data.camera = BuildCamera(camera, jitteredProjection, width, height);
-            data.options = BuildOptions(data.camera);
+            data.camera = BuildCamera(view, camera, jitteredProjection, width, height);
+            data.options = BuildOptions(view, data.camera);
             unsafe
             {
                 *(CaelixNativePacket*)slots[slot] = data;
@@ -1176,34 +1295,6 @@ namespace Caelix.Rendering.Native
         }
 
         /// <summary>
-        /// The four targets at the camera size: colour RGBA16F, depth R32F, motion RGBA16F, albedo
-        /// RGBA8 UNORM (the library's accepted formats), all with random write. Replacing them bumps
-        /// the generation, which makes the feature issue the release event first.
-        /// </summary>
-        private void EnsureTarget(int width, int height)
-        {
-            if (colorTarget.Matches(width, height) && depthTarget.Matches(width, height) &&
-                motionTarget.Matches(width, height) && albedoTarget.Matches(width, height))
-            {
-                return;
-            }
-            ReleaseTarget();
-            colorTarget.Create("Caelix Native Colour", GraphicsFormat.R16G16B16A16_SFloat, width, height);
-            depthTarget.Create("Caelix Native Depth", GraphicsFormat.R32_SFloat, width, height);
-            motionTarget.Create("Caelix Native Motion", GraphicsFormat.R16G16B16A16_SFloat, width, height);
-            albedoTarget.Create("Caelix Native Albedo", GraphicsFormat.R8G8B8A8_UNorm, width, height);
-            generation = ++s_generation;
-        }
-
-        private void ReleaseTarget()
-        {
-            colorTarget.Release();
-            depthTarget.Release();
-            motionTarget.Release();
-            albedoTarget.Release();
-        }
-
-        /// <summary>
         /// The library camera of this frame. <paramref name="jitteredProjection"/> is URP's projection
         /// of the frame (<c>UniversalCameraData.GetProjectionMatrix()</c>): with TAA it is
         /// <c>Translate(o) * P</c>, which moves every projected point by o (NDC, y up, o = 2 * jitter /
@@ -1212,8 +1303,10 @@ namespace Caelix.Rendering.Native
         /// -(P'12 - P12) * h / 2), because P'02 = P02 - o.x (P32 = -1) and likewise for y.
         /// Sign verified in Play Mode (P3): with this sign the TAA image of a static camera is sharp,
         /// with the opposite sign visibly blurred (Laplacian variance 169 vs 124).
+        /// <see cref="LastJitter"/> follows view 0 only.
         /// </summary>
-        private unsafe CaelixNativeCamera BuildCamera(Camera camera, Matrix4x4 jitteredProjection, int width, int height)
+        private unsafe CaelixNativeCamera BuildCamera(int view, Camera camera, Matrix4x4 jitteredProjection, int width,
+            int height)
         {
             var result = new CaelixNativeCamera();
             Transform t = camera.transform;
@@ -1262,29 +1355,32 @@ namespace Caelix.Rendering.Native
             }
             result.jitter[0] = jitterX;
             result.jitter[1] = jitterY;
-            LastJitter = new Vector2(jitterX, jitterY);
+            if (view == 0) LastJitter = new Vector2(jitterX, jitterY);
             return result;
         }
 
-        private unsafe CaelixNativeRenderOptions BuildOptions(in CaelixNativeCamera camera)
+        /// <summary>The options of <paramref name="view"/>, with its own mode, debug view and reset state.</summary>
+        private unsafe CaelixNativeRenderOptions BuildOptions(int view, in CaelixNativeCamera camera)
         {
-            bool lighting = mode != RenderMode.Primary;
+            RenderMode viewMode = ModeForView(view);
+            ViewFrameState state = viewFrames[view];
+            bool lighting = viewMode != RenderMode.Primary;
             uint flags = FlagFlipY;
-            if (mode == RenderMode.Primary && shading) flags |= FlagShading;
+            if (viewMode == RenderMode.Primary && shading) flags |= FlagShading;
             if (lighting && skyOnMiss) flags |= FlagSkyOnMiss;
             if (lighting && sunNextEventEstimation) flags |= FlagSunNee;
-            if (mode == RenderMode.PathTrace && deltaCheckerboard) flags |= FlagDeltaCheckerboard;
+            if (viewMode == RenderMode.PathTrace && deltaCheckerboard) flags |= FlagDeltaCheckerboard;
 
             var o = new CaelixNativeRenderOptions
             {
-                debugView = (uint)debugView,
+                debugView = (uint)DebugViewForView(view),
                 flags = flags,
                 // Unity on Vulkan uses reversed Z (GL.GetGPUProjectionMatrix).
                 missDepth = SystemInfo.usesReversedZBuffer ? 0.0f : 1.0f,
                 missViewZ = 1e30f,
-                mode = (uint)mode,
+                mode = (uint)viewMode,
                 bounceCount = (uint)Mathf.Clamp(bounces, 0, 14),
-                denoise = mode == RenderMode.PathTrace && denoise ? 1u : 0u,
+                denoise = viewMode == RenderMode.PathTrace && denoise ? 1u : 0u,
                 exposure = exposure,
                 sunAngularRadius = sunAngularRadiusDegrees * Mathf.Deg2Rad,
                 bounceCountTransparent = (uint)Mathf.Clamp(bouncesTransparent, 0, 15),
@@ -1300,15 +1396,16 @@ namespace Caelix.Rendering.Native
             // Reset rules of the Rust host: the reference mode restarts when the camera (jitter
             // excluded) or an option changes; both lighting modes on a mode change and on
             // ResetAccumulation. The path trace mode's NRD follows the camera through the motion.
-            bool cameraChanged = !hasLastFrame || !SameCamera(lastCamera, camera);
-            bool optionsChanged = !hasLastFrame || !SameOptions(lastOptions, o);
-            bool reset = resetRequested || mode != lastMode ||
-                         (mode == RenderMode.Reference && (cameraChanged || optionsChanged));
+            // Each view keeps its own reset state.
+            bool cameraChanged = !state.HasLastFrame || !SameCamera(state.LastCamera, camera);
+            bool optionsChanged = !state.HasLastFrame || !SameOptions(state.LastOptions, o);
+            bool reset = state.ResetRequested || viewMode != state.LastMode ||
+                         (viewMode == RenderMode.Reference && (cameraChanged || optionsChanged));
             o.resetAccumulation = reset ? 1u : 0u;
-            resetRequested = false;
-            lastCamera = camera;
-            lastOptions = o;
-            hasLastFrame = true;
+            state.ResetRequested = false;
+            state.LastCamera = camera;
+            state.LastOptions = o;
+            state.HasLastFrame = true;
 
             // One new seed per Unity frame, not per camera.
             if (Time.frameCount != lastPreparedFrame)
@@ -1317,7 +1414,7 @@ namespace Caelix.Rendering.Native
                 frameSeed++;
             }
             o.frameSeed = frameSeed;
-            lastMode = mode;
+            state.LastMode = viewMode;
             return o;
         }
 

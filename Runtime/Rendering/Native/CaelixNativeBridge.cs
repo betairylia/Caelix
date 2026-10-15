@@ -59,7 +59,7 @@ namespace Caelix.Rendering.Native
         public uint height;
     }
 
-    /// <summary>Mirror of <c>CaelixUnityPacket</c> (caelix_unity.h). 448 bytes (version 3).</summary>
+    /// <summary>Mirror of <c>CaelixUnityPacket</c> (caelix_unity.h). 448 bytes (version 4).</summary>
     /// <remarks>
     /// The fixed part of a packet. The scene records follow it in the same memory block; the
     /// offsets are bytes from the packet start (see caelix_unity.h for the apply order).
@@ -102,7 +102,12 @@ namespace Caelix.Rendering.Native
         public uint materialMode;
         public uint materialCount;
         public uint materialsOffset;
-        public uint pad;
+        /// <summary>
+        /// Version 4: view index 0 .. <see cref="CaelixNativeBridge.MaxViews"/> - 1. Each view has its
+        /// own plugin renderer (internal targets, NRD history) over the shared scene. 0 = Game view,
+        /// 1 = Scene view. The status timings are those of view 0.
+        /// </summary>
+        public uint view;
     }
 
     /// <summary>Mirror of <c>CaelixUnityEntity</c> (caelix_unity.h). 48 bytes.</summary>
@@ -212,7 +217,10 @@ namespace Caelix.Rendering.Native
         private const string Dll = "caelix_unity";
 
         /// <summary>Must equal <c>CAELIX_UNITY_PACKET_VERSION</c>.</summary>
-        public const uint PacketVersion = 3;
+        public const uint PacketVersion = 4;
+
+        /// <summary>Must equal <c>CAELIX_UNITY_MAX_VIEWS</c>: the number of views, each with its own plugin renderer.</summary>
+        public const uint MaxViews = 4;
 
         // caelix_unity.h constants.
         public const uint EntityAdd = 1u;

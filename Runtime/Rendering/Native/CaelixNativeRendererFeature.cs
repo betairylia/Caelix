@@ -10,7 +10,8 @@ namespace Caelix.Rendering.Native
     /// URP renderer feature of the native Vulkan renderer (<see cref="CaelixNativeRenderer"/>).
     /// </summary>
     /// <remarks>
-    /// Four passes, all Game cameras only:
+    /// Four passes, for Game cameras and (unless <see cref="CaelixNativeRenderer.SceneView"/> is
+    /// Off) Scene view cameras:
     /// <list type="number">
     /// <item><see cref="RenderPass"/> (before opaques) fills the camera part of this frame's packet
     /// (camera, jitter from URP's jittered projection, options, targets) and issues the plugin's
@@ -30,8 +31,12 @@ namespace Caelix.Rendering.Native
     /// </list>
     /// The scene itself is fed by <see cref="CaelixNativeRenderer.Tick"/> through the same packets.
     /// <para>
-    /// Enable exactly one Caelix feature per renderer asset. Game cameras only: the plugin counts
-    /// one frame per render event, and the Scene view would double the frames in flight.
+    /// Enable exactly one Caelix feature per renderer asset. The Game view is view 0 and the Scene
+    /// view is view 1; each view has its own plugin renderer (internal targets, NRD history) over
+    /// the shared scene, so the two never mix their denoiser history. Several Scene views share
+    /// view 1: when their sizes differ, the view's targets are recreated at every change of size,
+    /// which costs a release event per frame (a known limitation). Scene view cameras have no TAA,
+    /// so the motion pass does not run for them.
     /// </para>
     /// The render event goes through <see cref="CommandBuffer.IssuePluginEventAndData"/> on the
     /// native command buffer of an unsafe pass (<see cref="CommandBufferHelpers.GetNativeCommandBuffer"/>):
@@ -83,9 +88,11 @@ namespace Caelix.Rendering.Native
         public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
         {
             if (renderPass == null) return;
-            if (renderingData.cameraData.cameraType != CameraType.Game) return;
             CaelixNativeRenderer native = CaelixNativeRenderer.Active;
             if (native == null || !native.isActiveAndEnabled) return;
+            CameraType cameraType = renderingData.cameraData.cameraType;
+            bool sceneView = cameraType == CameraType.SceneView && native.SceneView != CaelixNativeRenderer.SceneViewMode.Off;
+            if (cameraType != CameraType.Game && !sceneView) return;
             if (!CaelixNativeBridge.IsAvailable)
             {
                 if (!loggedUnavailable)
@@ -172,17 +179,19 @@ namespace Caelix.Rendering.Native
                 // it sets up the camera, and GetProjectionMatrix() returns the jittered projection.
                 UniversalCameraData cameraData = frameData.Get<UniversalCameraData>();
                 RenderTextureDescriptor descriptor = cameraData.cameraTargetDescriptor;
-                if (!native.TryPrepareFrame(cameraData.camera, cameraData.GetProjectionMatrix(), descriptor.width,
+                // View 0 = Game view, view 1 = Scene view: each has its own plugin renderer.
+                int view = cameraData.cameraType == CameraType.SceneView ? 1 : 0;
+                if (!native.TryPrepareFrame(view, cameraData.camera, cameraData.GetProjectionMatrix(), descriptor.width,
                         descriptor.height, out IntPtr packet, out bool releaseViews))
                 {
                     return;
                 }
 
-                frame.Color = renderGraph.ImportTexture(native.ColorHandle);
-                frame.Depth = renderGraph.ImportTexture(native.DepthHandle);
-                frame.Motion = renderGraph.ImportTexture(native.MotionHandle);
-                frame.Albedo = renderGraph.ImportTexture(native.AlbedoHandle);
-                frame.PrimaryView = native.ColorIsDisplayEncoded;
+                frame.Color = renderGraph.ImportTexture(native.ColorHandle(view));
+                frame.Depth = renderGraph.ImportTexture(native.DepthHandle(view));
+                frame.Motion = renderGraph.ImportTexture(native.MotionHandle(view));
+                frame.Albedo = renderGraph.ImportTexture(native.AlbedoHandle(view));
+                frame.PrimaryView = native.ColorIsDisplayEncoded(view);
 
                 using (var builder = renderGraph.AddUnsafePass<PassData>("Caelix Native Render", out var passData))
                 {
