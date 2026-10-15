@@ -984,7 +984,8 @@ namespace Caelix.Rendering.Native
                       $"{s.entities}, groups {s.groups}, uploaded_total {s.uploadedTotal}, removed_total {s.removedTotal}, " +
                       $"encoding {s.sceneEncoding}, renders {s.renders}, failed {s.failedEvents}, last error {s.lastError}, " +
                       $"GPU flush {s.flushMs:F3} ms trace {s.traceMs:F3} ms composite {s.compositeMs:F3} ms denoise {s.denoiseMs:F3} ms; " +
-                      $"Tick {LastTickMilliseconds:F3} ms, deferred {TicksDeferred}, skipped {PacketsSkipped}.", this);
+                      $"Tick {LastTickMilliseconds:F3} ms, deferred {TicksDeferred}, skipped {PacketsSkipped}; " +
+                      $"jitter ({LastJitter.x:F3}, {LastJitter.y:F3}) px.", this);
         }
 
         [Serializable]
