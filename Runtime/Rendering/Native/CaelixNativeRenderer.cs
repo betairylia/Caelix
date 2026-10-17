@@ -20,27 +20,42 @@ namespace Caelix.Rendering.Native
     /// Scene renderer backed by the native Vulkan plugin <c>caelix_unity</c> (Caelix-Renderer).
     /// </summary>
     /// <remarks>
-    /// Owns, per view, the four targets the plugin writes (colour RGBA16F, depth R32F, motion
-    /// RGBA16F, albedo RGBA8 with coverage in alpha; the library writes them with
-    /// <c>CAELIX_RENDER_FLAG_FLIP_Y</c>, so they have Unity's row order) and a ring of packets.
-    /// <see cref="Tick"/> (called by <see cref="CaelixHost"/> after the client's
-    /// <c>PrepareRender</c>, like the ray query renderer) fills the scene section of the next
-    /// packet: entity records, brick removes, and brick uploads copied from the client store by a
-    /// Burst job, up to <see cref="BrickBudgetBytes"/> per packet. Each camera render,
-    /// <see cref="CaelixNativeRendererFeature"/> asks for a packet (<see cref="TryPrepareFrame"/>),
-    /// which adds the view index, the camera (with URP's TAA jitter), the options and the view's
-    /// targets to the filled packet, and issues the plugin's render event with it. View 0 is the
-    /// Game view, view 1 the Scene view (<see cref="SceneView"/>); the plugin has one renderer per
-    /// view (own internal targets and denoiser history) over one shared scene.
+    /// A view is one camera: every camera that renders through <see cref="CaelixNativeRendererFeature"/>
+    /// gets its own view (up to <see cref="CaelixNativeBridge.MaxViews"/>), with its own plugin
+    /// renderer (internal targets, denoiser history) over one shared scene. This component owns,
+    /// per view, the four targets the plugin writes (colour RGBA16F, depth R32F, motion RGBA16F,
+    /// albedo RGBA8 with coverage in alpha; the library writes them with
+    /// <c>CAELIX_RENDER_FLAG_FLIP_Y</c>, so they have Unity's row order).
     /// <para>
-    /// Packets live in unmanaged memory. The render thread reads a packet during its event and then
-    /// publishes the packet's sequence number; a slot is reused only after that. Brick data is
-    /// COPIED into the packet in the same frame it is bound (the phase rule of the store), because
-    /// the render thread runs after the next server tick may have changed the storage.
+    /// <see cref="Tick"/> (called once per frame by <see cref="CaelixHost"/> after the client's
+    /// <c>PrepareRender</c>, like the ray query renderer) fills ONE frame packet with the scene
+    /// records of the frame: entity records, brick removes, and brick uploads copied from the
+    /// client store by a Burst job, as many as the plugin's staging ring can take (the status'
+    /// <c>upload_bricks_free</c> minus the bricks of frame packets still in flight, capped at
+    /// <c>upload_bricks_cap</c>). It issues the plugin's frame event with
+    /// <see cref="Graphics.ExecuteCommandBuffer"/>. Unity's device command queue is FIFO, so the
+    /// event runs on the render thread before the cameras of the frame: the plugin flushes the
+    /// scene once per frame with Unity's own frame numbers, and every view renders the same scene
+    /// state. Each camera render, the feature asks for a view packet (<see cref="TryPrepareFrame"/>):
+    /// the view index, the camera (with URP's TAA jitter), the options, the view's targets and the
+    /// sky cubemap; it issues the plugin's render event with it.
     /// </para>
     /// <para>
-    /// The plugin's scene outlives Play sessions and components, so the first scene packet of an
-    /// enabled component carries the reset flag and sends every view as new.
+    /// Sessions: the scene's block encoding, its material table and its staging ring size are
+    /// fixed for a session. A session starts at the first tick with a client world (and again for
+    /// a new client world): a release event that destroys the plugin's scene and renderers, then a
+    /// frame packet with the reset flag and the session config; every entity is sent as new. It
+    /// ends when the component is disabled (another release event: the plugin holds no scene
+    /// between Play sessions), or with an error when the plugin dropped bricks (the next tick
+    /// starts a new session, which sends the world again). Changing <see cref="Encoding"/> or
+    /// <see cref="MaterialsJson"/> during a session is an error; disable the component first.
+    /// </para>
+    /// <para>
+    /// Packets live in unmanaged memory, in one ring per packet kind (frame, view, release). The
+    /// render thread reads a packet during its event and then publishes the packet's sequence
+    /// number for its kind; a slot is reused only after that. Brick data is COPIED into the frame
+    /// packet in the same frame it is bound (the phase rule of the store), because the render
+    /// thread runs after the next server tick may have changed the storage.
     /// </para>
     /// Options mirror the Rust host's <c>RenderSettings</c> (Caelix-Renderer/host-rs) and its
     /// command-line defaults.
@@ -55,10 +70,10 @@ namespace Caelix.Rendering.Native
             Reference = 2,
         }
 
-        /// <summary>How the Editor Scene view is drawn (view 1).</summary>
+        /// <summary>How Editor Scene view cameras are drawn.</summary>
         public enum SceneViewMode
         {
-            /// <summary>The Scene view is not drawn.</summary>
+            /// <summary>Scene views are not drawn.</summary>
             Off = 0,
             /// <summary>The Game view's mode and debug view, with its own denoiser history.</summary>
             Lit = 1,
@@ -100,13 +115,14 @@ namespace Caelix.Rendering.Native
         /// <summary>Unity render textures store row 0 at the bottom; the library writes them flipped.</summary>
         private const uint FlagFlipY = 1u << 4;
 
-        /// <summary>
-        /// Packet slots. Every view issues one packet per frame and the render thread may be a frame
-        /// behind, so two views need about four slots in flight; six leaves room for a third view.
-        /// </summary>
-        private const int RingSize = 6;
-        /// <summary>A slot whose packet was never consumed (its event was dropped) is reused after this many frames.</summary>
-        private const int StaleSlotFrames = 8;
+        /// <summary>Frame packet slots: one packet per frame, the render thread may be a frame or two behind.</summary>
+        private const int FrameRingSize = 3;
+        /// <summary>Release packet slots (fixed size).</summary>
+        private const int ReleaseRingSize = 4;
+        /// <summary>View packet slots (fixed size): every view issues one per frame, two frames in flight.</summary>
+        private const int ViewRingSize = (int)CaelixNativeBridge.MaxViews * 2 + 2;
+        /// <summary>A view whose camera has not rendered for this many frames is released.</summary>
+        private const int ViewIdleFrames = 300;
 
         /// <summary>Bytes of one brick in a packet: its key and its 512 block values.</summary>
         private const int BrickPacketBytes = 12 + 1024;
@@ -116,25 +132,26 @@ namespace Caelix.Rendering.Native
         private CaelixHost host;
 
         [SerializeField, Tooltip("Block encoding of the plugin's scene. Auto = the build's BlockEncoding.PackedSceneColor. " +
-                                 "Changing it while running recreates the plugin's scene and sends the world again.")]
+                                 "Fixed for a session: disable the component before changing it.")]
         private EncodingOverride encodingOverride = EncodingOverride.Auto;
 
         [SerializeField, Tooltip("Block-ID encoding only: material table entries (the Rust host's --materials JSON: id, " +
                                  "transparent, albedo, emission, smoothness, metallic, ior, extinction), applied over the " +
-                                 "plugin's built-in table.")]
+                                 "plugin's built-in table. Fixed for a session: disable the component before changing it.")]
         private TextAsset materialsJson;
 
-        [SerializeField, Min(1), Tooltip("Upper size of the brick data of one packet, in MiB (1036 bytes per brick).")]
-        private int brickBudgetMiB = 64;
+        [SerializeField, Min(4), Tooltip("Staging ring of the plugin's scene in MiB. Applied when a session starts (Play start " +
+                                         "or a reset); a change during a session takes effect at the next one.")]
+        private int stagingRingMiB = 256;
 
         [SerializeField, Min(0), Tooltip("Logs the plugin status every N frames (0 = off).")]
         private int statusLogInterval = 0;
 
-        [SerializeField, Tooltip("Logs stream completion, encoding changes and material table loads to the Console.")]
+        [SerializeField, Tooltip("Logs stream completion, session starts and material table loads to the Console.")]
         private bool verboseLogging = false;
 
         [Header("Scene View")]
-        [SerializeField, Tooltip("Editor Scene view: Off = not drawn; Lit = the same mode as the Game view with its own " +
+        [SerializeField, Tooltip("Editor Scene views: Off = not drawn; Lit = the same mode as the Game view with its own " +
                                  "denoiser history; Primary = the fast albedo debug view (no denoiser, no history). Costs " +
                                  "one more render per Scene view repaint.")]
         private SceneViewMode sceneView = SceneViewMode.Lit;
@@ -148,7 +165,7 @@ namespace Caelix.Rendering.Native
         [SerializeField] private bool denoise = true;
         [SerializeField] private bool sunNextEventEstimation = true;
         [SerializeField] private bool deltaCheckerboard = true;
-        [SerializeField, Tooltip("Lighting modes: show the procedural sky where the primary ray misses.")]
+        [SerializeField, Tooltip("Lighting modes: show the sky where the primary ray misses.")]
         private bool skyOnMiss = true;
         [SerializeField, Tooltip("Primary mode: Lambert shading of the albedo view.")]
         private bool shading = true;
@@ -168,6 +185,20 @@ namespace Caelix.Rendering.Native
         [SerializeField, Tooltip("Primary mode: the colour of rays that hit nothing.")]
         private Vector3 primarySkyColor = new Vector3(0.55f, 0.7f, 0.9f);
 
+        [Header("Sky Cubemap and Fog")]
+        [SerializeField, Tooltip("Cubemap sampled as the sky of the lighting modes (a Cubemap or a cube RenderTexture with " +
+                                 "mips). Must not contain the sun disk: the sun stays the Sun settings. Empty = the procedural sky.")]
+        private Texture skyCubemap;
+        [SerializeField, Tooltip("When no cubemap is set, use ReflectionProbe.defaultTexture when it is a cubemap.")]
+        private bool skyFromReflectionProbe = false;
+        [SerializeField, Min(0.0f), Tooltip("Lighting modes: extinction of the air per world unit (0 = no fog). Rays that " +
+                                            "leave the scene are not fogged: choose a fog colour near the sky's horizon colour.")]
+        private float fogDensity = 0.0f;
+        [SerializeField, ColorUsage(false, true), Tooltip("Radiance of the fog, linear RGB (the exposure applies).")]
+        private Color fogColor = new Color(0.7f, 0.8f, 0.95f, 1.0f);
+        [SerializeField, Min(0.0f), Tooltip("Every mode: multiplies the emission of every material (0 is treated as 1).")]
+        private float emissionScale = 1.0f;
+
         /// <summary>The enabled instance the renderer feature draws. One at a time.</summary>
         public static CaelixNativeRenderer Active { get; private set; }
 
@@ -175,19 +206,19 @@ namespace Caelix.Rendering.Native
         /// The colour target the plugin writes for <paramref name="view"/> (RGBA16F, random write).
         /// Null before the view's first frame.
         /// </summary>
-        public RTHandle ColorHandle(int view) => viewTargets[view].Color.Handle;
+        public RTHandle ColorHandle(int view) => viewSlots[view].Targets.Color.Handle;
 
         /// <summary>Device depth of Unity's GPU projection (R32F) for <paramref name="view"/>; a miss is the far plane.</summary>
-        public RTHandle DepthHandle(int view) => viewTargets[view].Depth.Handle;
+        public RTHandle DepthHandle(int view) => viewSlots[view].Targets.Depth.Handle;
 
         /// <summary>
         /// Motion of the primary hit for <paramref name="view"/> in pixels, previous - current, y up
         /// (flipped rows); w = checkerboard flag.
         /// </summary>
-        public RTHandle MotionHandle(int view) => viewTargets[view].Motion.Handle;
+        public RTHandle MotionHandle(int view) => viewSlots[view].Targets.Motion.Handle;
 
         /// <summary>Albedo (RGBA8) for <paramref name="view"/>; alpha = coverage (1 hit, 0 miss).</summary>
-        public RTHandle AlbedoHandle(int view) => viewTargets[view].Albedo.Handle;
+        public RTHandle AlbedoHandle(int view) => viewSlots[view].Targets.Albedo.Handle;
 
         /// <summary>
         /// True when the colour target of <paramref name="view"/> holds values meant to be shown as
@@ -202,37 +233,44 @@ namespace Caelix.Rendering.Native
                    (viewMode == RenderMode.PathTrace && DebugViewForView(view) == DebugView.Motion);
         }
 
-        /// <summary>The render mode of <paramref name="view"/>: the Scene view (1) may use the primary mode.</summary>
-        private RenderMode ModeForView(int view) =>
-            view == 1 && sceneView == SceneViewMode.Primary ? RenderMode.Primary : mode;
+        /// <summary>The render mode of <paramref name="view"/>: a Scene view camera may use the primary mode.</summary>
+        private RenderMode ModeForView(int view) => ModeFor(viewSlots[view].IsSceneView);
 
-        /// <summary>The debug view of <paramref name="view"/>: albedo for the Scene view's primary mode.</summary>
-        private DebugView DebugViewForView(int view) =>
-            view == 1 && sceneView == SceneViewMode.Primary ? DebugView.Albedo : debugView;
+        private RenderMode ModeFor(bool isSceneView) =>
+            isSceneView && sceneView == SceneViewMode.Primary ? RenderMode.Primary : mode;
 
-        /// <summary>The jitter of the newest prepared Game view (view 0) frame, in pixels (x right, y down).</summary>
+        /// <summary>The debug view of <paramref name="view"/>: albedo for a Scene view camera in the primary mode.</summary>
+        private DebugView DebugViewForView(int view) => DebugViewFor(viewSlots[view].IsSceneView);
+
+        private DebugView DebugViewFor(bool isSceneView) =>
+            isSceneView && sceneView == SceneViewMode.Primary ? DebugView.Albedo : debugView;
+
+        /// <summary>The jitter of the newest prepared Game camera frame, in pixels (x right, y down).</summary>
         public Vector2 LastJitter { get; private set; }
 
-        /// <summary>Packets issued since this component was enabled.</summary>
+        /// <summary>View packets issued since this component was enabled.</summary>
         public ulong PacketsIssued { get; private set; }
 
-        /// <summary>Frames skipped because every packet slot was still waiting for the render thread.</summary>
+        /// <summary>Camera renders skipped: no free view, or no free view or release packet slot.</summary>
         public ulong PacketsSkipped { get; private set; }
 
-        /// <summary>Ticks that could not fill a packet (the previous one was not issued yet, or no slot was free).</summary>
+        /// <summary>Ticks that issued no frame packet because every frame slot was still waiting for the render thread.</summary>
         public ulong TicksDeferred { get; private set; }
 
         /// <summary>CPU time of the newest <see cref="Tick"/>, in milliseconds.</summary>
         public double LastTickMilliseconds { get; private set; }
 
-        /// <summary>Bricks waiting on the C# side (not copied into a packet yet), over every view.</summary>
+        /// <summary>Bricks waiting on the C# side (not copied into a frame packet yet), over every entity.</summary>
         public long BricksPendingCSharp { get; private set; }
 
-        /// <summary>Bricks copied into packets since this component was enabled.</summary>
+        /// <summary>Bricks copied into frame packets since this component was enabled.</summary>
         public long BricksSentTotal { get; private set; }
 
-        /// <summary>The block encoding of the scene packets (0 packed, 1 block-ID).</summary>
-        public uint SceneEncoding => tickEncoding;
+        /// <summary>The block encoding of the live session (0 packed, 1 block-ID); <see cref="CaelixNativeBridge.NoScene"/> without one.</summary>
+        public uint SceneEncoding => sessionLive ? sessionEncoding : CaelixNativeBridge.NoScene;
+
+        /// <summary>True between the start of a session (the reset frame packet was issued) and its end.</summary>
+        public bool SessionLive => sessionLive;
 
         public RenderMode Mode { get => mode; set => mode = value; }
         public SceneViewMode SceneView { get => sceneView; set => sceneView = value; }
@@ -253,7 +291,17 @@ namespace Caelix.Rendering.Native
         public Vector3 SkyHorizon { get => skyHorizon; set => skyHorizon = value; }
         public Vector3 SkyGround { get => skyGround; set => skyGround = value; }
         public Vector3 PrimarySkyColor { get => primarySkyColor; set => primarySkyColor = value; }
-        public int BrickBudgetMiB { get => brickBudgetMiB; set => brickBudgetMiB = Mathf.Max(1, value); }
+        public Texture SkyCubemap { get => skyCubemap; set => skyCubemap = value; }
+        public bool SkyFromReflectionProbe { get => skyFromReflectionProbe; set => skyFromReflectionProbe = value; }
+        public float FogDensity { get => fogDensity; set => fogDensity = Mathf.Max(0f, value); }
+        public Color FogColor { get => fogColor; set => fogColor = value; }
+        public float EmissionScale { get => emissionScale; set => emissionScale = Mathf.Max(0f, value); }
+
+        /// <summary>
+        /// Staging ring of the plugin's scene in MiB. Applied when a session starts; a change during
+        /// a session takes effect at the next one.
+        /// </summary>
+        public int StagingRingMiB { get => stagingRingMiB; set => stagingRingMiB = Mathf.Max(4, value); }
 
         /// <summary>
         /// Restarts the reference accumulation and the NRD history with the next frame (the Rust
@@ -263,19 +311,46 @@ namespace Caelix.Rendering.Native
         [ContextMenu("Reset Accumulation")]
         public void ResetAccumulation()
         {
-            foreach (ViewFrameState state in viewFrames) state.ResetRequested = true;
+            foreach (ViewSlot slot in viewSlots) slot.State.ResetRequested = true;
         }
 
-        public EncodingOverride Encoding { get => encodingOverride; set => encodingOverride = value; }
-        public TextAsset MaterialsJson { get => materialsJson; set => materialsJson = value; }
+        /// <summary>Block encoding of the plugin's scene. Fixed for a session: setting another value then throws.</summary>
+        public EncodingOverride Encoding
+        {
+            get => encodingOverride;
+            set
+            {
+                if (sessionLive && value != sessionEncodingOverride)
+                {
+                    throw new InvalidOperationException(
+                        "CaelixNativeRenderer.Encoding is fixed for the session; disable the component first.");
+                }
+                encodingOverride = value;
+            }
+        }
+
+        /// <summary>Material entries of the block-ID encoding. Fixed for a session: setting another asset then throws.</summary>
+        public TextAsset MaterialsJson
+        {
+            get => materialsJson;
+            set
+            {
+                if (sessionLive && !ReferenceEquals(value, sessionMaterialsAsset))
+                {
+                    throw new InvalidOperationException(
+                        "CaelixNativeRenderer.MaterialsJson is fixed for the session; disable the component first.");
+                }
+                materialsJson = value;
+            }
+        }
+
         public int StatusLogInterval { get => statusLogInterval; set => statusLogInterval = Mathf.Max(0, value); }
         public bool VerboseLogging { get => verboseLogging; set => verboseLogging = value; }
-        public long BrickBudgetBytes => (long)Mathf.Max(1, brickBudgetMiB) << 20;
 
         /// <summary>The host whose client world this renderer draws, once resolved.</summary>
         public CaelixHost Host => host;
 
-        // ---------------- packets ----------------
+        // ---------------- views ----------------
         /// <summary>One render texture the plugin writes, with its native pointers.</summary>
         private sealed class NativeTarget
         {
@@ -374,50 +449,98 @@ namespace Caelix.Rendering.Native
             public CaelixNativeRenderOptions LastOptions;
             public RenderMode LastMode;
             public bool ResetRequested;
+
+            public void Reset(RenderMode viewMode)
+            {
+                HasLastFrame = false;
+                LastCamera = default;
+                LastOptions = default;
+                LastMode = viewMode;
+                ResetRequested = false;
+            }
         }
 
-        private static T[] PerView<T>() where T : new()
+        /// <summary>One view: the camera that owns it, its targets and its reset state.</summary>
+        private sealed class ViewSlot
         {
-            var array = new T[CaelixNativeBridge.MaxViews];
-            for (int i = 0; i < array.Length; i++) array[i] = new T();
-            return array;
+            public Camera Camera;
+            public bool InUse;
+            public bool IsSceneView;
+            /// <summary><see cref="Time.frameCount"/> of the camera's newest prepared frame.</summary>
+            public int LastFrame;
+            public readonly ViewTargets Targets = new ViewTargets();
+            public readonly ViewFrameState State = new ViewFrameState();
         }
 
-        private readonly ViewTargets[] viewTargets = PerView<ViewTargets>();
-        private readonly ViewFrameState[] viewFrames = PerView<ViewFrameState>();
-        /// <summary>
-        /// One generation for every view: the plugin releases the cached views of every renderer on
-        /// one release event, so a target replaced in any view needs that event.
-        /// </summary>
-        private uint generation;
+        private readonly ViewSlot[] viewSlots = CreateViewSlots();
 
-        private readonly IntPtr[] slots = new IntPtr[RingSize];
-        private readonly long[] slotCapacity = new long[RingSize];
-        private readonly ulong[] slotSequence = new ulong[RingSize];
-        private readonly int[] slotFrame = new int[RingSize];
-        /// <summary>The slot holds a scene section from <see cref="Tick"/> that was not issued yet.</summary>
-        private readonly bool[] slotFilled = new bool[RingSize];
-        /// <summary>The slot's newest issued packet carried scene records.</summary>
-        private readonly bool[] slotHadScene = new bool[RingSize];
-        private readonly CaelixNativeSceneSection[] slotScene = new CaelixNativeSceneSection[RingSize];
-        private readonly uint[] slotEncoding = new uint[RingSize];
+        private static ViewSlot[] CreateViewSlots()
+        {
+            var slots = new ViewSlot[CaelixNativeBridge.MaxViews];
+            for (int i = 0; i < slots.Length; i++) slots[i] = new ViewSlot();
+            return slots;
+        }
+
+        private readonly List<int> idleViewScratch = new List<int>();
         private uint frameSeed;
         private int lastPreparedFrame = -1;
         private bool warnedJitter;
+        private bool warnedNoView;
+        private bool warnedSkyNotCube;
+
+        // Sky cubemap: GetNativeTexturePtr may synchronize with the render thread, so the pointer is
+        // read once per texture reference.
+        private Texture skyTexture;
+        private IntPtr skyTexturePtr;
+
+        // ---------------- packets ----------------
+        private static readonly int FramePacketBytes = Marshal.SizeOf<CaelixNativeFramePacket>();
+        private static readonly int ViewPacketBytes = Marshal.SizeOf<CaelixNativeViewPacket>();
+        private static readonly int ReleasePacketBytes = Marshal.SizeOf<CaelixNativeReleasePacket>();
+
+        /// <summary>Frame packets: grown on demand to hold the records of one frame.</summary>
+        private readonly IntPtr[] frameSlots = new IntPtr[FrameRingSize];
+        private readonly long[] frameCapacity = new long[FrameRingSize];
+        private readonly ulong[] frameSequence = new ulong[FrameRingSize];
+        private readonly long[] frameBricks = new long[FrameRingSize];
+
+        /// <summary>View packets: <see cref="ViewRingSize"/> fixed slots in one block.</summary>
+        private IntPtr viewRing;
+        private readonly ulong[] viewSequence = new ulong[ViewRingSize];
+
+        /// <summary>Release packets: <see cref="ReleaseRingSize"/> fixed slots in one block.</summary>
+        private IntPtr releaseRing;
+        private readonly ulong[] releaseSequence = new ulong[ReleaseRingSize];
+
+        /// <summary>Carries the frame event (and the release events of the tick) to <see cref="Graphics.ExecuteCommandBuffer"/>.</summary>
+        private CommandBuffer frameCommands;
+        private float lastDeferredWarningTime = float.NegativeInfinity;
+
+        // ---------------- session ----------------
+        private bool sessionLive;
+        private EncodingOverride sessionEncodingOverride;
+        private uint sessionEncoding;
+        private TextAsset sessionMaterialsAsset;
+        /// <summary>Material entries of the session (block-ID encoding only), sent with the reset.</summary>
+        private CaelixNativeMaterialEntry[] sessionMaterials;
+        private int sessionStagingMiB;
+        /// <summary>Sequence of the session's reset frame packet.</summary>
+        private ulong sessionResetSequence;
+        /// <summary>The plugin consumed the reset packet: the status describes this session's scene.</summary>
+        private bool sessionReady;
+        private ulong sessionDroppedBaseline;
+        private bool sessionConfigLogged;
+        private bool sessionEncodingLogged;
+        private bool sessionStagingLogged;
 
         // ---------------- scene feed ----------------
         private ClientWorld source;
-        private readonly Dictionary<EntityView, ViewState> views = new Dictionary<EntityView, ViewState>();
-        private readonly List<ViewState> viewOrder = new List<ViewState>();
+        private readonly Dictionary<EntityView, EntityState> entities = new Dictionary<EntityView, EntityState>();
+        private readonly List<EntityState> entityOrder = new List<EntityState>();
         private readonly List<Guid128> pendingEntityRemoves = new List<Guid128>();
         private readonly List<EntityView> removedScratch = new List<EntityView>();
         private NativeHashSet<int3> frameDedupe;
-        private int viewStamp;
-        private uint tickEncoding = uint.MaxValue;
-        private bool sceneReset = true;
-        private bool materialsDirty = true;
-        private TextAsset parsedMaterialsAsset;
-        private CaelixNativeMaterialEntry[] parsedMaterials;
+        private int entityStamp;
         private int lastTickFrame = -1;
 
         // Stream tracking (logs one line when a burst of uploads has become traceable).
@@ -428,21 +551,23 @@ namespace Caelix.Rendering.Native
         private double streamTickMsMax;
         private int streamTicks;
         private long streamBricks;
-        private ulong lastUploadSequence;
-        private int lastUploadSlot = -1;
-        private ulong settleRenders;
+        private ulong settleFrames;
 
         // Shared by every instance: sequence numbers and target generations must never repeat
         // within one plugin lifetime. The plugin outlives components and domain reloads; a domain
-        // reload resets these to 0, so TryPrepareFrame continues s_sequence above the plugin's
-        // last consumed sequence (slot reuse depends on it). Generations only feed a warning.
-        private static ulong s_sequence;
+        // reload resets these to 0, so every packet kind continues its counter above the plugin's
+        // last consumed sequence of that kind (slot reuse depends on it). Generations only feed a
+        // warning of the plugin.
+        private static ulong s_frameSequence;
+        private static ulong s_viewSequence;
+        private static ulong s_releaseSequence;
         private static uint s_generation;
         private static uint s_releasedGeneration;
-        private static uint s_issuedEncoding = uint.MaxValue;
-        private static readonly List<(IntPtr memory, ulong sequence)> s_deferredFree = new List<(IntPtr, ulong)>();
+        private static readonly List<(IntPtr memory, uint kind, ulong sequence)> s_deferredFree =
+            new List<(IntPtr, uint, ulong)>();
 
-        private sealed class ViewState
+        /// <summary>What the plugin knows of one client entity view.</summary>
+        private sealed class EntityState
         {
             public EntityView View;
             public Guid128 Guid;
@@ -471,46 +596,84 @@ namespace Caelix.Rendering.Native
                 Debug.LogWarning($"Caelix native: {name} replaces {Active.name} as the active native renderer.", this);
             }
             Active = this;
-            for (int i = 0; i < RingSize; i++)
+            for (int i = 0; i < FrameRingSize; i++)
             {
-                slots[i] = IntPtr.Zero;
-                slotCapacity[i] = 0;
-                slotSequence[i] = 0;
-                slotFrame[i] = 0;
-                slotFilled[i] = false;
-                slotHadScene[i] = false;
+                frameSlots[i] = IntPtr.Zero;
+                frameCapacity[i] = 0;
+                frameSequence[i] = 0;
+                frameBricks[i] = 0;
             }
-            for (int v = 0; v < viewFrames.Length; v++) viewFrames[v].LastMode = ModeForView(v);
+            viewRing = Marshal.AllocHGlobal(ViewRingSize * ViewPacketBytes);
+            Array.Clear(viewSequence, 0, viewSequence.Length);
+            releaseRing = Marshal.AllocHGlobal(ReleaseRingSize * ReleasePacketBytes);
+            Array.Clear(releaseSequence, 0, releaseSequence.Length);
+            frameCommands = new CommandBuffer { name = "Caelix Native Frame" };
+            for (int v = 0; v < viewSlots.Length; v++) FreeViewSlot(v);
             frameDedupe = new NativeHashSet<int3>(1024, Allocator.Persistent);
-            sceneReset = true;
-            materialsDirty = true;
-            tickEncoding = ResolveEncoding();
+            sessionLive = false;
+            streaming = false;
         }
 
         private void OnDisable()
         {
             if (Active == this) Active = null;
             CaelixNativeBridge.TryGetStatus(out CaelixNativeStatus status);
-            for (int i = 0; i < RingSize; i++)
+            FreeDeferred(status);
+            ContinueSequences(status);
+            if (sessionLive)
             {
-                if (slots[i] == IntPtr.Zero) continue;
-                bool issuedAndPending = !slotFilled[i] && slotSequence[i] != 0 && status.lastConsumedSequence < slotSequence[i];
-                if (!issuedAndPending)
+                // The session ends: every renderer and the scene go away, the plugin holds nothing
+                // between Play sessions. Issued before the targets below are released.
+                IntPtr release = FillRelease(CaelixNativeBridge.ReleaseScene, 0);
+                if (release == IntPtr.Zero)
                 {
-                    Marshal.FreeHGlobal(slots[i]);
+                    // Every ring slot is in flight and there is no next tick to wait for: a block of its own.
+                    release = Marshal.AllocHGlobal(ReleasePacketBytes);
+                    ulong sequence = WriteRelease(release, CaelixNativeBridge.ReleaseScene, 0);
+                    s_deferredFree.Add((release, CaelixNativeBridge.PacketRelease, sequence));
                 }
-                else
-                {
-                    // The render thread may still read it: free it once it reports the sequence.
-                    s_deferredFree.Add((slots[i], slotSequence[i]));
-                }
-                slots[i] = IntPtr.Zero;
-                slotCapacity[i] = 0;
-                slotFilled[i] = false;
+                frameCommands.Clear();
+                frameCommands.IssuePluginEventAndData(CaelixNativeBridge.RenderEventFunc, status.releaseEventId, release);
+                Graphics.ExecuteCommandBuffer(frameCommands);
+                sessionLive = false;
             }
-            foreach (ViewTargets targets in viewTargets) targets.Release();
+            frameCommands?.Release();
+            frameCommands = null;
+
+            // Packet memory the render thread may still read is freed once it reports the sequence.
+            for (int i = 0; i < FrameRingSize; i++)
+            {
+                FreeOrDefer(frameSlots[i], CaelixNativeBridge.PacketFrame, frameSequence[i], status);
+                frameSlots[i] = IntPtr.Zero;
+                frameCapacity[i] = 0;
+                frameSequence[i] = 0;
+                frameBricks[i] = 0;
+            }
+            FreeOrDefer(viewRing, CaelixNativeBridge.PacketView, Max(viewSequence), status);
+            viewRing = IntPtr.Zero;
+            FreeOrDefer(releaseRing, CaelixNativeBridge.PacketRelease, Max(releaseSequence), status);
+            releaseRing = IntPtr.Zero;
+
+            for (int v = 0; v < viewSlots.Length; v++) FreeViewSlot(v);
             UnbindSource();
             if (frameDedupe.IsCreated) frameDedupe.Dispose();
+        }
+
+        /// <summary>Reverts a session-fixed field that the Inspector changed during a session.</summary>
+        private void OnValidate()
+        {
+            if (!Application.isPlaying || !sessionLive) return;
+            if (encodingOverride != sessionEncodingOverride)
+            {
+                Debug.LogError($"Caelix native: the encoding is fixed for the session; reverted to {sessionEncodingOverride}. " +
+                               "Disable the component first.", this);
+                encodingOverride = sessionEncodingOverride;
+            }
+            if (!ReferenceEquals(materialsJson, sessionMaterialsAsset))
+            {
+                Debug.LogError("Caelix native: the material JSON is fixed for the session; reverted. Disable the component first.", this);
+                materialsJson = sessionMaterialsAsset;
+            }
         }
 
         #region Scene feed
@@ -525,8 +688,10 @@ namespace Caelix.Rendering.Native
             }
         }
 
-        private bool EnsureSource()
+        /// <summary>Binds the host's client world. <paramref name="rebound"/> is true when a world was bound now.</summary>
+        private bool EnsureSource(out bool rebound)
         {
+            rebound = false;
             if (source != null && !source.IsDisposed) return true;
             if (host == null) host = CaelixHost.Current;
             if (host == null) return false;
@@ -535,36 +700,30 @@ namespace Caelix.Rendering.Native
             if (world == null || world.IsDisposed) return false;
             UnbindSource();
             source = world;
-            // A new world: the plugin's scene must forget the old one.
-            sceneReset = true;
-            materialsDirty = true;
+            rebound = true;
             return true;
         }
 
         private void UnbindSource()
         {
-            foreach (ViewState state in viewOrder) state.Dispose();
-            views.Clear();
-            viewOrder.Clear();
-            pendingEntityRemoves.Clear();
+            ForgetEntities();
             source = null;
         }
 
-        /// <summary>Forgets every view; the next diff sends them all as new, after a scene reset.</summary>
-        private void ResendEverything()
+        /// <summary>Forgets every entity; the next diff sends them all as new.</summary>
+        private void ForgetEntities()
         {
-            foreach (ViewState state in viewOrder) state.Dispose();
-            views.Clear();
-            viewOrder.Clear();
+            foreach (EntityState state in entityOrder) state.Dispose();
+            entities.Clear();
+            entityOrder.Clear();
             pendingEntityRemoves.Clear();
-            sceneReset = true;
-            materialsDirty = true;
         }
 
         /// <summary>
-        /// Collects this frame's scene changes and, when a packet slot is free, copies them into
-        /// the next packet. Call once per frame after the client's <c>PrepareRender</c> and before
-        /// <c>EndFrame</c>: the change lists are read here and nowhere cleared.
+        /// Collects this frame's scene changes and issues the frame event with them; starts a
+        /// session first when none is live. Call once per frame after the client's
+        /// <c>PrepareRender</c> and before <c>EndFrame</c>: the change lists are read here and
+        /// nowhere cleared.
         /// </summary>
         public void Tick()
         {
@@ -594,63 +753,196 @@ namespace Caelix.Rendering.Native
                 return;
             }
             lastTickFrame = Time.frameCount;
-            if (!EnsureSource()) return;
-
-            uint encoding = ResolveEncoding();
-            if (encoding != tickEncoding)
+            if (!CaelixNativeBridge.IsAvailable) return;
+            if (!EnsureSource(out bool rebound)) return;
+            if (rebound && sessionLive)
             {
+                // A new client world: the session start below releases the old scene.
                 if (verboseLogging)
                 {
-                    Debug.Log($"Caelix native: scene encoding {tickEncoding} -> {encoding}; the plugin recreates its scene and the world is sent again.", this);
+                    Debug.Log("Caelix native: a new client world; the session restarts and the world is sent again.", this);
                 }
-                tickEncoding = encoding;
-                ResendEverything();
+                sessionLive = false;
             }
-            if (!ReferenceEquals(materialsJson, parsedMaterialsAsset))
+
+            CaelixNativeBridge.TryGetStatus(out CaelixNativeStatus status);
+            FreeDeferred(status);
+            ContinueSequences(status);
+            if (sessionLive && !CheckSession(status)) return;
+
+            bool starting = !sessionLive;
+            int frameSlot = FindFreeFrameSlot(status);
+            if (starting)
             {
-                materialsDirty = true;
+                if (frameSlot < 0 || !HasFreeRelease(status))
+                {
+                    TicksDeferred++;
+                    WarnDeferred("the session start waits for a free packet slot");
+                    return;
+                }
+                BeginSession();
             }
 
             CollectChanges();
-
-            CaelixNativeBridge.TryGetStatus(out CaelixNativeStatus status);
-            FreeDeferred(status.lastConsumedSequence);
             TrackStream(status);
             if (statusLogInterval > 0 && Time.frameCount % statusLogInterval == 0)
             {
                 LogStatus(status);
             }
 
-            for (int i = 0; i < RingSize; i++)
+            frameCommands.Clear();
+            bool issue = false;
+            IntPtr eventFunc = CaelixNativeBridge.RenderEventFunc;
+            if (starting)
             {
-                if (slotFilled[i])
+                // Destroys the previous scene and every renderer (when there are any); the reset
+                // frame packet below creates the new scene.
+                IntPtr release = FillRelease(CaelixNativeBridge.ReleaseScene, 0);
+                frameCommands.IssuePluginEventAndData(eventFunc, status.releaseEventId, release);
+                issue = true;
+            }
+
+            // Views whose camera is gone or idle: their renderers go (a scene release covers them).
+            idleViewScratch.Clear();
+            for (int v = 0; v < viewSlots.Length; v++)
+            {
+                ViewSlot slot = viewSlots[v];
+                if (!slot.InUse) continue;
+                if (slot.Camera != null && Time.frameCount - slot.LastFrame <= ViewIdleFrames) continue;
+                if (!starting)
                 {
-                    // The previous scene packet was not issued yet (no camera rendered): keep it,
-                    // everything collected since waits in the view states.
-                    TicksDeferred++;
-                    return;
+                    IntPtr release = FillRelease(CaelixNativeBridge.ReleaseView, (uint)v);
+                    // No free release slot: wait for the next tick.
+                    if (release == IntPtr.Zero) break;
+                    frameCommands.IssuePluginEventAndData(eventFunc, status.releaseEventId, release);
+                    issue = true;
+                }
+                idleViewScratch.Add(v);
+            }
+
+            bool frameIssued = false;
+            if (frameSlot >= 0)
+            {
+                if (FillFramePacket(frameSlot, status, starting))
+                {
+                    frameCommands.IssuePluginEventAndData(eventFunc, status.frameEventId, frameSlots[frameSlot]);
+                    issue = true;
+                    frameIssued = true;
                 }
             }
-            int slot = FindFreeSlot(status.lastConsumedSequence);
-            if (slot < 0)
+            else
             {
+                // Everything collected waits in the entity states for the next frame packet.
                 TicksDeferred++;
-                return;
+                WarnDeferred("no frame packet slot is free; the scene records of this frame wait");
             }
-            FillScenePacket(slot, status);
+
+            if (issue) Graphics.ExecuteCommandBuffer(frameCommands);
+            // After the release events: the plugin drops its views of the targets before Unity destroys them.
+            foreach (int v in idleViewScratch) FreeViewSlot(v);
+            if (starting && frameIssued)
+            {
+                sessionLive = true;
+                // The scene release also released every target view.
+                s_releasedGeneration = s_generation;
+                if (verboseLogging)
+                {
+                    Debug.Log($"Caelix native: session started: encoding {sessionEncoding}, staging ring {sessionStagingMiB} MiB, " +
+                              $"{(sessionMaterials != null ? sessionMaterials.Length : 0)} material entries, " +
+                              $"{entityOrder.Count} entities, {BricksPendingCSharp} bricks to send.", this);
+                }
+            }
         }
 
-        /// <summary>Diffs the views and reads their change lists into the view states.</summary>
+        /// <summary>Fixes the session config and forgets every entity: the world is sent again.</summary>
+        private void BeginSession()
+        {
+            sessionEncodingOverride = encodingOverride;
+            sessionEncoding = ResolveEncoding();
+            sessionMaterialsAsset = materialsJson;
+            sessionMaterials = sessionEncoding == 1u ? ParseMaterials(materialsJson) : null;
+            if (sessionEncoding != 1u && materialsJson != null && verboseLogging)
+            {
+                Debug.Log($"Caelix native: {materialsJson.name} is ignored: the packed encoding has no material table.", this);
+            }
+            sessionStagingMiB = Mathf.Max(4, stagingRingMiB);
+            sessionResetSequence = ulong.MaxValue;
+            sessionReady = false;
+            sessionDroppedBaseline = 0;
+            sessionConfigLogged = false;
+            sessionEncodingLogged = false;
+            sessionStagingLogged = false;
+            ForgetEntities();
+        }
+
+        /// <summary>
+        /// The tripwires of a live session. False when the session ended (the plugin dropped
+        /// bricks); the next tick starts a new one.
+        /// </summary>
+        private bool CheckSession(in CaelixNativeStatus status)
+        {
+            if (!sessionConfigLogged &&
+                (ResolveEncoding() != sessionEncoding || !ReferenceEquals(materialsJson, sessionMaterialsAsset)))
+            {
+                sessionConfigLogged = true;
+                Debug.LogError("Caelix native: the encoding or the material JSON changed during the session; the session " +
+                               "keeps its own. Disable the component before changing them.", this);
+            }
+            if (!sessionStagingLogged && stagingRingMiB != sessionStagingMiB)
+            {
+                sessionStagingLogged = true;
+                if (verboseLogging)
+                {
+                    Debug.Log($"Caelix native: staging ring {stagingRingMiB} MiB applies at the next session (this one has " +
+                              $"{sessionStagingMiB} MiB).", this);
+                }
+            }
+
+            // Until the plugin consumed the reset packet, the status describes the previous scene.
+            if (status.lastConsumedFrameSequence < sessionResetSequence) return true;
+            if (!sessionReady)
+            {
+                // Frame packets of an earlier session were consumed before the reset: their drops
+                // are in this baseline, and this session sends no bricks before it is ready.
+                sessionReady = true;
+                sessionDroppedBaseline = status.bricksDropped;
+            }
+            if (!sessionEncodingLogged && status.sceneEncoding != CaelixNativeBridge.NoScene &&
+                status.sceneEncoding != sessionEncoding)
+            {
+                sessionEncodingLogged = true;
+                Debug.LogError($"Caelix native: the plugin's scene has encoding {status.sceneEncoding}, the session " +
+                               $"{sessionEncoding}.", this);
+            }
+            if (status.bricksDropped > sessionDroppedBaseline)
+            {
+                Debug.LogError($"Caelix native: the plugin dropped {status.bricksDropped - sessionDroppedBaseline} bricks " +
+                               "(its staging ring refused them); the session restarts and the world is sent again.", this);
+                sessionLive = false;
+                return false;
+            }
+            return true;
+        }
+
+        private void WarnDeferred(string reason)
+        {
+            float now = Time.realtimeSinceStartup;
+            if (now - lastDeferredWarningTime < 5.0f) return;
+            lastDeferredWarningTime = now;
+            Debug.LogWarning($"Caelix native: {reason} ({TicksDeferred} deferred ticks so far).", this);
+        }
+
+        /// <summary>Diffs the entity views and reads their change lists into the entity states.</summary>
         private void CollectChanges()
         {
             IReadOnlyList<EntityView> list = source.Views;
-            viewStamp++;
+            entityStamp++;
             for (int v = 0; v < list.Count; v++)
             {
                 EntityView view = list[v];
-                if (!views.TryGetValue(view, out ViewState state))
+                if (!entities.TryGetValue(view, out EntityState state))
                 {
-                    state = new ViewState
+                    state = new EntityState
                     {
                         View = view,
                         Guid = view.Guid,
@@ -662,12 +954,12 @@ namespace Caelix.Rendering.Native
                     {
                         state.PendingUploads.Add(key);
                     }
-                    views.Add(view, state);
-                    viewOrder.Add(state);
-                    state.Stamp = viewStamp;
+                    entities.Add(view, state);
+                    entityOrder.Add(state);
+                    state.Stamp = entityStamp;
                     continue;
                 }
-                state.Stamp = viewStamp;
+                state.Stamp = entityStamp;
 
                 int count = view.Data.ChangeCount;
                 if (count == 0) continue;
@@ -692,39 +984,66 @@ namespace Caelix.Rendering.Native
 
             // Views that are gone: one remove record each. Their data may be disposed already.
             removedScratch.Clear();
-            foreach (var kvp in views)
+            foreach (var kvp in entities)
             {
-                if (kvp.Value.Stamp != viewStamp) removedScratch.Add(kvp.Key);
+                if (kvp.Value.Stamp != entityStamp) removedScratch.Add(kvp.Key);
             }
             foreach (EntityView view in removedScratch)
             {
-                ViewState state = views[view];
+                EntityState state = entities[view];
                 // A view that never reached the plugin needs no remove.
                 if (!state.NeedsAdd) pendingEntityRemoves.Add(state.Guid);
                 state.Dispose();
-                views.Remove(view);
-                viewOrder.Remove(state);
+                entities.Remove(view);
+                entityOrder.Remove(state);
             }
 
             long waiting = 0;
-            foreach (ViewState state in viewOrder) waiting += state.UploadsWaiting;
+            foreach (EntityState state in entityOrder) waiting += state.UploadsWaiting;
             BricksPendingCSharp = waiting;
         }
 
         private static int Align(int value, int alignment) => (value + alignment - 1) & ~(alignment - 1);
 
-        private unsafe void FillScenePacket(int slot, in CaelixNativeStatus status)
+        /// <summary>Bricks of issued frame packets the render thread has not consumed yet.</summary>
+        private long BricksInFlight(in CaelixNativeStatus status)
         {
-            // Back-pressure: while the plugin still holds a packet's worth of bricks, send none.
-            long budget = BrickBudgetBytes;
-            if ((long)status.bricksPendingPlugin * BrickPacketBytes >= budget) budget = 0;
+            long bricks = 0;
+            for (int i = 0; i < FrameRingSize; i++)
+            {
+                if (frameSequence[i] > status.lastConsumedFrameSequence) bricks += frameBricks[i];
+            }
+            return bricks;
+        }
+
+        /// <summary>
+        /// Bricks the next frame packet may carry: the staging ring's free upload capacity after the
+        /// newest flush, minus the bricks of frame packets issued since, capped at the per-packet
+        /// cap. 0 before the plugin created this session's scene.
+        /// </summary>
+        private long UploadBudgetBricks(in CaelixNativeStatus status)
+        {
+            if (!sessionReady || status.sceneEncoding == CaelixNativeBridge.NoScene) return 0;
+            long free = (long)Math.Min(status.uploadBricksFree, long.MaxValue) - BricksInFlight(status);
+            long budget = Math.Min(free, (long)Math.Min(status.uploadBricksCap, long.MaxValue));
+            return budget > 0 ? budget : 0;
+        }
+
+        /// <summary>
+        /// Fills frame packet <paramref name="slot"/> with this frame's records (and, with
+        /// <paramref name="reset"/>, the session config). False when the packet would be too large;
+        /// nothing was consumed then.
+        /// </summary>
+        private unsafe bool FillFramePacket(int slot, in CaelixNativeStatus status, bool reset)
+        {
+            long budget = UploadBudgetBricks(status) * BrickPacketBytes;
 
             // Entity records: removes first (the plugin applies them in list order), then the views
             // that have something to say.
             int entityCount = pendingEntityRemoves.Count;
             int removeCount = 0;
-            int uploadViews = 0;
-            foreach (ViewState state in viewOrder)
+            int uploadEntities = 0;
+            foreach (EntityState state in entityOrder)
             {
                 state.PacketIndex = -1;
                 bool moved = !state.NeedsAdd && !TransformEquals(state.SentTransform, state.View.Data.transform);
@@ -734,58 +1053,51 @@ namespace Caelix.Rendering.Native
                     state.PacketIndex = entityCount++;
                 }
                 removeCount += state.PendingRemoves.Length;
-                if (uploads) uploadViews++;
+                if (uploads) uploadEntities++;
             }
 
-            bool sendMaterials = materialsDirty;
-            uint materialMode = CaelixNativeBridge.MaterialsNone;
-            int materialCount = 0;
-            int materialBytes = 0;
-            if (sendMaterials)
-            {
-                ParseMaterialsIfChanged();
-                if (tickEncoding == 1u && parsedMaterials != null && parsedMaterials.Length > 0)
-                {
-                    materialMode = CaelixNativeBridge.MaterialsPartial;
-                    materialCount = parsedMaterials.Length;
-                    materialBytes = materialCount * sizeof(CaelixNativeMaterialEntry);
-                }
-                else if (!sceneReset)
-                {
-                    // No table (or a packed scene): back to the built-in table. A reset restores it anyway.
-                    materialMode = CaelixNativeBridge.MaterialsFull;
-                }
-            }
+            // Material entries go with the reset only (the table is fixed for the session).
+            int materialCount = reset && sessionMaterials != null ? sessionMaterials.Length : 0;
+            int materialBytes = materialCount * sizeof(CaelixNativeMaterialEntry);
 
-            int packetSize = sizeof(CaelixNativePacket);
-            int entitiesOffset = Align(packetSize, 16);
+            int materialsOffset = Align(sizeof(CaelixNativeFramePacket), 16);
+            int entitiesOffset = Align(materialsOffset + materialBytes, 16);
             int removesOffset = Align(entitiesOffset + entityCount * sizeof(CaelixNativeEntity), 16);
             int uploadsOffset = Align(removesOffset + removeCount * sizeof(CaelixNativeBrickRemove), 16);
-            int materialsOffset = Align(uploadsOffset + uploadViews * sizeof(CaelixNativeUpload), 16);
-            int dataOffset = Align(materialsOffset + materialBytes, 16);
-            long required = dataOffset + (budget > 0 ? budget + 16L * uploadViews + 16 : 0);
+            int dataOffset = Align(uploadsOffset + uploadEntities * sizeof(CaelixNativeUpload), 16);
+            long required = dataOffset + (budget > 0 ? budget + 16L * uploadEntities + 16 : 0);
             if (required > int.MaxValue)
             {
-                Debug.LogError($"Caelix native: scene packet would need {required} bytes; lower the brick budget.", this);
-                return;
+                Debug.LogError($"Caelix native: frame packet would need {required} bytes; lower the staging ring.", this);
+                foreach (EntityState state in entityOrder) state.PacketIndex = -1;
+                return false;
             }
-            EnsureSlotCapacity(slot, required);
-            byte* packet = (byte*)slots[slot];
+            EnsureFrameCapacity(slot, required);
+            byte* packet = (byte*)frameSlots[slot];
+
+            // Materials.
+            if (materialCount > 0)
+            {
+                fixed (CaelixNativeMaterialEntry* src = sessionMaterials)
+                {
+                    UnsafeUtility.MemCpy(packet + materialsOffset, src, materialBytes);
+                }
+            }
 
             // Entities.
-            var entities = (CaelixNativeEntity*)(packet + entitiesOffset);
+            var entityRecords = (CaelixNativeEntity*)(packet + entitiesOffset);
             int e = 0;
             foreach (Guid128 guid in pendingEntityRemoves)
             {
-                entities[e] = default;
-                WriteGuid(ref entities[e], guid);
-                entities[e].flags = CaelixNativeBridge.EntityRemove;
+                entityRecords[e] = default;
+                WriteGuid(ref entityRecords[e], guid);
+                entityRecords[e].flags = CaelixNativeBridge.EntityRemove;
                 e++;
             }
-            foreach (ViewState state in viewOrder)
+            foreach (EntityState state in entityOrder)
             {
                 if (state.PacketIndex < 0) continue;
-                ref CaelixNativeEntity record = ref entities[state.PacketIndex];
+                ref CaelixNativeEntity record = ref entityRecords[state.PacketIndex];
                 record = default;
                 WriteGuid(ref record, state.Guid);
                 RigidTransform t = state.View.Data.transform;
@@ -801,7 +1113,7 @@ namespace Caelix.Rendering.Native
             // Brick removes.
             var removes = (CaelixNativeBrickRemove*)(packet + removesOffset);
             int r = 0;
-            foreach (ViewState state in viewOrder)
+            foreach (EntityState state in entityOrder)
             {
                 for (int i = 0; i < state.PendingRemoves.Length; i++)
                 {
@@ -814,25 +1126,17 @@ namespace Caelix.Rendering.Native
                 state.PendingRemoves.Clear();
             }
 
-            // Materials.
-            if (materialMode == CaelixNativeBridge.MaterialsPartial)
-            {
-                fixed (CaelixNativeMaterialEntry* src = parsedMaterials)
-                {
-                    UnsafeUtility.MemCpy(packet + materialsOffset, src, materialBytes);
-                }
-            }
-
-            // Uploads: one Burst job copies the waiting bricks of every view, in view order, up to
-            // the budget. Bound pointers live only inside this synchronous run.
+            // Uploads: one Burst job copies the waiting bricks of every entity, in entity order, up
+            // to the budget. Bound pointers live only inside this synchronous run.
             int uploadCount = 0;
             int endOffset = dataOffset;
-            if (budget > 0 && uploadViews > 0)
+            long bricks = 0;
+            if (budget > 0 && uploadEntities > 0)
             {
-                var sources = new NativeArray<UploadSource>(uploadViews, Allocator.TempJob);
-                var owners = new ViewState[uploadViews];
+                var sources = new NativeArray<UploadSource>(uploadEntities, Allocator.TempJob);
+                var owners = new EntityState[uploadEntities];
                 int s = 0;
-                foreach (ViewState state in viewOrder)
+                foreach (EntityState state in entityOrder)
                 {
                     if (state.PacketIndex < 0 || state.UploadsWaiting <= 0) continue;
                     owners[s] = state;
@@ -844,7 +1148,7 @@ namespace Caelix.Rendering.Native
                         EntityIndex = (uint)state.PacketIndex,
                     };
                 }
-                var consumed = new NativeArray<int>(uploadViews, Allocator.TempJob);
+                var consumed = new NativeArray<int>(uploadEntities, Allocator.TempJob);
                 var result = new NativeArray<long>(4, Allocator.TempJob);
                 new FillUploadsJob
                 {
@@ -858,7 +1162,7 @@ namespace Caelix.Rendering.Native
                 }.Run();
                 uploadCount = (int)result[0];
                 endOffset = (int)result[1];
-                long bricks = result[2];
+                bricks = result[2];
                 BricksSentTotal += bricks;
                 if (bricks > 0)
                 {
@@ -873,12 +1177,11 @@ namespace Caelix.Rendering.Native
                         streamBricks = 0;
                     }
                     streamBricks += bricks;
-                    lastUploadSlot = slot;
-                    settleRenders = 0;
+                    settleFrames = 0;
                 }
-                for (int i = 0; i < uploadViews; i++)
+                for (int i = 0; i < uploadEntities; i++)
                 {
-                    ViewState state = owners[i];
+                    EntityState state = owners[i];
                     state.Head += consumed[i];
                     if (state.Head >= state.PendingUploads.Length)
                     {
@@ -896,31 +1199,39 @@ namespace Caelix.Rendering.Native
                 result.Dispose();
             }
 
-            uint flags = sceneReset ? CaelixNativeBridge.SceneReset : 0u;
-            slotScene[slot] = new CaelixNativeSceneSection
+            ulong sequence = ++s_frameSequence;
+            *(CaelixNativeFramePacket*)packet = new CaelixNativeFramePacket
             {
-                sceneFlags = flags,
+                header = new CaelixNativePacketHeader
+                {
+                    size = (uint)sizeof(CaelixNativeFramePacket),
+                    version = CaelixNativeBridge.PacketVersion,
+                    kind = CaelixNativeBridge.PacketFrame,
+                    sequence = sequence,
+                },
+                flags = reset ? CaelixNativeBridge.FrameReset : 0u,
                 totalBytes = (uint)Math.Max(endOffset, dataOffset),
+                encoding = sessionEncoding,
+                stagingMib = (uint)sessionStagingMiB,
+                materialCount = (uint)materialCount,
+                materialsOffset = (uint)materialsOffset,
                 entityCount = (uint)entityCount,
                 entitiesOffset = (uint)entitiesOffset,
                 removeCount = (uint)removeCount,
                 removesOffset = (uint)removesOffset,
                 uploadCount = (uint)uploadCount,
                 uploadsOffset = (uint)uploadsOffset,
-                materialMode = materialMode,
-                materialCount = (uint)materialCount,
-                materialsOffset = (uint)materialsOffset,
+                brickCount = (uint)bricks,
             };
-            slotEncoding[slot] = tickEncoding;
-            slotFilled[slot] = true;
+            frameSequence[slot] = sequence;
+            frameBricks[slot] = bricks;
+            if (reset) sessionResetSequence = sequence;
 
             pendingEntityRemoves.Clear();
-            sceneReset = false;
-            if (sendMaterials) materialsDirty = false;
-
             long waiting = 0;
-            foreach (ViewState state in viewOrder) waiting += state.UploadsWaiting;
+            foreach (EntityState state in entityOrder) waiting += state.UploadsWaiting;
             BricksPendingCSharp = waiting;
+            return true;
         }
 
         private static unsafe void WriteGuid(ref CaelixNativeEntity record, Guid128 guid)
@@ -937,12 +1248,12 @@ namespace Caelix.Rendering.Native
             return math.all(a.pos == b.pos) && math.all(a.rot.value == b.rot.value);
         }
 
-        private void EnsureSlotCapacity(int slot, long bytes)
+        private void EnsureFrameCapacity(int slot, long bytes)
         {
-            if (slots[slot] != IntPtr.Zero && slotCapacity[slot] >= bytes) return;
-            if (slots[slot] != IntPtr.Zero) Marshal.FreeHGlobal(slots[slot]);
-            slots[slot] = Marshal.AllocHGlobal(new IntPtr(bytes));
-            slotCapacity[slot] = bytes;
+            if (frameSlots[slot] != IntPtr.Zero && frameCapacity[slot] >= bytes) return;
+            if (frameSlots[slot] != IntPtr.Zero) Marshal.FreeHGlobal(frameSlots[slot]);
+            frameSlots[slot] = Marshal.AllocHGlobal(new IntPtr(bytes));
+            frameCapacity[slot] = bytes;
         }
 
         /// <summary>
@@ -951,24 +1262,22 @@ namespace Caelix.Rendering.Native
         /// </summary>
         private void TrackStream(in CaelixNativeStatus status)
         {
-            if (!streaming || BricksPendingCSharp > 0 || lastUploadSlot < 0) return;
-            // The last packet with uploads must have been issued and consumed.
-            if (slotFilled[lastUploadSlot]) return;
-            if (lastUploadSequence == 0 || status.lastConsumedSequence < lastUploadSequence) return;
-            if (status.bricksPendingPlugin != 0 || status.asBuildsPending != 0)
+            if (!streaming) return;
+            if (BricksPendingCSharp > 0 || BricksInFlight(status) > 0 || status.asBuildsPending != 0)
             {
-                settleRenders = 0;
+                settleFrames = 0;
                 return;
             }
-            // The statistics are published after the flush of the same event that consumed the
-            // packet; two more renders make sure they belong to a flush after it.
-            if (settleRenders == 0)
+            // The statistics are published after the flush of the frame event that consumed the
+            // last uploads; two more flushes make sure they belong to a flush after it.
+            if (settleFrames == 0)
             {
-                settleRenders = status.renders + 2;
+                settleFrames = status.frames + 2;
                 return;
             }
-            if (status.renders < settleRenders) return;
+            if (status.frames < settleFrames) return;
             streaming = false;
+            settleFrames = 0;
             if (!verboseLogging) return;
             double seconds = (Stopwatch.GetTimestamp() - streamStartTicks) / (double)Stopwatch.Frequency;
             Debug.Log($"Caelix native: stream complete after {Time.frameCount - streamStartFrame} frames ({seconds:F2} s): " +
@@ -979,13 +1288,14 @@ namespace Caelix.Rendering.Native
 
         private void LogStatus(in CaelixNativeStatus s)
         {
-            Debug.Log($"Caelix native status (frame {Time.frameCount}): resident {s.bricksResident}, pending plugin " +
-                      $"{s.bricksPendingPlugin}, pending C# {BricksPendingCSharp}, as_builds_pending {s.asBuildsPending}, entities " +
-                      $"{s.entities}, groups {s.groups}, uploaded_total {s.uploadedTotal}, removed_total {s.removedTotal}, " +
-                      $"encoding {s.sceneEncoding}, renders {s.renders}, failed {s.failedEvents}, last error {s.lastError}, " +
-                      $"GPU flush {s.flushMs:F3} ms trace {s.traceMs:F3} ms composite {s.compositeMs:F3} ms denoise {s.denoiseMs:F3} ms; " +
-                      $"Tick {LastTickMilliseconds:F3} ms, deferred {TicksDeferred}, skipped {PacketsSkipped}; " +
-                      $"jitter ({LastJitter.x:F3}, {LastJitter.y:F3}) px.", this);
+            Debug.Log($"Caelix native status (frame {Time.frameCount}): frames {s.frames}, renders {s.renders}, failed " +
+                      $"{s.failedEvents}, last error {s.lastError}, resets {s.sceneResets}, live views 0x{s.liveViews:X2}, " +
+                      $"encoding {s.sceneEncoding}, entities {s.entities}, groups {s.groups}, resident {s.bricksResident}, " +
+                      $"pending C# {BricksPendingCSharp}, in flight {BricksInFlight(s)}, free/cap {s.uploadBricksFree}/" +
+                      $"{s.uploadBricksCap}, dropped {s.bricksDropped}, as_builds_pending {s.asBuildsPending}, GPU flush " +
+                      $"{s.flushMs:F3} ms trace {s.traceMs:F3} ms composite {s.compositeMs:F3} ms denoise {s.denoiseMs:F3} ms " +
+                      $"(view {s.timingsView}); Tick {LastTickMilliseconds:F3} ms, deferred {TicksDeferred}, skipped " +
+                      $"{PacketsSkipped}; jitter ({LastJitter.x:F3}, {LastJitter.y:F3}) px.", this);
         }
 
         [Serializable]
@@ -1007,23 +1317,21 @@ namespace Caelix.Rendering.Native
             public MaterialJsonEntry[] items;
         }
 
-        private unsafe void ParseMaterialsIfChanged()
+        /// <summary>The material entries of <paramref name="asset"/>; null without an asset or on a parse error.</summary>
+        private unsafe CaelixNativeMaterialEntry[] ParseMaterials(TextAsset asset)
         {
-            if (ReferenceEquals(parsedMaterialsAsset, materialsJson) && (parsedMaterials != null || materialsJson == null)) return;
-            parsedMaterialsAsset = materialsJson;
-            parsedMaterials = null;
-            if (materialsJson == null) return;
+            if (asset == null) return null;
             MaterialJsonList list;
             try
             {
-                list = JsonUtility.FromJson<MaterialJsonList>("{\"items\":" + materialsJson.text + "}");
+                list = JsonUtility.FromJson<MaterialJsonList>("{\"items\":" + asset.text + "}");
             }
             catch (Exception ex)
             {
-                Debug.LogError($"Caelix native: {materialsJson.name} is not a material JSON array: {ex.Message}", this);
-                return;
+                Debug.LogError($"Caelix native: {asset.name} is not a material JSON array: {ex.Message}", this);
+                return null;
             }
-            if (list?.items == null) return;
+            if (list?.items == null) return null;
             var entries = new List<CaelixNativeMaterialEntry>(list.items.Length);
             for (int i = 0; i < list.items.Length; i++)
             {
@@ -1032,7 +1340,7 @@ namespace Caelix.Rendering.Native
                 int limit = item.transparent ? 0x1FF : 0x7FFF;
                 if (item.id < 0 || item.id > limit)
                 {
-                    Debug.LogWarning($"Caelix native: {materialsJson.name} entry {i}: id {item.id} out of range (0..{limit}); skipped.", this);
+                    Debug.LogWarning($"Caelix native: {asset.name} entry {i}: id {item.id} out of range (0..{limit}); skipped.", this);
                     continue;
                 }
                 var entry = new CaelixNativeMaterialEntry
@@ -1051,11 +1359,12 @@ namespace Caelix.Rendering.Native
                 entry.material.extinction = Mathf.Max(0f, item.extinction);
                 entries.Add(entry);
             }
-            parsedMaterials = entries.ToArray();
+            CaelixNativeMaterialEntry[] parsed = entries.ToArray();
             if (verboseLogging)
             {
-                Debug.Log($"Caelix native: {parsedMaterials.Length} material entries from {materialsJson.name}.", this);
+                Debug.Log($"Caelix native: {parsed.Length} material entries from {asset.name}.", this);
             }
+            return parsed;
         }
 
         private static float Element(float[] values, int index, float fallback)
@@ -1072,10 +1381,10 @@ namespace Caelix.Rendering.Native
         }
 
         /// <summary>
-        /// Copies waiting bricks into the packet: per view, the keys (12 bytes each) then the
+        /// Copies waiting bricks into the packet: per entity, the keys (12 bytes each) then the
         /// 16-byte aligned block values (1024 bytes each) and one upload record. A key whose brick
         /// no longer exists is consumed without a copy (its removal is, or was, a remove record).
-        /// Stops at the first view that does not fit completely; the rest waits for a later packet.
+        /// Stops at the first entity that does not fit completely; the rest waits for a later packet.
         /// </summary>
         [BurstCompile]
         private unsafe struct FillUploadsJob : IJob
@@ -1165,129 +1474,285 @@ namespace Caelix.Rendering.Native
         #region Packets
 
         /// <summary>
-        /// Fills the next packet of <paramref name="view"/> (0 Game view, 1 Scene view) for
-        /// <paramref name="camera"/> at <paramref name="width"/> x <paramref name="height"/> pixels
-        /// and returns its address. <paramref name="releaseViews"/> is true when a target was
-        /// replaced or the scene encoding changed: the caller then issues the plugin's release event,
-        /// with the packet as its data, before the render event. False when the view index is out of
-        /// range or no packet slot is free (the frame is skipped).
+        /// Fills the view packet of <paramref name="camera"/> at <paramref name="width"/> x
+        /// <paramref name="height"/> pixels. <paramref name="view"/> is the camera's view index (its
+        /// own plugin renderer and targets; see <see cref="ColorHandle"/>); the caller issues the
+        /// render event with <paramref name="viewPacket"/>. <paramref name="releasePacket"/> is
+        /// nonzero when a target of any view was replaced: the caller then issues the release event
+        /// with it before the render event. False when no session is live, every view is taken, or
+        /// no packet slot is free (the frame of this camera is skipped and nothing is drawn).
         /// </summary>
-        public bool TryPrepareFrame(int view, Camera camera, Matrix4x4 jitteredProjection, int width, int height,
-            out IntPtr packet, out bool releaseViews)
+        public bool TryPrepareFrame(Camera camera, Matrix4x4 jitteredProjection, int width, int height,
+            out int view, out IntPtr viewPacket, out IntPtr releasePacket)
         {
-            packet = IntPtr.Zero;
-            releaseViews = false;
-            if (view < 0 || view >= (int)CaelixNativeBridge.MaxViews) return false;
+            view = -1;
+            viewPacket = IntPtr.Zero;
+            releasePacket = IntPtr.Zero;
+            if (!sessionLive || camera == null || viewRing == IntPtr.Zero) return false;
             if (width <= 0 || height <= 0) return false;
 
             CaelixNativeBridge.TryGetStatus(out CaelixNativeStatus status);
-            FreeDeferred(status.lastConsumedSequence);
-            // A domain reload resets s_sequence to 0 but the plugin keeps its newest consumed
-            // sequence: continue above it, or every slot would look consumed while the render
-            // thread may still read it.
-            if (s_sequence < status.lastConsumedSequence) s_sequence = status.lastConsumedSequence;
+            FreeDeferred(status);
+            ContinueSequences(status);
 
-            // The scene packet Tick filled goes with the first view prepared in the frame; otherwise
-            // (also for the next view) a free slot with an empty scene section.
-            int slot = -1;
-            for (int i = 0; i < RingSize; i++)
+            int index = FindViewSlot(camera);
+            if (index < 0)
             {
-                if (slotFilled[i]) { slot = i; break; }
-            }
-            if (slot < 0)
-            {
-                slot = FindFreeSlot(status.lastConsumedSequence);
-                if (slot < 0)
+                PacketsSkipped++;
+                if (!warnedNoView)
                 {
+                    warnedNoView = true;
+                    Debug.LogWarning($"Caelix native: every one of the {CaelixNativeBridge.MaxViews} views is taken; camera " +
+                                     $"'{camera.name}' is not drawn.", this);
+                }
+                return false;
+            }
+            int packetSlot = FindFreeViewPacket(status);
+            if (packetSlot < 0)
+            {
+                PacketsSkipped++;
+                return false;
+            }
+
+            ViewSlot slot = viewSlots[index];
+            slot.LastFrame = Time.frameCount;
+            // Replacing a target bumps the shared generation, which needs a release event first.
+            if (slot.Targets.Ensure(width, height, index)) s_generation++;
+            if (s_generation != s_releasedGeneration)
+            {
+                releasePacket = FillRelease(CaelixNativeBridge.ReleaseTargetViews, 0);
+                if (releasePacket == IntPtr.Zero)
+                {
+                    // The plugin may still cache a view of a destroyed texture: no render without the release.
                     PacketsSkipped++;
                     return false;
                 }
-                EnsureSlotCapacity(slot, Marshal.SizeOf<CaelixNativePacket>());
-                slotScene[slot] = new CaelixNativeSceneSection { totalBytes = (uint)Marshal.SizeOf<CaelixNativePacket>() };
-                slotEncoding[slot] = tickEncoding == uint.MaxValue ? ResolveEncoding() : tickEncoding;
+                s_releasedGeneration = s_generation;
             }
 
-            ViewTargets targets = viewTargets[view];
-            // Replacing a target bumps the generation, which makes the feature issue the release event first.
-            if (targets.Ensure(width, height, view)) generation = ++s_generation;
-            if (generation != s_releasedGeneration)
+            bool isGame = camera.cameraType == CameraType.Game;
+            ulong sequence = ++s_viewSequence;
+            var data = new CaelixNativeViewPacket
             {
-                releaseViews = true;
-                s_releasedGeneration = generation;
-            }
-            if (slotEncoding[slot] != s_issuedEncoding)
-            {
-                // The release event recreates the plugin's scene when the encoding differs.
-                releaseViews = true;
-                s_issuedEncoding = slotEncoding[slot];
-            }
-
-            // A copy: the slot's stored section stays as Tick wrote it.
-            CaelixNativeSceneSection scene = slotScene[slot];
-            scene.view = (uint)view;
-            var data = new CaelixNativePacket
-            {
-                size = (uint)Marshal.SizeOf<CaelixNativePacket>(),
-                version = CaelixNativeBridge.PacketVersion,
-                sequence = ++s_sequence,
-                encoding = slotEncoding[slot],
-                targetGeneration = generation,
-                color = targets.Color.ToPacket(width, height),
-                depth = targets.Depth.ToPacket(width, height),
-                motion = targets.Motion.ToPacket(width, height),
-                albedo = targets.Albedo.ToPacket(width, height),
-                scene = scene,
+                header = new CaelixNativePacketHeader
+                {
+                    size = (uint)ViewPacketBytes,
+                    version = CaelixNativeBridge.PacketVersion,
+                    kind = CaelixNativeBridge.PacketView,
+                    sequence = sequence,
+                },
+                view = (uint)index,
+                flags = isGame ? CaelixNativeBridge.ViewReportTimings : 0u,
+                targetGeneration = s_generation,
+                color = slot.Targets.Color.ToPacket(width, height),
+                depth = slot.Targets.Depth.ToPacket(width, height),
+                motion = slot.Targets.Motion.ToPacket(width, height),
+                albedo = slot.Targets.Albedo.ToPacket(width, height),
+                sky = SkyTarget(),
             };
-            data.camera = BuildCamera(view, camera, jitteredProjection, width, height);
-            data.options = BuildOptions(view, data.camera);
+            data.camera = BuildCamera(camera, jitteredProjection, width, height, isGame);
+            data.options = BuildOptions(slot, data.camera);
+            IntPtr memory = viewRing + packetSlot * ViewPacketBytes;
             unsafe
             {
-                *(CaelixNativePacket*)slots[slot] = data;
+                *(CaelixNativeViewPacket*)memory = data;
             }
-            bool hasScene = scene.entityCount != 0 || scene.removeCount != 0 || scene.uploadCount != 0 ||
-                            scene.materialMode != 0 || scene.sceneFlags != 0;
-            slotSequence[slot] = data.sequence;
-            slotFrame[slot] = Time.frameCount;
-            slotHadScene[slot] = hasScene;
-            slotFilled[slot] = false;
-            if (slot == lastUploadSlot && scene.uploadCount != 0) lastUploadSequence = data.sequence;
+            viewSequence[packetSlot] = sequence;
             PacketsIssued++;
-            packet = slots[slot];
+            view = index;
+            viewPacket = memory;
             return true;
         }
 
-        private int FindFreeSlot(ulong lastConsumed)
+        /// <summary>The view of <paramref name="camera"/>, or a free view claimed for it; -1 when every view is taken.</summary>
+        private int FindViewSlot(Camera camera)
         {
-            int frame = Time.frameCount;
-            for (int i = 0; i < RingSize; i++)
+            int free = -1;
+            for (int v = 0; v < viewSlots.Length; v++)
             {
-                if (slotFilled[i]) continue;
-                if (slotSequence[i] == 0 || lastConsumed >= slotSequence[i]) return i;
-            }
-            for (int i = 0; i < RingSize; i++)
-            {
-                if (slotFilled[i]) continue;
-                if (frame - slotFrame[i] > StaleSlotFrames)
+                ViewSlot slot = viewSlots[v];
+                if (slot.InUse)
                 {
-                    if (slotHadScene[i])
-                    {
-                        // Its scene records never reached the plugin: send the whole world again.
-                        Debug.LogError($"Caelix native: packet {slotSequence[i]} with scene records was never consumed by the " +
-                                       "render thread; the world is sent again.", this);
-                        ResendEverything();
-                    }
-                    slotHadScene[i] = false;
-                    return i;
+                    if (ReferenceEquals(slot.Camera, camera)) return v;
                 }
+                else if (free < 0)
+                {
+                    free = v;
+                }
+            }
+            if (free < 0) return -1;
+            ViewSlot claimed = viewSlots[free];
+            claimed.InUse = true;
+            claimed.Camera = camera;
+            claimed.IsSceneView = camera.cameraType == CameraType.SceneView;
+            claimed.LastFrame = Time.frameCount;
+            claimed.State.Reset(ModeFor(claimed.IsSceneView));
+            return free;
+        }
+
+        /// <summary>Frees view <paramref name="v"/> and its targets (the plugin's renderer must be released already).</summary>
+        private void FreeViewSlot(int v)
+        {
+            ViewSlot slot = viewSlots[v];
+            slot.Targets.Release();
+            slot.InUse = false;
+            slot.Camera = null;
+            slot.IsSceneView = false;
+            slot.State.Reset(mode);
+        }
+
+        /// <summary>
+        /// The sky target: <see cref="skyCubemap"/>, else <see cref="ReflectionProbe.defaultTexture"/>
+        /// with <see cref="skyFromReflectionProbe"/> when it is a cubemap, else none (the procedural sky).
+        /// </summary>
+        private CaelixNativeTarget SkyTarget()
+        {
+            Texture texture = null;
+            if (skyCubemap != null)
+            {
+                if (skyCubemap.dimension == TextureDimension.Cube)
+                {
+                    texture = skyCubemap;
+                }
+                else if (!warnedSkyNotCube)
+                {
+                    warnedSkyNotCube = true;
+                    Debug.LogWarning($"Caelix native: sky cubemap '{skyCubemap.name}' is not a cube texture; the procedural sky is used.", this);
+                }
+            }
+            else if (skyFromReflectionProbe)
+            {
+                Texture probe = ReflectionProbe.defaultTexture;
+                if (probe != null && probe.dimension == TextureDimension.Cube) texture = probe;
+            }
+            if (texture == null) return default;
+            if (!ReferenceEquals(texture, skyTexture) || skyTexturePtr == IntPtr.Zero)
+            {
+                skyTexture = texture;
+                skyTexturePtr = texture.GetNativeTexturePtr();
+            }
+            if (skyTexturePtr == IntPtr.Zero) return default;
+            return new CaelixNativeTarget
+            {
+                nativeTexture = skyTexturePtr,
+                nativeRenderBuffer = IntPtr.Zero,
+                width = (uint)texture.width,
+                height = (uint)texture.width,
+            };
+        }
+
+        private int FindFreeFrameSlot(in CaelixNativeStatus status)
+        {
+            for (int i = 0; i < FrameRingSize; i++)
+            {
+                if (frameSequence[i] == 0 || status.lastConsumedFrameSequence >= frameSequence[i]) return i;
             }
             return -1;
         }
 
-        private static void FreeDeferred(ulong lastConsumed)
+        private int FindFreeViewPacket(in CaelixNativeStatus status)
+        {
+            for (int i = 0; i < ViewRingSize; i++)
+            {
+                if (viewSequence[i] == 0 || status.lastConsumedViewSequence >= viewSequence[i]) return i;
+            }
+            return -1;
+        }
+
+        private bool HasFreeRelease(in CaelixNativeStatus status)
+        {
+            if (releaseRing == IntPtr.Zero) return false;
+            for (int i = 0; i < ReleaseRingSize; i++)
+            {
+                if (releaseSequence[i] == 0 || status.lastConsumedReleaseSequence >= releaseSequence[i]) return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Fills a free release packet slot and returns its address; zero when every slot is still
+        /// waiting for the render thread (the caller tries again later).
+        /// </summary>
+        private IntPtr FillRelease(uint flags, uint view)
+        {
+            if (releaseRing == IntPtr.Zero) return IntPtr.Zero;
+            CaelixNativeBridge.TryGetStatus(out CaelixNativeStatus status);
+            for (int i = 0; i < ReleaseRingSize; i++)
+            {
+                if (releaseSequence[i] != 0 && status.lastConsumedReleaseSequence < releaseSequence[i]) continue;
+                IntPtr memory = releaseRing + i * ReleasePacketBytes;
+                releaseSequence[i] = WriteRelease(memory, flags, view);
+                return memory;
+            }
+            return IntPtr.Zero;
+        }
+
+        private static unsafe ulong WriteRelease(IntPtr memory, uint flags, uint view)
+        {
+            ulong sequence = ++s_releaseSequence;
+            *(CaelixNativeReleasePacket*)memory = new CaelixNativeReleasePacket
+            {
+                header = new CaelixNativePacketHeader
+                {
+                    size = (uint)sizeof(CaelixNativeReleasePacket),
+                    version = CaelixNativeBridge.PacketVersion,
+                    kind = CaelixNativeBridge.PacketRelease,
+                    sequence = sequence,
+                },
+                flags = flags,
+                view = view,
+            };
+            return sequence;
+        }
+
+        /// <summary>
+        /// A domain reload resets the static counters to 0 but the plugin keeps its newest consumed
+        /// sequences: continue above them, or every slot would look consumed while the render
+        /// thread may still read it.
+        /// </summary>
+        private static void ContinueSequences(in CaelixNativeStatus status)
+        {
+            if (s_frameSequence < status.lastConsumedFrameSequence) s_frameSequence = status.lastConsumedFrameSequence;
+            if (s_viewSequence < status.lastConsumedViewSequence) s_viewSequence = status.lastConsumedViewSequence;
+            if (s_releaseSequence < status.lastConsumedReleaseSequence) s_releaseSequence = status.lastConsumedReleaseSequence;
+        }
+
+        private static ulong ConsumedSequence(in CaelixNativeStatus status, uint kind)
+        {
+            switch (kind)
+            {
+                case CaelixNativeBridge.PacketFrame: return status.lastConsumedFrameSequence;
+                case CaelixNativeBridge.PacketView: return status.lastConsumedViewSequence;
+                default: return status.lastConsumedReleaseSequence;
+            }
+        }
+
+        private static ulong Max(ulong[] values)
+        {
+            ulong max = 0;
+            foreach (ulong value in values) max = Math.Max(max, value);
+            return max;
+        }
+
+        /// <summary>Frees <paramref name="memory"/> now, or once the render thread consumed packet <paramref name="sequence"/> of <paramref name="kind"/>.</summary>
+        private static void FreeOrDefer(IntPtr memory, uint kind, ulong sequence, in CaelixNativeStatus status)
+        {
+            if (memory == IntPtr.Zero) return;
+            if (sequence == 0 || ConsumedSequence(status, kind) >= sequence)
+            {
+                Marshal.FreeHGlobal(memory);
+            }
+            else
+            {
+                s_deferredFree.Add((memory, kind, sequence));
+            }
+        }
+
+        private static void FreeDeferred(in CaelixNativeStatus status)
         {
             for (int i = s_deferredFree.Count - 1; i >= 0; i--)
             {
-                if (lastConsumed >= s_deferredFree[i].sequence)
+                if (ConsumedSequence(status, s_deferredFree[i].kind) >= s_deferredFree[i].sequence)
                 {
                     Marshal.FreeHGlobal(s_deferredFree[i].memory);
                     s_deferredFree.RemoveAt(i);
@@ -1304,10 +1769,10 @@ namespace Caelix.Rendering.Native
         /// -(P'12 - P12) * h / 2), because P'02 = P02 - o.x (P32 = -1) and likewise for y.
         /// Sign verified in Play Mode (P3): with this sign the TAA image of a static camera is sharp,
         /// with the opposite sign visibly blurred (Laplacian variance 169 vs 124).
-        /// <see cref="LastJitter"/> follows view 0 only.
+        /// <see cref="LastJitter"/> follows the Game cameras only (<paramref name="isGame"/>).
         /// </summary>
-        private unsafe CaelixNativeCamera BuildCamera(int view, Camera camera, Matrix4x4 jitteredProjection, int width,
-            int height)
+        private unsafe CaelixNativeCamera BuildCamera(Camera camera, Matrix4x4 jitteredProjection, int width,
+            int height, bool isGame)
         {
             var result = new CaelixNativeCamera();
             Transform t = camera.transform;
@@ -1356,15 +1821,15 @@ namespace Caelix.Rendering.Native
             }
             result.jitter[0] = jitterX;
             result.jitter[1] = jitterY;
-            if (view == 0) LastJitter = new Vector2(jitterX, jitterY);
+            if (isGame) LastJitter = new Vector2(jitterX, jitterY);
             return result;
         }
 
-        /// <summary>The options of <paramref name="view"/>, with its own mode, debug view and reset state.</summary>
-        private unsafe CaelixNativeRenderOptions BuildOptions(int view, in CaelixNativeCamera camera)
+        /// <summary>The options of <paramref name="slot"/>, with its own mode, debug view and reset state.</summary>
+        private unsafe CaelixNativeRenderOptions BuildOptions(ViewSlot slot, in CaelixNativeCamera camera)
         {
-            RenderMode viewMode = ModeForView(view);
-            ViewFrameState state = viewFrames[view];
+            RenderMode viewMode = ModeFor(slot.IsSceneView);
+            ViewFrameState state = slot.State;
             bool lighting = viewMode != RenderMode.Primary;
             uint flags = FlagFlipY;
             if (viewMode == RenderMode.Primary && shading) flags |= FlagShading;
@@ -1374,7 +1839,7 @@ namespace Caelix.Rendering.Native
 
             var o = new CaelixNativeRenderOptions
             {
-                debugView = (uint)DebugViewForView(view),
+                debugView = (uint)DebugViewFor(slot.IsSceneView),
                 flags = flags,
                 // Unity on Vulkan uses reversed Z (GL.GetGPUProjectionMatrix).
                 missDepth = SystemInfo.usesReversedZBuffer ? 0.0f : 1.0f,
@@ -1385,6 +1850,9 @@ namespace Caelix.Rendering.Native
                 exposure = exposure,
                 sunAngularRadius = sunAngularRadiusDegrees * Mathf.Deg2Rad,
                 bounceCountTransparent = (uint)Mathf.Clamp(bouncesTransparent, 0, 15),
+                emissionScale = emissionScale,
+                fogDensity = Mathf.Max(0.0f, fogDensity),
+                // sky stays zero: the plugin fills it from the view packet's sky target.
             };
             Vector3 sun = lighting ? sunDirection : primarySunDirection;
             o.sunDir[0] = sun.x; o.sunDir[1] = sun.y; o.sunDir[2] = sun.z;
@@ -1393,6 +1861,7 @@ namespace Caelix.Rendering.Native
             o.skyZenith[0] = skyZenith.x; o.skyZenith[1] = skyZenith.y; o.skyZenith[2] = skyZenith.z;
             o.skyHorizon[0] = skyHorizon.x; o.skyHorizon[1] = skyHorizon.y; o.skyHorizon[2] = skyHorizon.z;
             o.skyGround[0] = skyGround.x; o.skyGround[1] = skyGround.y; o.skyGround[2] = skyGround.z;
+            o.fogColor[0] = fogColor.r; o.fogColor[1] = fogColor.g; o.fogColor[2] = fogColor.b;
 
             // Reset rules of the Rust host: the reference mode restarts when the camera (jitter
             // excluded) or an option changes; both lighting modes on a mode change and on

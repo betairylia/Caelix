@@ -13,9 +13,10 @@ namespace Caelix.Rendering.Native
     /// Four passes, for Game cameras and (unless <see cref="CaelixNativeRenderer.SceneView"/> is
     /// Off) Scene view cameras:
     /// <list type="number">
-    /// <item><see cref="RenderPass"/> (before opaques) fills the camera part of this frame's packet
-    /// (camera, jitter from URP's jittered projection, options, targets) and issues the plugin's
-    /// render event. The plugin records the trace into Unity's command buffer and writes four
+    /// <item><see cref="RenderPass"/> (before opaques) asks for the camera's view packet (camera,
+    /// jitter from URP's jittered projection, options, the view's targets, the sky cubemap) and
+    /// issues the plugin's render event with it, after a release event when a target was
+    /// replaced. The plugin records the trace into Unity's command buffer and writes four
     /// targets: colour, device depth, motion and albedo (alpha = coverage). The library writes them
     /// with <c>CAELIX_RENDER_FLAG_FLIP_Y</c>, so their rows already have Unity's order (row 0 at the
     /// bottom) and no pass flips.</item>
@@ -29,17 +30,18 @@ namespace Caelix.Rendering.Native
     /// <item><see cref="PresentPass"/> stage 1 (after the skybox) blends the pixels with
     /// 0.01 &lt;= coverage &lt; 0.99 over the skybox (premultiplied colour), no depth write.</item>
     /// </list>
-    /// The scene itself is fed by <see cref="CaelixNativeRenderer.Tick"/> through the same packets.
+    /// The scene itself is fed by <see cref="CaelixNativeRenderer.Tick"/> through its own frame
+    /// packet, one per Unity frame, issued before the cameras render: every camera of a frame
+    /// draws the same scene state. Nothing is drawn while the renderer has no live session.
     /// <para>
-    /// Enable exactly one Caelix feature per renderer asset. The Game view is view 0 and the Scene
-    /// view is view 1; each view has its own plugin renderer (internal targets, NRD history) over
-    /// the shared scene, so the two never mix their denoiser history. Several Scene views share
-    /// view 1: when their sizes differ, the view's targets are recreated at every change of size,
-    /// which costs a release event per frame (a known limitation). Scene view cameras have no TAA,
-    /// so the motion pass does not run for them.
+    /// Enable exactly one Caelix feature per renderer asset. Views are per camera, up to
+    /// <see cref="CaelixNativeBridge.MaxViews"/>: every Game or Scene view camera gets its own view
+    /// with its own plugin renderer (internal targets, NRD history) over the shared scene, so
+    /// cameras never mix their denoiser history. A camera beyond the limit is not drawn. Scene view
+    /// cameras have no TAA, so the motion pass does not run for them.
     /// </para>
-    /// The render event goes through <see cref="CommandBuffer.IssuePluginEventAndData"/> on the
-    /// native command buffer of an unsafe pass (<see cref="CommandBufferHelpers.GetNativeCommandBuffer"/>):
+    /// The render and release events go through <see cref="CommandBuffer.IssuePluginEventAndData"/>
+    /// on the native command buffer of an unsafe pass (<see cref="CommandBufferHelpers.GetNativeCommandBuffer"/>):
     /// the RenderGraph command buffer types do not expose plugin events.
     /// </remarks>
     public class CaelixNativeRendererFeature : ScriptableRendererFeature
@@ -162,8 +164,8 @@ namespace Caelix.Rendering.Native
                 internal IntPtr EventFunc;
                 internal int RenderEventId;
                 internal int ReleaseEventId;
-                internal bool ReleaseViews;
                 internal IntPtr Packet;
+                internal IntPtr ReleasePacket;
             }
 
             public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
@@ -179,10 +181,9 @@ namespace Caelix.Rendering.Native
                 // it sets up the camera, and GetProjectionMatrix() returns the jittered projection.
                 UniversalCameraData cameraData = frameData.Get<UniversalCameraData>();
                 RenderTextureDescriptor descriptor = cameraData.cameraTargetDescriptor;
-                // View 0 = Game view, view 1 = Scene view: each has its own plugin renderer.
-                int view = cameraData.cameraType == CameraType.SceneView ? 1 : 0;
-                if (!native.TryPrepareFrame(view, cameraData.camera, cameraData.GetProjectionMatrix(), descriptor.width,
-                        descriptor.height, out IntPtr packet, out bool releaseViews))
+                // Every camera has its own view (plugin renderer and targets).
+                if (!native.TryPrepareFrame(cameraData.camera, cameraData.GetProjectionMatrix(), descriptor.width,
+                        descriptor.height, out int view, out IntPtr packet, out IntPtr releasePacket))
                 {
                     return;
                 }
@@ -198,8 +199,8 @@ namespace Caelix.Rendering.Native
                     passData.EventFunc = CaelixNativeBridge.RenderEventFunc;
                     passData.RenderEventId = status.renderEventId;
                     passData.ReleaseEventId = status.releaseEventId;
-                    passData.ReleaseViews = releaseViews;
                     passData.Packet = packet;
+                    passData.ReleasePacket = releasePacket;
 
                     builder.UseTexture(frame.Color, AccessFlags.Write);
                     builder.UseTexture(frame.Depth, AccessFlags.Write);
@@ -209,11 +210,11 @@ namespace Caelix.Rendering.Native
                     builder.SetRenderFunc((PassData data, UnsafeGraphContext context) =>
                     {
                         CommandBuffer cmd = CommandBufferHelpers.GetNativeCommandBuffer(context.cmd);
-                        if (data.ReleaseViews)
+                        if (data.ReleasePacket != IntPtr.Zero)
                         {
-                            // The packet goes along: when its encoding differs from the plugin's
-                            // scene, the release event (queue idle) also recreates the scene.
-                            cmd.IssuePluginEventAndData(data.EventFunc, data.ReleaseEventId, data.Packet);
+                            // A target of some view was replaced: the plugin drops its cached image
+                            // views (queue idle) before any render uses the new textures.
+                            cmd.IssuePluginEventAndData(data.EventFunc, data.ReleaseEventId, data.ReleasePacket);
                         }
                         cmd.IssuePluginEventAndData(data.EventFunc, data.RenderEventId, data.Packet);
                     });
