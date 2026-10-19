@@ -320,7 +320,7 @@ What the numbers say:
 
 ## 9. Reproduction
 
-Everything is in `F:\RP_Games\Caelix-family\Artifacts\caelix-benchmarks\`:
+Everything is in (insert local path | not uploaded to repo):
 
 - `README.md` (this folder's index), `report.md` (this report), `notes/` (the research notes per harness and the literature review with sources), `scenes/` (converted scenes + `README.md` with the conversion table and coordinate offsets), `scripts/` (converters, `run_caelix.py`, `run_voxelrt.py`, `run_naadf.py`, `aggregate.py`, `gpu_lock.py`), `results/<harness>/*.json` (one file per run, schema in `notes/results-schema.md`), `results/reference-views/`, `results/experiments/`, `tables/`, `figures/`.
 - Code branches: `bench/caelix-benchmarks-20261018` in `Caelix-Renderer`, `D:\RP_CG\VoxelRT` and `Research/NAADF`.
