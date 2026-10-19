@@ -3,13 +3,14 @@ using System.Collections.Generic;
 using Unity.Collections.LowLevel.Unsafe;
 using UnityEngine;
 using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
 
 namespace Caelix.Rendering.Native
 {
     /// <summary>
     /// The per-camera views of <see cref="CaelixNativeRenderer"/>: the view slots with their targets
     /// and reset state, the view packet of a camera render (<see cref="TryPrepareFrame"/>), and the
-    /// camera, options and sky target that go into it.
+    /// camera, options, upscaler request and sky target that go into it.
     /// </summary>
     public partial class CaelixNativeRenderer
     {
@@ -53,6 +54,20 @@ namespace Caelix.Rendering.Native
             public int LastFrame;
             public readonly CaelixNativeViewTargets Targets = new CaelixNativeViewTargets();
             public readonly ViewFrameState State = new ViewFrameState();
+            /// <summary>The upscaler key whose "not available" warning was logged for this view.</summary>
+            public CaelixNativeUpscalerStatus WarnedUnsupported;
+            public bool HasWarnedUnsupported;
+        }
+
+        /// <summary>The upscaler of one view frame (see <see cref="ResolveUpscaler"/>).</summary>
+        private struct UpscalerRequest
+        {
+            /// <summary><c>CaelixUpscaler</c>; 0 = no upscaler for this frame.</summary>
+            public uint Upscaler;
+            public uint Quality;
+            /// <summary>The render size from the plugin's query; 0 while it is not known yet.</summary>
+            public uint RenderWidth;
+            public uint RenderHeight;
         }
 
         private readonly ViewSlot[] viewSlots = CreateViewSlots();
@@ -62,6 +77,7 @@ namespace Caelix.Rendering.Native
         private bool warnedJitter;
         private bool warnedNoView;
         private bool warnedSkyNotCube;
+        private bool warnedUpscalerTaa;
 
         // Sky cubemap: GetNativeTexturePtr may synchronize with the render thread, so the pointer is
         // read once per texture reference.
@@ -139,6 +155,9 @@ namespace Caelix.Rendering.Native
         /// nonzero when a target of any view was replaced: the caller then issues the release event
         /// with it before the render event. False when no session is live, every view is taken, or
         /// no packet slot is free (the frame of this camera is skipped and nothing is drawn).
+        /// With an upscaler, the colour target keeps <paramref name="width"/> x <paramref name="height"/>
+        /// and the depth, motion and albedo targets get the render size that the plugin's status
+        /// reports for the view's key (see <see cref="ResolveUpscaler"/>).
         /// </summary>
         public bool TryPrepareFrame(Camera camera, Matrix4x4 jitteredProjection, int width, int height,
             out int view, out IntPtr viewPacket, out IntPtr releasePacket)
@@ -173,8 +192,11 @@ namespace Caelix.Rendering.Native
 
             ViewSlot slot = viewSlots[index];
             slot.LastFrame = Time.frameCount;
+            UpscalerRequest upscale = ResolveUpscaler(slot, index, camera, status, width, height);
+            int geometryWidth = upscale.RenderWidth != 0 ? (int)upscale.RenderWidth : width;
+            int geometryHeight = upscale.RenderHeight != 0 ? (int)upscale.RenderHeight : height;
             // Replacing a target bumps the shared generation, which needs a release event first.
-            if (slot.Targets.Ensure(width, height, index)) s_generation++;
+            if (slot.Targets.Ensure(width, height, geometryWidth, geometryHeight, index)) s_generation++;
             if (s_generation != s_releasedGeneration)
             {
                 releasePacket = rings.FillRelease(CaelixNativeBridge.ReleaseTargetViews, 0, status);
@@ -200,14 +222,14 @@ namespace Caelix.Rendering.Native
                 view = (uint)index,
                 flags = isGame ? CaelixNativeBridge.ViewReportTimings : 0u,
                 targetGeneration = s_generation,
-                color = slot.Targets.Color.ToPacket(width, height),
-                depth = slot.Targets.Depth.ToPacket(width, height),
-                motion = slot.Targets.Motion.ToPacket(width, height),
-                albedo = slot.Targets.Albedo.ToPacket(width, height),
+                color = slot.Targets.Color.ToPacket(),
+                depth = slot.Targets.Depth.ToPacket(),
+                motion = slot.Targets.Motion.ToPacket(),
+                albedo = slot.Targets.Albedo.ToPacket(),
                 sky = SkyTarget(),
             };
-            data.camera = BuildCamera(camera, jitteredProjection, width, height, isGame);
-            data.options = BuildOptions(slot, data.camera);
+            data.camera = BuildCamera(camera, jitteredProjection, width, height, isGame, upscale);
+            data.options = BuildOptions(slot, data.camera, upscale);
             unsafe
             {
                 *(CaelixNativeViewPacket*)memory = data;
@@ -241,7 +263,70 @@ namespace Caelix.Rendering.Native
             claimed.IsSceneView = camera.cameraType == CameraType.SceneView;
             claimed.LastFrame = Time.frameCount;
             claimed.State.Reset(ModeFor(claimed.IsSceneView));
+            claimed.HasWarnedUnsupported = false;
             return free;
+        }
+
+        /// <summary>
+        /// The upscaler of this frame of <paramref name="slot"/>. None unless the view is in the path
+        /// trace mode and <see cref="upscaler"/> is set. The plugin queries the upscaler for the key
+        /// (upscaler, quality, <paramref name="width"/> x <paramref name="height"/>) and publishes the
+        /// result in its status: when the status entry of the view has this key and says supported,
+        /// the request carries its render size (the geometry targets get that size); before that the
+        /// render size is 0 (geometry at the camera size, and the plugin renders this frame without
+        /// the upscaler). When the entry says unsupported, the request is none (one warning per key).
+        /// </summary>
+        private UpscalerRequest ResolveUpscaler(ViewSlot slot, int view, Camera camera, in CaelixNativeStatus status,
+            int width, int height)
+        {
+            var request = new UpscalerRequest();
+            if (upscaler == Upscaler.None || ModeFor(slot.IsSceneView) != RenderMode.PathTrace) return request;
+            request.Upscaler = (uint)upscaler;
+            request.Quality = (uint)upscaleQuality;
+
+            CaelixNativeUpscalerStatus entry = status.Upscaler(view);
+            if (entry.Matches(request.Upscaler, request.Quality, width, height))
+            {
+                if (entry.supported == 0 || entry.renderWidth == 0 || entry.renderHeight == 0)
+                {
+                    if (!slot.HasWarnedUnsupported || !slot.WarnedUnsupported.Matches(entry.upscaler, entry.quality,
+                            (int)entry.outputWidth, (int)entry.outputHeight))
+                    {
+                        slot.HasWarnedUnsupported = true;
+                        slot.WarnedUnsupported = entry;
+                        Debug.LogWarning($"Caelix native: {upscaler} {upscaleQuality} at {width}x{height} is not available " +
+                                         $"(reason {entry.reason}: {UpscalerReasonText(entry.reason)}); view {view} renders " +
+                                         "without the upscaler.", this);
+                    }
+                    return new UpscalerRequest();
+                }
+                request.RenderWidth = entry.renderWidth;
+                request.RenderHeight = entry.renderHeight;
+            }
+
+            if (!warnedUpscalerTaa && camera.TryGetComponent(out UniversalAdditionalCameraData cameraData) &&
+                cameraData.antialiasing == AntialiasingMode.TemporalAntiAliasing)
+            {
+                warnedUpscalerTaa = true;
+                Debug.LogWarning($"Caelix native: DLSS replaces TAA; set the anti-aliasing of camera '{camera.name}' to None.", this);
+            }
+            return request;
+        }
+
+        /// <summary>Text of a <c>CaelixUpscalerUnsupportedReason</c>.</summary>
+        private static string UpscalerReasonText(uint reason)
+        {
+            switch (reason)
+            {
+                case 0: return "available";
+                case 1: return "the library was built without the upscaler";
+                case 2: return "NGX did not start (NVIDIA driver, DLL or Vulkan device extension missing; see the Editor log)";
+                case 3: return "the GPU or the NGX runtime lacks the feature";
+                case 4: return "the driver is too old";
+                case 5: return "the upscaler has no render size for this quality";
+                case 6: return "bad argument (output below 64 x 32, or an unknown value)";
+                default: return "unknown reason";
+            }
         }
 
         /// <summary>True for a view in use whose camera is gone or has not rendered for <see cref="ViewIdleFrames"/>.</summary>
@@ -261,6 +346,7 @@ namespace Caelix.Rendering.Native
             slot.Camera = null;
             slot.IsSceneView = false;
             slot.State.Reset(mode);
+            slot.HasWarnedUnsupported = false;
         }
 
         /// <summary>
@@ -312,10 +398,15 @@ namespace Caelix.Rendering.Native
         /// -(P'12 - P12) * h / 2), because P'02 = P02 - o.x (P32 = -1) and likewise for y.
         /// Sign verified in Play Mode (P3): with this sign the TAA image of a static camera is sharp,
         /// with the opposite sign visibly blurred (Laplacian variance 169 vs 124).
+        /// With an upscaler (<paramref name="upscale"/>) URP's jitter is ignored: the jitter is the
+        /// library's Halton(2, 3) sequence over <see cref="Time.frameCount"/>, with the phase count
+        /// the DLSS guide recommends for the render and output widths (render width unknown yet =
+        /// ratio 1). The aspect and the projection stay those of the camera size: the render-size
+        /// image covers the same frustum.
         /// <see cref="LastJitter"/> follows the Game cameras only (<paramref name="isGame"/>).
         /// </summary>
         private unsafe CaelixNativeCamera BuildCamera(Camera camera, Matrix4x4 jitteredProjection, int width,
-            int height, bool isGame)
+            int height, bool isGame, in UpscalerRequest upscale)
         {
             var result = new CaelixNativeCamera();
             Transform t = camera.transform;
@@ -347,6 +438,16 @@ namespace Caelix.Rendering.Native
                 }
             }
 
+            if (upscale.Upscaler != 0)
+            {
+                uint phases = CaelixNativeLibrary.UpscalerJitterPhases(upscale.Upscaler, upscale.RenderWidth, (uint)width);
+                Vector2 halton = CaelixNativeLibrary.JitterHalton((uint)Time.frameCount, phases);
+                result.jitter[0] = halton.x;
+                result.jitter[1] = halton.y;
+                if (isGame) LastJitter = halton;
+                return result;
+            }
+
             float jitterX = (jitteredProjection.m02 - gl.m02) * 0.5f * width;
             float jitterY = -(jitteredProjection.m12 - gl.m12) * 0.5f * height;
             if (!(Mathf.Abs(jitterX) <= 1.0f && Mathf.Abs(jitterY) <= 1.0f))
@@ -368,8 +469,13 @@ namespace Caelix.Rendering.Native
             return result;
         }
 
-        /// <summary>The options of <paramref name="slot"/>, with its own mode, debug view and reset state.</summary>
-        private unsafe CaelixNativeRenderOptions BuildOptions(ViewSlot slot, in CaelixNativeCamera camera)
+        /// <summary>
+        /// The options of <paramref name="slot"/>, with its own mode, debug view, reset state and
+        /// upscaler. <see cref="ResetAccumulation"/> also resets the upscaler's history (the library
+        /// drops it with <c>reset_accumulation</c>).
+        /// </summary>
+        private unsafe CaelixNativeRenderOptions BuildOptions(ViewSlot slot, in CaelixNativeCamera camera,
+            in UpscalerRequest upscale)
         {
             RenderMode viewMode = ModeFor(slot.IsSceneView);
             ViewFrameState state = slot.State;
@@ -397,6 +503,17 @@ namespace Caelix.Rendering.Native
                 fogDensity = Mathf.Max(0.0f, fogDensity),
                 // sky stays zero: the plugin fills it from the view packet's sky target.
             };
+            if (upscale.Upscaler != 0)
+            {
+                // Sent also while the render size is not known yet: that is how the plugin learns the key.
+                o.upscaler = upscale.Upscaler;
+                o.upscaleQuality = upscale.Quality;
+                o.upscalePreset = (uint)Mathf.Clamp(upscalePreset, 0, 15);
+                if (upscale.Upscaler == CaelixNativeBridge.UpscalerDlssSr && upscaleAutoExposure)
+                {
+                    o.upscaleFlags |= CaelixNativeBridge.UpscaleFlagAutoExposure;
+                }
+            }
             Vector3 sun = lighting ? sunDirection : primarySunDirection;
             o.sunDir[0] = sun.x; o.sunDir[1] = sun.y; o.sunDir[2] = sun.z;
             o.skyColor[0] = primarySkyColor.x; o.skyColor[1] = primarySkyColor.y; o.skyColor[2] = primarySkyColor.z;

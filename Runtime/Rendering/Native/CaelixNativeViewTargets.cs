@@ -50,19 +50,32 @@ namespace Caelix.Rendering.Native
             RenderBufferPtr = IntPtr.Zero;
         }
 
-        public CaelixNativeTarget ToPacket(int width, int height) => new CaelixNativeTarget
+        /// <summary>The packet target with this texture's own size (absent when there is no texture).</summary>
+        public CaelixNativeTarget ToPacket() => Texture == null ? default : new CaelixNativeTarget
         {
             nativeTexture = TexturePtr,
             nativeRenderBuffer = RenderBufferPtr,
-            width = (uint)width,
-            height = (uint)height,
+            width = (uint)Texture.width,
+            height = (uint)Texture.height,
         };
+
+        /// <summary>Recreates the texture when it does not have the size. True when it was replaced.</summary>
+        public bool Ensure(string name, GraphicsFormat format, int width, int height)
+        {
+            if (Matches(width, height)) return false;
+            Release();
+            Create(name, format, width, height);
+            return true;
+        }
     }
 
     /// <summary>
-    /// The four targets of one view at the view's camera size: colour RGBA16F, depth R32F, motion
-    /// RGBA16F, albedo RGBA8 UNORM (the library's accepted formats), all with random write. The
-    /// library writes them with <c>CAELIX_RENDER_FLAG_FLIP_Y</c>, so they have Unity's row order.
+    /// The four targets of one view: colour RGBA16F at the camera size; depth R32F, motion RGBA16F
+    /// and albedo RGBA8 UNORM at the geometry size (the camera size, or the upscaler's render size
+    /// while the view upscales). These are the library's accepted formats, all with random write.
+    /// The library writes them with <c>CAELIX_RENDER_FLAG_FLIP_Y</c>, so they have Unity's row order.
+    /// The present shader samples every target by UV, so render-size geometry targets need no
+    /// change there.
     /// </summary>
     internal sealed class CaelixNativeViewTargets
     {
@@ -71,20 +84,26 @@ namespace Caelix.Rendering.Native
         public readonly CaelixNativeTargetTexture Motion = new CaelixNativeTargetTexture();
         public readonly CaelixNativeTargetTexture Albedo = new CaelixNativeTargetTexture();
 
-        public bool Matches(int width, int height) =>
-            Color.Matches(width, height) && Depth.Matches(width, height) &&
-            Motion.Matches(width, height) && Albedo.Matches(width, height);
+        public bool Matches(int colorWidth, int colorHeight, int geometryWidth, int geometryHeight) =>
+            Color.Matches(colorWidth, colorHeight) && Depth.Matches(geometryWidth, geometryHeight) &&
+            Motion.Matches(geometryWidth, geometryHeight) && Albedo.Matches(geometryWidth, geometryHeight);
 
-        /// <summary>Recreates all four when any does not match the size. True when they were replaced.</summary>
-        public bool Ensure(int width, int height, int view)
+        /// <summary>
+        /// Recreates each target that does not have its size: the colour at
+        /// <paramref name="colorWidth"/> x <paramref name="colorHeight"/>, the geometry targets at
+        /// <paramref name="geometryWidth"/> x <paramref name="geometryHeight"/>. True when any was replaced.
+        /// </summary>
+        public bool Ensure(int colorWidth, int colorHeight, int geometryWidth, int geometryHeight, int view)
         {
-            if (Matches(width, height)) return false;
-            Release();
-            Color.Create($"Caelix Native Colour (view {view})", GraphicsFormat.R16G16B16A16_SFloat, width, height);
-            Depth.Create($"Caelix Native Depth (view {view})", GraphicsFormat.R32_SFloat, width, height);
-            Motion.Create($"Caelix Native Motion (view {view})", GraphicsFormat.R16G16B16A16_SFloat, width, height);
-            Albedo.Create($"Caelix Native Albedo (view {view})", GraphicsFormat.R8G8B8A8_UNorm, width, height);
-            return true;
+            bool replaced = Color.Ensure($"Caelix Native Colour (view {view})", GraphicsFormat.R16G16B16A16_SFloat,
+                colorWidth, colorHeight);
+            replaced |= Depth.Ensure($"Caelix Native Depth (view {view})", GraphicsFormat.R32_SFloat,
+                geometryWidth, geometryHeight);
+            replaced |= Motion.Ensure($"Caelix Native Motion (view {view})", GraphicsFormat.R16G16B16A16_SFloat,
+                geometryWidth, geometryHeight);
+            replaced |= Albedo.Ensure($"Caelix Native Albedo (view {view})", GraphicsFormat.R8G8B8A8_UNorm,
+                geometryWidth, geometryHeight);
+            return replaced;
         }
 
         public void Release()

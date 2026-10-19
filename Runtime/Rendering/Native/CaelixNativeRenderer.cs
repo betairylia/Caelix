@@ -24,8 +24,15 @@ namespace Caelix.Rendering.Native
     /// event runs on the render thread before the cameras of the frame: the plugin flushes the
     /// scene once per frame with Unity's own frame numbers, and every view renders the same scene
     /// state. Each camera render, the feature asks for a view packet (<see cref="TryPrepareFrame"/>):
-    /// the view index, the camera (with URP's TAA jitter), the options, the view's targets and the
-    /// sky cubemap; it issues the plugin's render event with it.
+    /// the view index, the camera (with URP's TAA jitter, or the Halton jitter of the upscaler), the
+    /// options, the view's targets and the sky cubemap; it issues the plugin's render event with it.
+    /// </para>
+    /// <para>
+    /// Upscaler (path trace mode only): with <see cref="UpscalerKind"/> set, the plugin queries DLSS
+    /// for the view's key (upscaler, quality, camera size) and publishes the render size in its
+    /// status. From the next frame on, the view's depth, motion and albedo targets have that render
+    /// size and the plugin upscales into the camera-sized colour target; the first frame of a key
+    /// renders without the upscaler. The camera's own TAA should be off (DLSS replaces it).
     /// </para>
     /// <para>
     /// Sessions: the scene's block encoding, its material table and its staging ring size are
@@ -81,6 +88,32 @@ namespace Caelix.Rendering.Native
             Motion = 8,
             Material = 9,
             NrdSpecular = 10,
+        }
+
+        /// <summary>The upscaler of the path trace mode (values = caelix.h <c>CaelixUpscaler</c>).</summary>
+        public enum Upscaler
+        {
+            /// <summary>No upscaler: every target has the camera's size.</summary>
+            None = 0,
+            /// <summary>NVIDIA DLSS Super Resolution; NRD stays the denoiser.</summary>
+            DlssSuperResolution = 1,
+            /// <summary>NVIDIA DLSS Ray Reconstruction; replaces NRD.</summary>
+            DlssRayReconstruction = 2,
+        }
+
+        /// <summary>The render size per output size of the upscaler (values = caelix.h <c>CaelixUpscaleQuality</c>).</summary>
+        public enum UpscaleQuality
+        {
+            /// <summary>Render size = output size (anti-aliasing only).</summary>
+            Dlaa = 0,
+            /// <summary>About 0.67 per axis.</summary>
+            Quality = 1,
+            /// <summary>About 0.58 per axis.</summary>
+            Balanced = 2,
+            /// <summary>0.5 per axis.</summary>
+            Performance = 3,
+            /// <summary>About 0.33 per axis.</summary>
+            UltraPerformance = 4,
         }
 
         /// <summary>The block encoding the plugin's scene uses.</summary>
@@ -166,10 +199,27 @@ namespace Caelix.Rendering.Native
         [SerializeField, Min(0.0f), Tooltip("Every mode: multiplies the emission of every material (0 is treated as 1).")]
         private float emissionScale = 1.0f;
 
+        [Header("Upscaler")]
+        [SerializeField, Tooltip("Path trace mode only: DLSS Super Resolution (NRD stays the denoiser) or DLSS Ray " +
+                                 "Reconstruction (replaces NRD). The view traces at the upscaler's render size and DLSS " +
+                                 "writes the camera size. Set the camera's anti-aliasing to None: DLSS replaces TAA.")]
+        private Upscaler upscaler = Upscaler.None;
+        [SerializeField, Tooltip("Render size per output size: DLAA 1.0, Quality ~0.67, Balanced ~0.58, Performance 0.5, " +
+                                 "Ultra Performance ~0.33 per axis.")]
+        private UpscaleQuality upscaleQuality = UpscaleQuality.Quality;
+        [SerializeField, Range(0, 15), Tooltip("0 = the NGX default preset. Else the raw NGX preset value: Super Resolution " +
+                                               "J = 10, K = 11, L = 12, M = 13; Ray Reconstruction D = 4, E = 5, F = 6.")]
+        private int upscalePreset = 0;
+        [SerializeField, Tooltip("DLSS Super Resolution only: NGX auto exposure instead of a fixed exposure of 1.")]
+        private bool upscaleAutoExposure = false;
+
         /// <summary>The enabled instance the renderer feature draws. One at a time.</summary>
         public static CaelixNativeRenderer Active { get; private set; }
 
-        /// <summary>The jitter of the newest prepared Game camera frame, in pixels (x right, y down).</summary>
+        /// <summary>
+        /// The jitter of the newest prepared Game camera frame, in pixels (x right, y down): URP's TAA
+        /// jitter, or the Halton jitter while the view uses an upscaler.
+        /// </summary>
         public Vector2 LastJitter { get; private set; }
 
         /// <summary>View packets issued since this component was enabled.</summary>
@@ -220,6 +270,13 @@ namespace Caelix.Rendering.Native
         public float FogDensity { get => fogDensity; set => fogDensity = Mathf.Max(0f, value); }
         public Color FogColor { get => fogColor; set => fogColor = value; }
         public float EmissionScale { get => emissionScale; set => emissionScale = Mathf.Max(0f, value); }
+        /// <summary>The upscaler of the path trace mode (live: takes effect with the next frame of every view).</summary>
+        public Upscaler UpscalerKind { get => upscaler; set => upscaler = value; }
+        public UpscaleQuality UpscaleQualityLevel { get => upscaleQuality; set => upscaleQuality = value; }
+        /// <summary>0 = the NGX default; else the raw NGX preset value (0 .. 15).</summary>
+        public int UpscalePreset { get => upscalePreset; set => upscalePreset = Mathf.Clamp(value, 0, 15); }
+        /// <summary>DLSS Super Resolution only: NGX auto exposure.</summary>
+        public bool UpscaleAutoExposure { get => upscaleAutoExposure; set => upscaleAutoExposure = value; }
 
         /// <summary>
         /// Staging ring of the plugin's scene in MiB. Applied when a session starts; a change during

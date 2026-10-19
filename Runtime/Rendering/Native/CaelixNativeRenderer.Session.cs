@@ -291,14 +291,24 @@ namespace Caelix.Rendering.Native
 
         private void LogStatus(in CaelixNativeStatus s)
         {
+            string upscalers = "";
+            for (int v = 0; v < CaelixNativeBridge.MaxViews; v++)
+            {
+                if ((s.liveViews & (1u << v)) == 0) continue;
+                CaelixNativeUpscalerStatus u = s.Upscaler(v);
+                if (u.upscaler == 0 && u.quality == 0 && u.outputWidth == 0 && u.outputHeight == 0) continue;
+                upscalers += $"; view {v}: upscaler {u.upscaler} quality {u.quality} {u.renderWidth}x{u.renderHeight} -> " +
+                             $"{u.outputWidth}x{u.outputHeight} (reason {u.reason})";
+            }
             Debug.Log($"Caelix native status (frame {Time.frameCount}): frames {s.frames}, renders {s.renders}, failed " +
                       $"{s.failedEvents}, last error {s.lastError}, resets {s.sceneResets}, live views 0x{s.liveViews:X2}, " +
                       $"encoding {s.sceneEncoding}, entities {s.entities}, groups {s.groups}, resident {s.bricksResident}, " +
                       $"pending C# {BricksPendingCSharp}, in flight {rings.BricksInFlight(s)}, free/cap {s.uploadBricksFree}/" +
                       $"{s.uploadBricksCap}, dropped {s.bricksDropped}, as_builds_pending {s.asBuildsPending}, GPU flush " +
                       $"{s.flushMs:F3} ms trace {s.traceMs:F3} ms composite {s.compositeMs:F3} ms denoise {s.denoiseMs:F3} ms " +
-                      $"(view {s.timingsView}); Tick {LastTickMilliseconds:F3} ms, deferred {TicksDeferred}, skipped " +
-                      $"{PacketsSkipped}; jitter ({LastJitter.x:F3}, {LastJitter.y:F3}) px.", this);
+                      $"upscale {s.upscaleMs:F3} ms (view {s.timingsView}); Tick {LastTickMilliseconds:F3} ms, deferred " +
+                      $"{TicksDeferred}, skipped {PacketsSkipped}; jitter ({LastJitter.x:F3}, {LastJitter.y:F3}) px; upscaler " +
+                      $"extensions {s.upscalerExtensions}{upscalers}.", this);
         }
     }
 }

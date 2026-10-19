@@ -36,8 +36,9 @@ Shader "Hidden/Caelix/NativePresent"
         TEXTURE2D(_CaelixNativeAlbedo);
         float _CaelixPrimaryView;
 
-        // Point-sampled: the targets have the camera's size, and depth or motion must never be
-        // interpolated across a silhouette.
+        // Point-sampled by UV: the colour has the camera's size, depth, motion and albedo the camera's
+        // size or the upscaler's render size (UV sampling scales them), and depth or motion must
+        // never be interpolated across a silhouette.
         float4 SampleTarget(Texture2D tex, float2 uv)
         {
             return SAMPLE_TEXTURE2D_LOD(tex, sampler_PointClamp, uv, 0);
