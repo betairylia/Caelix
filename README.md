@@ -21,5 +21,6 @@ This package contains rendering, authoring, and world orchestration. It uses Cae
 
 - [Caelix-Core](https://github.com/betairylia/Caelix-Core) — Basic voxel data layouts + I/O.
 - [Caelix-physics](https://github.com/betairylia/Caelix-physics) — Voxel fork of Unity Physics.
+- [Caelix-Renderer](https://github.com/betairylia/Caelix-Renderer) — Caelix's Vulkan native rendering plugin.
 - [Caelix](https://github.com/betairylia/Caelix) — Custom voxel rendering & physics engine backend.
 - [Titania](https://github.com/betairylia/Titania) — A voxel sandbox project built on Caelix, demonstrates Caelix usage.
