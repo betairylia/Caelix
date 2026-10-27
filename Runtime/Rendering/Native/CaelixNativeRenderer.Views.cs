@@ -238,13 +238,6 @@ namespace Caelix.Rendering.Native
                 }
                 return false;
             }
-            IntPtr memory = rings.TakeViewPacket(status, out ulong sequence);
-            if (memory == IntPtr.Zero)
-            {
-                PacketsSkipped++;
-                return false;
-            }
-
             ViewSlot slot = viewSlots[index];
             slot.LastFrame = Time.frameCount;
             UpscalerRequest upscale = ResolveUpscaler(slot, index, camera, status, width, height);
@@ -255,14 +248,20 @@ namespace Caelix.Rendering.Native
             if (slot.Targets.Ensure(width, height, geometryWidth, geometryHeight, index, voxelIdTarget)) s_generation++;
             if (s_generation != s_releasedGeneration)
             {
+                // The release goes alone this frame and the view renders from the next frame on: a
+                // player with split graphics jobs runs the release event (queue access, flush) later
+                // than a render event issued next to it, which would then use the plugin's cached
+                // views of destroyed textures (see sessionReleaseSequence).
                 releasePacket = rings.FillRelease(CaelixNativeBridge.ReleaseTargetViews, 0, status);
-                if (releasePacket == IntPtr.Zero)
-                {
-                    // The plugin may still cache a view of a destroyed texture: no render without the release.
-                    PacketsSkipped++;
-                    return false;
-                }
-                s_releasedGeneration = s_generation;
+                if (releasePacket != IntPtr.Zero) s_releasedGeneration = s_generation;
+                PacketsSkipped++;
+                return false;
+            }
+            IntPtr memory = rings.TakeViewPacket(status, out ulong sequence);
+            if (memory == IntPtr.Zero)
+            {
+                PacketsSkipped++;
+                return false;
             }
 
             bool isGame = camera.cameraType == CameraType.Game;

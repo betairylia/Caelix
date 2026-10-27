@@ -28,6 +28,16 @@ namespace Caelix.Rendering.Native
         private int sessionLightHeapMiB;
         /// <summary>Sequence of the session's reset frame packet.</summary>
         private ulong sessionResetSequence;
+        /// <summary>
+        /// Sequence of the scene release that precedes the next session's reset; 0 = none issued.
+        /// A session starts in two ticks: the scene release goes alone in one tick, and the reset
+        /// frame packet follows once the plugin consumed it. The release event has graphics queue
+        /// access and a flush, and a player with split graphics jobs (kGfxThreadingModeSplitJobs)
+        /// runs such an event LATER than the events issued next to it: in one command buffer the
+        /// reset created the scene and the release then destroyed it (seen in a build 2026-10-28;
+        /// the Editor's threaded mode keeps the order).
+        /// </summary>
+        private ulong sessionReleaseSequence;
         /// <summary>The plugin consumed the reset packet: the status describes this session's scene.</summary>
         private bool sessionReady;
         private ulong sessionDroppedBaseline;
@@ -117,12 +127,38 @@ namespace Caelix.Rendering.Native
 
             bool starting = !sessionLive;
             int frameSlot = rings.FindFreeFrameSlot(status);
+            IntPtr eventFunc = CaelixNativeBridge.RenderEventFunc;
             if (starting)
             {
-                if (frameSlot < 0 || !rings.HasFreeRelease(status))
+                // Phase 1: the scene release alone (destroys the previous scene and every renderer,
+                // when there are any). Phase 2, a later tick: the reset frame packet, once the
+                // plugin consumed the release (see sessionReleaseSequence for why they never share
+                // a command buffer).
+                if (sessionReleaseSequence == 0)
+                {
+                    IntPtr release = rings.FillRelease(CaelixNativeBridge.ReleaseScene, 0, status,
+                        out sessionReleaseSequence);
+                    if (release == IntPtr.Zero)
+                    {
+                        TicksDeferred++;
+                        WarnDeferred("the session start waits for a free release packet slot");
+                        return;
+                    }
+                    frameCommands.Clear();
+                    frameCommands.IssuePluginEventAndData(eventFunc, status.releaseEventId, release);
+                    Graphics.ExecuteCommandBuffer(frameCommands);
+                    return;
+                }
+                if (status.lastConsumedReleaseSequence < sessionReleaseSequence)
                 {
                     TicksDeferred++;
-                    WarnDeferred("the session start waits for a free packet slot");
+                    WarnDeferred("the session start waits for the plugin to run the scene release");
+                    return;
+                }
+                if (frameSlot < 0)
+                {
+                    TicksDeferred++;
+                    WarnDeferred("the session start waits for a free frame packet slot");
                     return;
                 }
                 BeginSession();
@@ -137,15 +173,6 @@ namespace Caelix.Rendering.Native
 
             frameCommands.Clear();
             bool issue = false;
-            IntPtr eventFunc = CaelixNativeBridge.RenderEventFunc;
-            if (starting)
-            {
-                // Destroys the previous scene and every renderer (when there are any); the reset
-                // frame packet below creates the new scene.
-                IntPtr release = rings.FillRelease(CaelixNativeBridge.ReleaseScene, 0, status);
-                frameCommands.IssuePluginEventAndData(eventFunc, status.releaseEventId, release);
-                issue = true;
-            }
 
             // Views whose camera is gone or idle: their renderers go (a scene release covers them).
             idleViewScratch.Clear();
@@ -195,6 +222,7 @@ namespace Caelix.Rendering.Native
             if (starting && frameIssued)
             {
                 sessionLive = true;
+                sessionReleaseSequence = 0;
                 // The scene release also released every target view.
                 s_releasedGeneration = s_generation;
                 if (verboseLogging)

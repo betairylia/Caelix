@@ -433,6 +433,7 @@ namespace Caelix.Rendering.Native
             for (int v = 0; v < viewSlots.Length; v++) FreeViewSlot(v);
             if (feed == null) feed = new CaelixNativeEntityFeed();
             sessionLive = false;
+            sessionReleaseSequence = 0;
         }
 
         private void OnDisable()

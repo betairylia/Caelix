@@ -244,6 +244,24 @@ namespace Caelix.Rendering.Native
                 if (!native.TryPrepareFrame(cameraData.camera, cameraData.GetProjectionMatrix(), descriptor.width,
                         descriptor.height, out int view, out IntPtr packet, out IntPtr releasePacket))
                 {
+                    // A target was replaced: this frame issues only the release of the plugin's
+                    // cached target views; the view renders from the next frame on (see
+                    // CaelixNativeRenderer.TryPrepareFrame).
+                    if (releasePacket != IntPtr.Zero)
+                    {
+                        using (var builder = renderGraph.AddUnsafePass<PassData>("Caelix Native Release", out var releaseData))
+                        {
+                            releaseData.EventFunc = CaelixNativeBridge.RenderEventFunc;
+                            releaseData.ReleaseEventId = status.releaseEventId;
+                            releaseData.ReleasePacket = releasePacket;
+                            builder.AllowPassCulling(false);
+                            builder.SetRenderFunc((PassData data, UnsafeGraphContext context) =>
+                            {
+                                CommandBuffer cmd = CommandBufferHelpers.GetNativeCommandBuffer(context.cmd);
+                                cmd.IssuePluginEventAndData(data.EventFunc, data.ReleaseEventId, data.ReleasePacket);
+                            });
+                        }
+                    }
                     return;
                 }
 

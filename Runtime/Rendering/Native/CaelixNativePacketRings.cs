@@ -187,20 +187,27 @@ namespace Caelix.Rendering.Native
 
         /// <summary>
         /// Fills a free release packet slot and returns its address; zero when every slot is still
-        /// waiting for the render thread (the caller tries again later).
+        /// waiting for the render thread (the caller tries again later). <paramref name="sequence"/>
+        /// is the packet's sequence (0 when none was filled): the plugin publishes it as
+        /// <c>lastConsumedReleaseSequence</c> once the release ran.
         /// </summary>
-        public IntPtr FillRelease(uint flags, uint view, in CaelixNativeStatus status)
+        public IntPtr FillRelease(uint flags, uint view, in CaelixNativeStatus status, out ulong sequence)
         {
+            sequence = 0;
             if (releaseRing == IntPtr.Zero) return IntPtr.Zero;
             for (int i = 0; i < ReleaseRingSize; i++)
             {
                 if (releaseSequence[i] != 0 && status.lastConsumedReleaseSequence < releaseSequence[i]) continue;
                 IntPtr memory = releaseRing + i * ReleasePacketBytes;
                 releaseSequence[i] = WriteRelease(memory, flags, view);
+                sequence = releaseSequence[i];
                 return memory;
             }
             return IntPtr.Zero;
         }
+
+        public IntPtr FillRelease(uint flags, uint view, in CaelixNativeStatus status) =>
+            FillRelease(flags, view, status, out _);
 
         /// <summary>
         /// A release packet in a block of its own, freed once the plugin consumed it: for a caller
