@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using Unity.Collections.LowLevel.Unsafe;
 using UnityEngine;
+using UnityEngine.Experimental.Rendering;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
 
@@ -83,6 +84,33 @@ namespace Caelix.Rendering.Native
         // read once per texture reference.
         private Texture skyTexture;
         private IntPtr skyTexturePtr;
+
+        /// <summary>The sun angular radius the library uses for 0 (caelix.h).</summary>
+        private const float DefaultSunAngularRadiusDegrees = 0.5f;
+        // The sun sync problem logged last (verbose): one log per problem and light, not per frame.
+        private SunLightProblem loggedSunProblem;
+        private Light loggedSunProblemLight;
+
+        private enum SunLightProblem
+        {
+            None = 0,
+            NoLight = 1,
+            NotDirectional = 2,
+            Disabled = 3,
+        }
+
+        // Sky capture (see UpdateSkyCapture).
+        /// <summary>A sun turn of more than this many degrees since the last capture triggers a new one.</summary>
+        private const float SkyCaptureSunTurnDegrees = 0.1f;
+        private Camera skyCaptureCamera;
+        private RenderTexture skyCaptureTexture;
+        /// <summary>The current <see cref="skyCaptureTexture"/> holds a capture (with mips).</summary>
+        private bool skyCaptureValid;
+        private int skyCaptureLastFrame;
+        private Vector3 skyCaptureSunDirection;
+        private bool skyCaptureLogged;
+        private bool warnedSkyCaptureNoMaterial;
+        private bool warnedSkyCaptureFailed;
 
         // Shared by every instance: a target generation must never repeat within one plugin
         // lifetime (it only feeds a warning of the plugin, so a domain reload is harmless).
@@ -174,6 +202,8 @@ namespace Caelix.Rendering.Native
             releasePacket = IntPtr.Zero;
             if (!sessionLive || camera == null || !rings.IsAllocated) return false;
             if (width <= 0 || height <= 0) return false;
+            // The sky capture camera is a Reflection camera that the feature skips; never give it a view.
+            if (ReferenceEquals(camera, skyCaptureCamera)) return false;
 
             CaelixNativeBridge.TryGetStatus(out CaelixNativeStatus status);
             CaelixNativePacketRings.Maintain(status);
@@ -363,8 +393,10 @@ namespace Caelix.Rendering.Native
         }
 
         /// <summary>
-        /// The sky target: <see cref="skyCubemap"/>, else <see cref="ReflectionProbe.defaultTexture"/>
-        /// with <see cref="skyFromReflectionProbe"/> when it is a cubemap, else none (the procedural sky).
+        /// The sky target: <see cref="skyCubemap"/>, else the captured sky cube with
+        /// <see cref="skyCapture"/> (once a capture exists, see <see cref="UpdateSkyCapture"/>), else
+        /// <see cref="ReflectionProbe.defaultTexture"/> with <see cref="skyFromReflectionProbe"/> when it
+        /// is a cubemap, else none (the procedural sky).
         /// </summary>
         private CaelixNativeTarget SkyTarget()
         {
@@ -380,6 +412,10 @@ namespace Caelix.Rendering.Native
                     warnedSkyNotCube = true;
                     Debug.LogWarning($"Caelix native: sky cubemap '{skyCubemap.name}' is not a cube texture; the procedural sky is used.", this);
                 }
+            }
+            else if (skyCapture && skyCaptureValid && skyCaptureTexture != null && skyCaptureTexture.IsCreated())
+            {
+                texture = skyCaptureTexture;
             }
             else if (skyFromReflectionProbe)
             {
@@ -401,6 +437,253 @@ namespace Caelix.Rendering.Native
                 height = (uint)texture.width,
             };
         }
+
+        #region Sun sync
+
+        /// <summary>
+        /// The sun of this frame. With <see cref="syncSunFromLight"/> and an enabled directional light
+        /// (<see cref="sunLight"/>, else <see cref="RenderSettings.sun"/>): <paramref name="direction"/> =
+        /// the light's -forward (toward the sun) and <paramref name="radiance"/> = E / (2 pi (1 - cos r)).
+        /// E = colour x intensity is URP's irradiance of a surface facing the light; r is the sun's
+        /// angular radius (0 = the library default, 0.5 degrees). The library's sun disk has constant
+        /// radiance over that cone, so a surface facing it receives E again. Returns true then.
+        /// Else (sync off, or no usable light: logged once per problem with verbose logging) the
+        /// serialized <see cref="sunDirection"/> and <see cref="sunRadiance"/>, and false.
+        /// </summary>
+        private bool ResolveSun(out Vector3 direction, out Vector3 radiance)
+        {
+            if (syncSunFromLight)
+            {
+                Light light = sunLight != null ? sunLight : RenderSettings.sun;
+                SunLightProblem problem = SunLightProblem.None;
+                if (light == null) problem = SunLightProblem.NoLight;
+                else if (light.type != LightType.Directional) problem = SunLightProblem.NotDirectional;
+                else if (!light.isActiveAndEnabled) problem = SunLightProblem.Disabled;
+
+                if (problem == SunLightProblem.None)
+                {
+                    loggedSunProblem = SunLightProblem.None;
+                    loggedSunProblemLight = null;
+                    direction = -light.transform.forward;
+                    // Unity with linear light intensities (URP's setting): the light colour is picked in
+                    // sRGB and converted to linear, then scaled by the intensity (and by the colour
+                    // temperature's RGB when the project uses colour temperatures).
+                    Color c = light.color.linear;
+                    if (light.useColorTemperature && GraphicsSettings.lightsUseColorTemperature)
+                    {
+                        c *= Mathf.CorrelatedColorTemperatureToRGB(light.colorTemperature);
+                    }
+                    Vector3 irradiance = new Vector3(c.r, c.g, c.b) * light.intensity;
+                    float degrees = sunAngularRadiusDegrees > 0.0f ? sunAngularRadiusDegrees : DefaultSunAngularRadiusDegrees;
+                    // 2 pi (1 - cos r) = 4 pi sin^2(r / 2): no cancellation at small r.
+                    float sinHalf = Mathf.Sin(0.5f * degrees * Mathf.Deg2Rad);
+                    float solidAngle = 4.0f * Mathf.PI * sinHalf * sinHalf;
+                    radiance = irradiance / solidAngle;
+                    return true;
+                }
+
+                if (problem != loggedSunProblem || !ReferenceEquals(light, loggedSunProblemLight))
+                {
+                    loggedSunProblem = problem;
+                    loggedSunProblemLight = light;
+                    if (verboseLogging)
+                    {
+                        string reason = problem == SunLightProblem.NoLight
+                            ? "Sun Light is empty and RenderSettings.sun is not set"
+                            : problem == SunLightProblem.NotDirectional
+                                ? $"light '{light.name}' is a {light.type} light, not a directional light"
+                                : $"light '{light.name}' is disabled";
+                        Debug.Log($"Caelix native: Sync Sun: {reason}; the Sun Direction and Sun Radiance fields are used.", this);
+                    }
+                }
+            }
+            direction = sunDirection;
+            radiance = sunRadiance;
+            return false;
+        }
+
+        #endregion
+
+        #region Sky capture
+
+        /// <summary>
+        /// Keeps the captured sky cube current; the tick calls it before the cameras of the frame
+        /// render. Without <see cref="skyCapture"/>, with an assigned <see cref="skyCubemap"/>, or
+        /// without a skybox material, the cube and the capture camera are released (the sky then
+        /// falls back as <see cref="SkyTarget"/> says). Else the cube is (re)created at
+        /// <see cref="skyCaptureSize"/> and captured when it is new, every
+        /// <see cref="skyCaptureInterval"/> frames, and when the sun direction of
+        /// <see cref="ResolveSun"/> turned by more than <see cref="SkyCaptureSunTurnDegrees"/>.
+        /// A capture renders the skybox (<see cref="skyCaptureMaterial"/> swapped into
+        /// <see cref="RenderSettings.skybox"/> for the call) into the six faces with
+        /// <see cref="Camera.RenderToCubemap(RenderTexture, int)"/>, then generates the mips.
+        /// </summary>
+        private void UpdateSkyCapture()
+        {
+            if (!skyCapture || skyCubemap != null)
+            {
+                ReleaseSkyCapture();
+                return;
+            }
+            Material material = skyCaptureMaterial != null ? skyCaptureMaterial : RenderSettings.skybox;
+            if (material == null)
+            {
+                if (!warnedSkyCaptureNoMaterial && verboseLogging)
+                {
+                    Debug.Log("Caelix native: sky capture: no Sky Capture Material and no RenderSettings.skybox; nothing " +
+                              "is captured.", this);
+                }
+                warnedSkyCaptureNoMaterial = true;
+                ReleaseSkyCapture();
+                return;
+            }
+            warnedSkyCaptureNoMaterial = false;
+
+            int size = Mathf.Clamp(skyCaptureSize, 16, 512);
+            if (skyCaptureTexture != null && skyCaptureTexture.width != size) ReleaseSkyCaptureTexture();
+            if (skyCaptureTexture == null)
+            {
+                skyCaptureTexture = new RenderTexture(size, size, GraphicsFormat.R16G16B16A16_SFloat, GraphicsFormat.None)
+                {
+                    name = "Caelix Sky Capture",
+                    dimension = TextureDimension.Cube,
+                    useMipMap = true,
+                    autoGenerateMips = false,
+                    hideFlags = HideFlags.HideAndDontSave,
+                };
+            }
+            bool fresh = false;
+            if (!skyCaptureTexture.IsCreated())
+            {
+                // The first creation, or Unity lost the texture: a new native image under the same reference.
+                skyCaptureTexture.Create();
+                OnSkyCaptureImageChanged();
+                fresh = true;
+            }
+
+            ResolveSun(out Vector3 sun, out _);
+            bool due = fresh || Time.frameCount - skyCaptureLastFrame >= Mathf.Max(1, skyCaptureInterval) ||
+                       (skyCaptureValid && Vector3.Angle(sun, skyCaptureSunDirection) > SkyCaptureSunTurnDegrees);
+            if (!due) return;
+            skyCaptureLastFrame = Time.frameCount;
+            skyCaptureSunDirection = sun;
+
+            Camera camera = EnsureSkyCaptureCamera();
+            camera.transform.position = SkyCapturePosition();
+            Material previous = RenderSettings.skybox;
+            bool swap = material != previous;
+            bool rendered;
+            if (swap) RenderSettings.skybox = material;
+            try
+            {
+                rendered = camera.RenderToCubemap(skyCaptureTexture, 63);
+            }
+            finally
+            {
+                if (swap) RenderSettings.skybox = previous;
+            }
+            if (!rendered)
+            {
+                // Retried every interval; until then the sky falls back past the capture.
+                skyCaptureValid = false;
+                if (!warnedSkyCaptureFailed)
+                {
+                    warnedSkyCaptureFailed = true;
+                    Debug.LogWarning("Caelix native: sky capture: Camera.RenderToCubemap failed; the sky falls back to the " +
+                                     "reflection probe or the procedural sky.", this);
+                }
+                return;
+            }
+            skyCaptureTexture.GenerateMips();
+            skyCaptureValid = true;
+            if (!skyCaptureLogged && verboseLogging)
+            {
+                skyCaptureLogged = true;
+                Debug.Log($"Caelix native: sky captured: {size} px per face, {skyCaptureTexture.mipmapCount} mips, " +
+                          $"material '{material.name}'.", this);
+            }
+        }
+
+        /// <summary>
+        /// The capture texture got a new native image: no capture in it yet, the cached native pointer
+        /// is stale (<see cref="SkyTarget"/> re-reads it), and the plugin's renderers cache image views
+        /// per image, so the next view packet first releases every target view (generation bump).
+        /// </summary>
+        private void OnSkyCaptureImageChanged()
+        {
+            skyCaptureValid = false;
+            skyTexture = null;
+            skyTexturePtr = IntPtr.Zero;
+            s_generation++;
+        }
+
+        /// <summary>The capture camera: hidden, disabled, skybox only, a Reflection camera (the feature draws Game and Scene view cameras only).</summary>
+        private Camera EnsureSkyCaptureCamera()
+        {
+            if (skyCaptureCamera != null) return skyCaptureCamera;
+            var go = new GameObject("Caelix Sky Capture Camera") { hideFlags = HideFlags.HideAndDontSave };
+            Camera camera = go.AddComponent<Camera>();
+            camera.enabled = false;
+            camera.cameraType = CameraType.Reflection;
+            camera.clearFlags = CameraClearFlags.Skybox;
+            camera.cullingMask = 0;
+            camera.allowHDR = true;
+            camera.allowMSAA = false;
+            camera.useOcclusionCulling = false;
+            UniversalAdditionalCameraData data = go.AddComponent<UniversalAdditionalCameraData>();
+            data.renderPostProcessing = false;
+            data.antialiasing = AntialiasingMode.None;
+            data.renderShadows = false;
+            data.requiresColorOption = CameraOverrideOption.Off;
+            data.requiresDepthOption = CameraOverrideOption.Off;
+            skyCaptureCamera = camera;
+            return camera;
+        }
+
+        /// <summary>The position of the newest Game view camera, else <see cref="Camera.main"/>, else the origin.</summary>
+        private Vector3 SkyCapturePosition()
+        {
+            Camera best = null;
+            int bestFrame = int.MinValue;
+            foreach (ViewSlot slot in viewSlots)
+            {
+                if (!slot.InUse || slot.IsSceneView || slot.Camera == null || slot.LastFrame <= bestFrame) continue;
+                best = slot.Camera;
+                bestFrame = slot.LastFrame;
+            }
+            if (best == null) best = Camera.main;
+            return best != null ? best.transform.position : Vector3.zero;
+        }
+
+        /// <summary>Destroys the capture texture (the next view packet releases the plugin's views of it).</summary>
+        private void ReleaseSkyCaptureTexture()
+        {
+            if (skyCaptureTexture == null) return;
+            if (ReferenceEquals(skyTexture, skyCaptureTexture))
+            {
+                skyTexture = null;
+                skyTexturePtr = IntPtr.Zero;
+            }
+            skyCaptureTexture.Release();
+            UnityEngine.Object.DestroyImmediate(skyCaptureTexture);
+            skyCaptureTexture = null;
+            skyCaptureValid = false;
+            s_generation++;
+        }
+
+        /// <summary>Destroys the capture texture and the capture camera.</summary>
+        private void ReleaseSkyCapture()
+        {
+            ReleaseSkyCaptureTexture();
+            if (skyCaptureCamera != null)
+            {
+                UnityEngine.Object.DestroyImmediate(skyCaptureCamera.gameObject);
+            }
+            skyCaptureCamera = null;
+            skyCaptureLogged = false;
+        }
+
+        #endregion
 
         /// <summary>
         /// The library camera of this frame. <paramref name="jitteredProjection"/> is URP's projection
@@ -528,10 +811,12 @@ namespace Caelix.Rendering.Native
                     o.upscaleFlags |= CaelixNativeBridge.UpscaleFlagAutoExposure;
                 }
             }
-            Vector3 sun = lighting ? sunDirection : primarySunDirection;
+            // The synced sun drives both modes; unsynced, the primary mode keeps its own Lambert direction.
+            bool sunSynced = ResolveSun(out Vector3 sunDir, out Vector3 sunRad);
+            Vector3 sun = lighting || sunSynced ? sunDir : primarySunDirection;
             o.sunDir[0] = sun.x; o.sunDir[1] = sun.y; o.sunDir[2] = sun.z;
             o.skyColor[0] = primarySkyColor.x; o.skyColor[1] = primarySkyColor.y; o.skyColor[2] = primarySkyColor.z;
-            o.sunRadiance[0] = sunRadiance.x; o.sunRadiance[1] = sunRadiance.y; o.sunRadiance[2] = sunRadiance.z;
+            o.sunRadiance[0] = sunRad.x; o.sunRadiance[1] = sunRad.y; o.sunRadiance[2] = sunRad.z;
             o.skyZenith[0] = skyZenith.x; o.skyZenith[1] = skyZenith.y; o.skyZenith[2] = skyZenith.z;
             o.skyHorizon[0] = skyHorizon.x; o.skyHorizon[1] = skyHorizon.y; o.skyHorizon[2] = skyHorizon.z;
             o.skyGround[0] = skyGround.x; o.skyGround[1] = skyGround.y; o.skyGround[2] = skyGround.z;

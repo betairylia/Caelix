@@ -29,6 +29,16 @@ namespace Caelix.Rendering.Native
     /// options, the view's targets and the sky cubemap; it issues the plugin's render event with it.
     /// </para>
     /// <para>
+    /// Sun and sky: with <see cref="SyncSunFromLight"/> the sun follows a directional light
+    /// (<see cref="SunLight"/>, else <see cref="RenderSettings.sun"/>): direction = toward the light,
+    /// radiance = the light's irradiance (colour x intensity) divided by the solid angle of the sun
+    /// disk. The sky of the lighting modes is <see cref="SkyCubemap"/> when assigned, else (with
+    /// <see cref="SkyCapture"/>) a small cube RenderTexture that <see cref="Tick"/> renders from the
+    /// scene's skybox every <see cref="SkyCaptureInterval"/> frames and when the sun turns, else
+    /// <see cref="ReflectionProbe.defaultTexture"/> (with <see cref="SkyFromReflectionProbe"/>), else
+    /// the procedural sky. The visible sky of the Game view stays Unity's own skybox.
+    /// </para>
+    /// <para>
     /// Upscaler (path trace mode only): with <see cref="UpscalerKind"/> set, the plugin queries DLSS
     /// for the view's key (upscaler, quality, camera size) and publishes the render size in its
     /// status. From the next frame on, the view's depth, motion and albedo targets have that render
@@ -172,15 +182,29 @@ namespace Caelix.Rendering.Native
         [SerializeField, Tooltip("Primary mode: Lambert shading of the albedo view.")]
         private bool shading = true;
 
+        [Header("Sun Light")]
+        [SerializeField, Tooltip("Directional light that drives the sun. Empty = RenderSettings.sun. With Sync Sun on, its " +
+                                 "direction and colour x intensity replace the Sun Direction and Sun Radiance fields every frame.")]
+        private Light sunLight;
+        [SerializeField, Tooltip("Every frame: sun direction = the light's forward direction (toward the sun), sun radiance = " +
+                                 "colour x intensity / (2 pi (1 - cos r)) with r = Sun Angular Radius (so that a surface facing " +
+                                 "the sun receives the light's irradiance). The primary mode's Lambert sun uses the same direction.")]
+        private bool syncSunFromLight = true;
+
         [Header("Exposure, Sun and Sky (linear RGB)")]
         [SerializeField, Min(0.0f)] private float exposure = 1.0f;
-        [SerializeField, Tooltip("Lighting modes: direction toward the sun (normalized by the library).")]
+        [SerializeField, Tooltip("Lighting modes: direction toward the sun (normalized by the library). Replaced by the " +
+                                 "sun light while Sync Sun is on and the light is found.")]
         private Vector3 sunDirection = new Vector3(0.45f, 0.7f, 0.55f);
-        [SerializeField, Tooltip("Primary mode: direction of the Lambert shading.")]
+        [SerializeField, Tooltip("Primary mode: direction of the Lambert shading. Replaced by the sun light's direction " +
+                                 "while Sync Sun is on and the light is found.")]
         private Vector3 primarySunDirection = new Vector3(-0.45f, 0.8f, -0.3f);
-        [SerializeField, Tooltip("Radiance of the sun disk. 0 = sun off (sky light only). Suggested 2e4, 1.9e4, 1.8e4.")]
+        [SerializeField, Tooltip("Radiance of the sun disk. 0 = sun off (sky light only). Suggested 2e4, 1.9e4, 1.8e4. " +
+                                 "Replaced by the sun light while Sync Sun is on and the light is found.")]
         private Vector3 sunRadiance = Vector3.zero;
-        [SerializeField, Min(0.0f)] private float sunAngularRadiusDegrees = 0.5f;
+        [SerializeField, Min(0.0f), Tooltip("Angular radius of the sun disk in degrees (0 = the library default, 0.5). " +
+                                            "Sync Sun divides the light's irradiance by the solid angle of this disk.")]
+        private float sunAngularRadiusDegrees = 0.5f;
         [SerializeField] private Vector3 skyZenith = new Vector3(0.2f, 0.4f, 0.9f);
         [SerializeField] private Vector3 skyHorizon = new Vector3(0.7f, 0.8f, 0.95f);
         [SerializeField] private Vector3 skyGround = new Vector3(0.25f, 0.22f, 0.2f);
@@ -200,6 +224,22 @@ namespace Caelix.Rendering.Native
         private Color fogColor = new Color(0.7f, 0.8f, 0.95f, 1.0f);
         [SerializeField, Min(0.0f), Tooltip("Every mode: multiplies the emission of every material (0 is treated as 1).")]
         private float emissionScale = 1.0f;
+
+        [Header("Sky Capture")]
+        [SerializeField, Tooltip("When no Sky Cubemap is assigned: render the scene's skybox material into a small cube " +
+                                 "RenderTexture with mips and pass it as the sky of the lighting modes (instead of the " +
+                                 "procedural sky).")]
+        private bool skyCapture = true;
+        [SerializeField, Range(16, 512), Tooltip("Face size of the captured cube in pixels. The renderer uses it for its " +
+                                                 "sky lighting only (irradiance and roughness mips): 128 is plenty.")]
+        private int skyCaptureSize = 128;
+        [SerializeField, Min(1), Tooltip("Frames between captures (the capture also runs when the sun direction turns by " +
+                                         "more than 0.1 degree, and on the first frame).")]
+        private int skyCaptureInterval = 60;
+        [SerializeField, Tooltip("Skybox material to capture instead of RenderSettings.skybox, for example a copy with the " +
+                                 "sun disk disabled (the renderer draws its own sun; a disk in the cubemap would count the " +
+                                 "sun twice). Empty = RenderSettings.skybox.")]
+        private Material skyCaptureMaterial;
 
         [Header("Upscaler")]
         [SerializeField, Tooltip("Path trace mode only: DLSS Super Resolution (NRD stays the denoiser) or DLSS Ray " +
@@ -298,6 +338,18 @@ namespace Caelix.Rendering.Native
         public float FogDensity { get => fogDensity; set => fogDensity = Mathf.Max(0f, value); }
         public Color FogColor { get => fogColor; set => fogColor = value; }
         public float EmissionScale { get => emissionScale; set => emissionScale = Mathf.Max(0f, value); }
+        /// <summary>The directional light of the sun sync; null = <see cref="RenderSettings.sun"/>.</summary>
+        public Light SunLight { get => sunLight; set => sunLight = value; }
+        /// <summary>Every frame: the sun direction and radiance come from <see cref="SunLight"/> (see <see cref="ResolveSun"/>).</summary>
+        public bool SyncSunFromLight { get => syncSunFromLight; set => syncSunFromLight = value; }
+        /// <summary>Without a <see cref="SkyCubemap"/>: capture the scene's skybox into a small cube as the sky of the lighting modes.</summary>
+        public bool SkyCapture { get => skyCapture; set => skyCapture = value; }
+        /// <summary>Face size of the captured sky cube in pixels (16 .. 512); a change recreates the cube.</summary>
+        public int SkyCaptureSize { get => skyCaptureSize; set => skyCaptureSize = Mathf.Clamp(value, 16, 512); }
+        /// <summary>Frames between sky captures (at least 1).</summary>
+        public int SkyCaptureInterval { get => skyCaptureInterval; set => skyCaptureInterval = Mathf.Max(1, value); }
+        /// <summary>Skybox material of the sky capture; null = <see cref="RenderSettings.skybox"/>.</summary>
+        public Material SkyCaptureMaterial { get => skyCaptureMaterial; set => skyCaptureMaterial = value; }
         /// <summary>The upscaler of the path trace mode (live: takes effect with the next frame of every view).</summary>
         public Upscaler UpscalerKind { get => upscaler; set => upscaler = value; }
         public UpscaleQuality UpscaleQualityLevel { get => upscaleQuality; set => upscaleQuality = value; }
@@ -409,6 +461,8 @@ namespace Caelix.Rendering.Native
             // Packet memory the render thread may still read is freed once it reports the sequence.
             rings.Release(status);
             for (int v = 0; v < viewSlots.Length; v++) FreeViewSlot(v);
+            // After the scene release above: the plugin's renderers (and their cached sky views) are gone.
+            ReleaseSkyCapture();
             UnbindSource();
             feed.Dispose();
             feed = null;

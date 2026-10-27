@@ -98,6 +98,8 @@ namespace Caelix.Rendering.Native
             }
             lastTickFrame = Time.frameCount;
             if (!CaelixNativeBridge.IsAvailable) return;
+            // Before any camera of the frame renders: the view packets of this frame see the new capture.
+            UpdateSkyCapture();
             if (!EnsureSource(out bool rebound)) return;
             if (rebound && sessionLive)
             {
