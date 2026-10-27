@@ -115,6 +115,13 @@ namespace Caelix.Rendering.Native
         public RTHandle AlbedoHandle(int view) => viewSlots[view].Targets.Albedo.Handle;
 
         /// <summary>
+        /// The voxel id target of <paramref name="view"/> (R32_UINT at the camera size, the voxel hash of
+        /// the camera ray's first hit, 0xFFFFFFFF on a miss). Null while the view has none
+        /// (<see cref="VoxelIdTarget"/> off, or before the view's first frame).
+        /// </summary>
+        public RTHandle VoxelIdHandle(int view) => viewSlots[view].Targets.VoxelId.Handle;
+
+        /// <summary>
         /// True when the colour target of <paramref name="view"/> holds values meant to be shown as
         /// they are (the primary mode's debug views, the path trace mode's motion view), not linear
         /// radiance. The present pass then decodes them from sRGB so that Unity's own output encode
@@ -196,7 +203,7 @@ namespace Caelix.Rendering.Native
             int geometryWidth = upscale.RenderWidth != 0 ? (int)upscale.RenderWidth : width;
             int geometryHeight = upscale.RenderHeight != 0 ? (int)upscale.RenderHeight : height;
             // Replacing a target bumps the shared generation, which needs a release event first.
-            if (slot.Targets.Ensure(width, height, geometryWidth, geometryHeight, index)) s_generation++;
+            if (slot.Targets.Ensure(width, height, geometryWidth, geometryHeight, index, voxelIdTarget)) s_generation++;
             if (s_generation != s_releasedGeneration)
             {
                 releasePacket = rings.FillRelease(CaelixNativeBridge.ReleaseTargetViews, 0, status);
@@ -227,6 +234,12 @@ namespace Caelix.Rendering.Native
                 motion = slot.Targets.Motion.ToPacket(),
                 albedo = slot.Targets.Albedo.ToPacket(),
                 sky = SkyTarget(),
+                voxelId = voxelIdTarget ? slot.Targets.VoxelId.ToPacket() : default,
+                lightNee = new CaelixNativeLightNeeOptions
+                {
+                    enabled = lightNee ? 1u : 0u,
+                    flags = lightNeeMis ? 0u : CaelixNativeBridge.LightNeeFlagNoMis,
+                },
             };
             data.camera = BuildCamera(camera, jitteredProjection, width, height, isGame, upscale);
             data.options = BuildOptions(slot, data.camera, upscale);
@@ -501,6 +514,7 @@ namespace Caelix.Rendering.Native
                 bounceCountTransparent = (uint)Mathf.Clamp(bouncesTransparent, 0, 15),
                 emissionScale = emissionScale,
                 fogDensity = Mathf.Max(0.0f, fogDensity),
+                voxelIdTMax = Mathf.Max(0.0f, voxelIdTMax),
                 // sky stays zero: the plugin fills it from the view packet's sky target.
             };
             if (upscale.Upscaler != 0)

@@ -41,6 +41,8 @@ namespace Caelix.Rendering.Native
             public uint StagingMiB;
             /// <summary>Material entries sent with the reset (block-ID encoding only); may be null.</summary>
             public CaelixNativeMaterialEntry[] Materials;
+            /// <summary>Light tree options of the session (the plugin reads them with the reset only).</summary>
+            public CaelixNativeLightOptions Light;
         }
 
         /// <summary>What the plugin knows of one client entity view.</summary>
@@ -376,6 +378,7 @@ namespace Caelix.Rendering.Native
                 uploadCount = (uint)uploadCount,
                 uploadsOffset = (uint)uploadsOffset,
                 brickCount = (uint)bricks,
+                light = config.Light,
             };
 
             pendingEntityRemoves.Clear();

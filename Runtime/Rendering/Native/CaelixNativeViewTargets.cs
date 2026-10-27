@@ -70,12 +70,14 @@ namespace Caelix.Rendering.Native
     }
 
     /// <summary>
-    /// The four targets of one view: colour RGBA16F at the camera size; depth R32F, motion RGBA16F
+    /// The five targets of one view: colour RGBA16F at the camera size; depth R32F, motion RGBA16F
     /// and albedo RGBA8 UNORM at the geometry size (the camera size, or the upscaler's render size
-    /// while the view upscales). These are the library's accepted formats, all with random write.
-    /// The library writes them with <c>CAELIX_RENDER_FLAG_FLIP_Y</c>, so they have Unity's row order.
-    /// The present shader samples every target by UV, so render-size geometry targets need no
-    /// change there.
+    /// while the view upscales); and the optional voxel id R32_UINT at the camera size in every case
+    /// (the voxel hash of the camera ray's first hit, 0xFFFFFFFF on a miss). These are the library's
+    /// accepted formats, all with random write. The library writes them with
+    /// <c>CAELIX_RENDER_FLAG_FLIP_Y</c>, so they have Unity's row order. The present shader samples
+    /// every target by UV, so render-size geometry targets need no change there; it does not read
+    /// the voxel id.
     /// </summary>
     internal sealed class CaelixNativeViewTargets
     {
@@ -83,17 +85,22 @@ namespace Caelix.Rendering.Native
         public readonly CaelixNativeTargetTexture Depth = new CaelixNativeTargetTexture();
         public readonly CaelixNativeTargetTexture Motion = new CaelixNativeTargetTexture();
         public readonly CaelixNativeTargetTexture Albedo = new CaelixNativeTargetTexture();
+        /// <summary>Optional; no texture while the view has no voxel id target.</summary>
+        public readonly CaelixNativeTargetTexture VoxelId = new CaelixNativeTargetTexture();
 
-        public bool Matches(int colorWidth, int colorHeight, int geometryWidth, int geometryHeight) =>
+        public bool Matches(int colorWidth, int colorHeight, int geometryWidth, int geometryHeight, bool voxelId) =>
             Color.Matches(colorWidth, colorHeight) && Depth.Matches(geometryWidth, geometryHeight) &&
-            Motion.Matches(geometryWidth, geometryHeight) && Albedo.Matches(geometryWidth, geometryHeight);
+            Motion.Matches(geometryWidth, geometryHeight) && Albedo.Matches(geometryWidth, geometryHeight) &&
+            (voxelId ? VoxelId.Matches(colorWidth, colorHeight) : VoxelId.Texture == null);
 
         /// <summary>
-        /// Recreates each target that does not have its size: the colour at
-        /// <paramref name="colorWidth"/> x <paramref name="colorHeight"/>, the geometry targets at
-        /// <paramref name="geometryWidth"/> x <paramref name="geometryHeight"/>. True when any was replaced.
+        /// Recreates each target that does not have its size: the colour (and, with
+        /// <paramref name="voxelId"/>, the voxel id) at <paramref name="colorWidth"/> x
+        /// <paramref name="colorHeight"/>, the geometry targets at <paramref name="geometryWidth"/> x
+        /// <paramref name="geometryHeight"/>. Without <paramref name="voxelId"/> the voxel id target is
+        /// released. True when any target was replaced or released.
         /// </summary>
-        public bool Ensure(int colorWidth, int colorHeight, int geometryWidth, int geometryHeight, int view)
+        public bool Ensure(int colorWidth, int colorHeight, int geometryWidth, int geometryHeight, int view, bool voxelId)
         {
             bool replaced = Color.Ensure($"Caelix Native Colour (view {view})", GraphicsFormat.R16G16B16A16_SFloat,
                 colorWidth, colorHeight);
@@ -103,6 +110,16 @@ namespace Caelix.Rendering.Native
                 geometryWidth, geometryHeight);
             replaced |= Albedo.Ensure($"Caelix Native Albedo (view {view})", GraphicsFormat.R8G8B8A8_UNorm,
                 geometryWidth, geometryHeight);
+            if (voxelId)
+            {
+                replaced |= VoxelId.Ensure($"Caelix Native Voxel Id (view {view})", GraphicsFormat.R32_UInt,
+                    colorWidth, colorHeight);
+            }
+            else if (VoxelId.Texture != null)
+            {
+                VoxelId.Release();
+                replaced = true;
+            }
             return replaced;
         }
 
@@ -112,6 +129,7 @@ namespace Caelix.Rendering.Native
             Depth.Release();
             Motion.Release();
             Albedo.Release();
+            VoxelId.Release();
         }
     }
 }

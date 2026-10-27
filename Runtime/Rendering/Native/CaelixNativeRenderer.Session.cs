@@ -22,6 +22,10 @@ namespace Caelix.Rendering.Native
         /// <summary>Material entries of the session (block-ID encoding only), sent with the reset.</summary>
         private CaelixNativeMaterialEntry[] sessionMaterials;
         private int sessionStagingMiB;
+        /// <summary>Light tree options of the session, sent with the reset.</summary>
+        private bool sessionLightTree;
+        private float sessionLightMinEmission;
+        private int sessionLightHeapMiB;
         /// <summary>Sequence of the session's reset frame packet.</summary>
         private ulong sessionResetSequence;
         /// <summary>The plugin consumed the reset packet: the status describes this session's scene.</summary>
@@ -30,6 +34,7 @@ namespace Caelix.Rendering.Native
         private bool sessionConfigLogged;
         private bool sessionEncodingLogged;
         private bool sessionStagingLogged;
+        private bool sessionLightLogged;
 
         private uint ResolveEncoding()
         {
@@ -165,6 +170,7 @@ namespace Caelix.Rendering.Native
                     Encoding = sessionEncoding,
                     StagingMiB = (uint)sessionStagingMiB,
                     Materials = sessionMaterials,
+                    Light = SessionLightOptions(),
                 };
                 if (feed.FillFramePacket(rings, frameSlot, UploadBudgetBricks(status), config, this, out ulong sequence))
                 {
@@ -192,8 +198,9 @@ namespace Caelix.Rendering.Native
                 if (verboseLogging)
                 {
                     Debug.Log($"Caelix native: session started: encoding {sessionEncoding}, staging ring {sessionStagingMiB} MiB, " +
-                              $"{(sessionMaterials != null ? sessionMaterials.Length : 0)} material entries, " +
-                              $"{feed.EntityCount} entities, {feed.BricksPending} bricks to send.", this);
+                              $"{(sessionMaterials != null ? sessionMaterials.Length : 0)} material entries, light tree " +
+                              $"{(sessionLightTree ? "on" : "off")} (min emission {sessionLightMinEmission}, heap {sessionLightHeapMiB} MiB; " +
+                              $"0 = library default), {feed.EntityCount} entities, {feed.BricksPending} bricks to send.", this);
                 }
             }
         }
@@ -210,14 +217,26 @@ namespace Caelix.Rendering.Native
                 Debug.Log($"Caelix native: {materialsJson.name} is ignored: the packed encoding has no material table.", this);
             }
             sessionStagingMiB = Mathf.Max(4, stagingRingMiB);
+            sessionLightTree = lightTree;
+            sessionLightMinEmission = Mathf.Max(0f, lightMinEmission);
+            sessionLightHeapMiB = Mathf.Max(0, lightHeapMiB);
             sessionResetSequence = ulong.MaxValue;
             sessionReady = false;
             sessionDroppedBaseline = 0;
             sessionConfigLogged = false;
             sessionEncodingLogged = false;
             sessionStagingLogged = false;
+            sessionLightLogged = false;
             feed.Forget();
         }
+
+        /// <summary>The light tree options of the session (the reset frame packet's <c>light</c>).</summary>
+        private CaelixNativeLightOptions SessionLightOptions() => new CaelixNativeLightOptions
+        {
+            enabled = sessionLightTree ? 1u : 0u,
+            minEmission = sessionLightMinEmission,
+            heapBytes = (ulong)sessionLightHeapMiB << 20,
+        };
 
         /// <summary>
         /// The tripwires of a live session. False when the session ended (the plugin dropped
@@ -240,6 +259,16 @@ namespace Caelix.Rendering.Native
                     Debug.Log($"Caelix native: staging ring {stagingRingMiB} MiB applies at the next session (this one has " +
                               $"{sessionStagingMiB} MiB).", this);
                 }
+            }
+            if (!sessionLightLogged && (lightTree != sessionLightTree || !Mathf.Approximately(lightMinEmission, sessionLightMinEmission) ||
+                                        lightHeapMiB != sessionLightHeapMiB))
+            {
+                // Not reverted (unlike the encoding): the new values are used by the next session.
+                sessionLightLogged = true;
+                Debug.Log($"Caelix native: the light tree settings (tree {(lightTree ? "on" : "off")}, min emission " +
+                          $"{lightMinEmission}, heap {lightHeapMiB} MiB) apply at the next session; this one keeps tree " +
+                          $"{(sessionLightTree ? "on" : "off")}, min emission {sessionLightMinEmission}, heap " +
+                          $"{sessionLightHeapMiB} MiB.", this);
             }
 
             // Until the plugin consumed the reset packet, the status describes the previous scene.
@@ -306,7 +335,9 @@ namespace Caelix.Rendering.Native
                       $"pending C# {BricksPendingCSharp}, in flight {rings.BricksInFlight(s)}, free/cap {s.uploadBricksFree}/" +
                       $"{s.uploadBricksCap}, dropped {s.bricksDropped}, as_builds_pending {s.asBuildsPending}, GPU flush " +
                       $"{s.flushMs:F3} ms trace {s.traceMs:F3} ms composite {s.compositeMs:F3} ms denoise {s.denoiseMs:F3} ms " +
-                      $"upscale {s.upscaleMs:F3} ms (view {s.timingsView}); Tick {LastTickMilliseconds:F3} ms, deferred " +
+                      $"upscale {s.upscaleMs:F3} ms (view {s.timingsView}); light tree {s.lightEnabled}, light bricks " +
+                      $"{s.lightBricks}, light gpu ms {s.lightGpuMs:F3}, nee running 0x{s.lightNeeRunning:X2}, voxel id views " +
+                      $"0x{s.voxelIdViews:X2}; Tick {LastTickMilliseconds:F3} ms, deferred " +
                       $"{TicksDeferred}, skipped {PacketsSkipped}; jitter ({LastJitter.x:F3}, {LastJitter.y:F3}) px; upscaler " +
                       $"extensions {s.upscalerExtensions}{upscalers}.", this);
         }

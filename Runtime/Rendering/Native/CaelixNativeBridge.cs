@@ -58,7 +58,11 @@ namespace Caelix.Rendering.Native
         public uint blocksOffset;
     }
 
-    /// <summary>Mirror of <c>CaelixMaterial</c> (caelix.h). 48 bytes, linear values.</summary>
+    /// <summary>
+    /// Mirror of <c>CaelixMaterial</c> (caelix.h). 112 bytes, linear values. Every float must be
+    /// finite with a magnitude &lt;= 65504 (the GPU stores halves). The library stores the SSS and
+    /// texture fields but no kernel reads them yet.
+    /// </summary>
     [StructLayout(LayoutKind.Sequential)]
     public unsafe struct CaelixNativeMaterial
     {
@@ -68,10 +72,27 @@ namespace Caelix.Rendering.Native
         public float metallic;
         public float ior;
         public float extinction;
-        public fixed float pad[2];
+        /// <summary>Subsurface scattering model, 0..255: 0 = none.</summary>
+        public uint sssModel;
+        /// <summary>0..1: probability that a path entering the voxel scatters.</summary>
+        public float sssProbability;
+        /// <summary>0..1 per channel, per scattering step.</summary>
+        public fixed float sssAlbedo[3];
+        /// <summary>-1..1 (Henyey-Greenstein g or the model's equivalent).</summary>
+        public float sssAnisotropy;
+        /// <summary>0..255: step cap of a walk.</summary>
+        public uint sssSteps;
+        /// <summary>Per-model parameters.</summary>
+        public fixed float sssParams[8];
+        /// <summary>0..65535, reserved for textures.</summary>
+        public uint textureSet;
+        /// <summary>0..65535, reserved for connected textures.</summary>
+        public uint connectGroup;
+        /// <summary>Ignored; pass 0.</summary>
+        public uint reserved;
     }
 
-    /// <summary>Mirror of <c>CaelixMaterialEntry</c> (caelix.h). 52 bytes.</summary>
+    /// <summary>Mirror of <c>CaelixMaterialEntry</c> (caelix.h). 116 bytes.</summary>
     [StructLayout(LayoutKind.Sequential)]
     public struct CaelixNativeMaterialEntry
     {
@@ -91,7 +112,7 @@ namespace Caelix.Rendering.Native
         public uint mipLevels;
     }
 
-    /// <summary>Mirror of <c>CaelixRenderOptions</c> (caelix.h). 192 bytes.</summary>
+    /// <summary>Mirror of <c>CaelixRenderOptions</c> (caelix.h). 208 bytes.</summary>
     [StructLayout(LayoutKind.Sequential)]
     public unsafe struct CaelixNativeRenderOptions
     {
@@ -132,6 +153,34 @@ namespace Caelix.Rendering.Native
         public uint upscalePreset;
         /// <summary><c>CAELIX_UPSCALE_FLAG_*</c>: <see cref="CaelixNativeBridge.UpscaleFlagResetHistory"/>, <see cref="CaelixNativeBridge.UpscaleFlagAutoExposure"/>.</summary>
         public uint upscaleFlags;
+        /// <summary>Every mode: hits farther than this along the camera ray are misses in the voxel id target and view; 0 = no limit.</summary>
+        public float voxelIdTMax;
+        /// <summary>Reserved, pass 0.</summary>
+        public fixed uint reservedVoxelId[3];
+    }
+
+    /// <summary>Mirror of <c>CaelixLightOptions</c> (caelix.h). 16 bytes. The light tree of the scene.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct CaelixNativeLightOptions
+    {
+        /// <summary>0 = no light tree, 1 = build it.</summary>
+        public uint enabled;
+        /// <summary>Light voxel threshold: luminance of the material emission before the emission scale. 0 = the library default (20).</summary>
+        public float minEmission;
+        /// <summary>Initial capacity of each of the two heap buffers in bytes. 0 = the library default (16 MiB).</summary>
+        public ulong heapBytes;
+    }
+
+    /// <summary>Mirror of <c>CaelixLightNeeOptions</c> (caelix.h). 16 bytes. The light NEE of one renderer.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public unsafe struct CaelixNativeLightNeeOptions
+    {
+        /// <summary>0 = off, 1 = on.</summary>
+        public uint enabled;
+        /// <summary><c>CAELIX_LIGHT_NEE_FLAG_*</c>: <see cref="CaelixNativeBridge.LightNeeFlagNoMis"/>.</summary>
+        public uint flags;
+        /// <summary>Must be 0.</summary>
+        public fixed uint reserved[2];
     }
 
     /// <summary>Mirror of <c>CaelixCamera</c> (caelix.h). 152 bytes.</summary>
@@ -153,12 +202,12 @@ namespace Caelix.Rendering.Native
         public fixed float jitter[2];
     }
 
-    /// <summary>Mirror of <c>CaelixUnityFramePacket</c> (caelix_unity.h). 80 bytes.</summary>
+    /// <summary>Mirror of <c>CaelixUnityFramePacket</c> (caelix_unity.h). 96 bytes.</summary>
     /// <remarks>
     /// One per Unity frame, with the frame event. The scene records follow it in the same memory
     /// block; the offsets are bytes from the packet start (see caelix_unity.h for the apply order).
-    /// The session config (encoding, staging size, material entries) is read only with
-    /// <see cref="CaelixNativeBridge.FrameReset"/>.
+    /// The session config (encoding, staging size, material entries, light tree options) is read
+    /// only with <see cref="CaelixNativeBridge.FrameReset"/>.
     /// </remarks>
     [StructLayout(LayoutKind.Sequential)]
     public struct CaelixNativeFramePacket
@@ -183,9 +232,11 @@ namespace Caelix.Rendering.Native
         /// <summary>The bricks of every upload record together (C# accounting).</summary>
         public uint brickCount;
         public uint pad;
+        /// <summary>Session config: the light tree options, applied right after the scene is created.</summary>
+        public CaelixNativeLightOptions light;
     }
 
-    /// <summary>Mirror of <c>CaelixUnityViewPacket</c> (caelix_unity.h). 504 bytes.</summary>
+    /// <summary>Mirror of <c>CaelixUnityViewPacket</c> (caelix_unity.h). 560 bytes.</summary>
     /// <remarks>One per view per Unity frame, with the render event.</remarks>
     [StructLayout(LayoutKind.Sequential)]
     public struct CaelixNativeViewPacket
@@ -210,6 +261,13 @@ namespace Caelix.Rendering.Native
         public CaelixNativeTarget sky;
         public CaelixNativeCamera camera;
         public CaelixNativeRenderOptions options;
+        /// <summary>
+        /// Optional voxel id target (R32_UINT or R32G32_UINT, random write) at the colour size, also
+        /// while the view upscales; nativeTexture zero = absent.
+        /// </summary>
+        public CaelixNativeTarget voxelId;
+        /// <summary>The light NEE options of the view's renderer (set by the plugin when they change).</summary>
+        public CaelixNativeLightNeeOptions lightNee;
     }
 
     /// <summary>Mirror of <c>CaelixUnityReleasePacket</c> (caelix_unity.h). 32 bytes.</summary>
@@ -250,7 +308,10 @@ namespace Caelix.Rendering.Native
             upscaler == upscalerValue && quality == qualityValue && outputWidth == (uint)width && outputHeight == (uint)height;
     }
 
-    /// <summary>Mirror of <c>CaelixUnityStatus</c> (caelix_unity.h). 536 bytes. Counters are monotonic.</summary>
+    /// <summary>
+    /// Mirror of <c>CaelixUnityStatus</c> (caelix_unity.h). 568 bytes (the last 4 are tail padding
+    /// to the 8-byte alignment, as in C). Counters are monotonic.
+    /// </summary>
     [StructLayout(LayoutKind.Sequential)]
     public struct CaelixNativeStatus
     {
@@ -330,6 +391,19 @@ namespace Caelix.Rendering.Native
         public CaelixNativeUpscalerStatus upscaler6;
         public CaelixNativeUpscalerStatus upscaler7;
 
+        // Light tree (after the newest flush) and light NEE.
+        /// <summary><c>CaelixLightStats::light_bricks</c>: bricks with at least one light face.</summary>
+        public ulong lightBricks;
+        /// <summary><c>CaelixLightStats::gpu_ms</c>: GPU time of the newest measured light update.</summary>
+        public float lightGpuMs;
+        /// <summary><c>CaelixLightStats::enabled</c>: 1 while the scene's light tree is enabled.</summary>
+        public uint lightEnabled;
+        /// <summary>Bit v = the newest render of view v ran the light NEE.</summary>
+        public uint lightNeeRunning;
+        /// <summary>Bit v = the newest render event of view v passed a voxel id target.</summary>
+        public uint voxelIdViews;
+        public uint pad1;
+
         /// <summary>The newest upscaler query of <paramref name="view"/> (0 .. <see cref="CaelixNativeBridge.MaxViews"/> - 1).</summary>
         public readonly CaelixNativeUpscalerStatus Upscaler(int view)
         {
@@ -356,14 +430,14 @@ namespace Caelix.Rendering.Native
     /// All renderer work runs on the render thread inside plugin events issued through
     /// <see cref="UnityEngine.Rendering.CommandBuffer.IssuePluginEventAndData"/>: the frame event
     /// (one per Unity frame, scene records and flush), the render event (one per view per frame)
-    /// and the release event. The contract is caelix_unity.h (packet version 6).
+    /// and the release event. The contract is caelix_unity.h (packet version 7).
     /// </remarks>
     public static class CaelixNativeBridge
     {
         private const string Dll = "caelix_unity";
 
         /// <summary>Must equal <c>CAELIX_UNITY_PACKET_VERSION</c>.</summary>
-        public const uint PacketVersion = 6;
+        public const uint PacketVersion = 7;
 
         /// <summary>Must equal <c>CAELIX_UNITY_MAX_VIEWS</c>: the number of views, one per camera, each with its own plugin renderer.</summary>
         public const uint MaxViews = 8;
@@ -374,16 +448,18 @@ namespace Caelix.Rendering.Native
         public const int EntitySize = 48;
         public const int BrickRemoveSize = 16;
         public const int UploadSize = 16;
-        public const int MaterialSize = 48;
-        public const int MaterialEntrySize = 52;
+        public const int MaterialSize = 112;
+        public const int MaterialEntrySize = 116;
         public const int SkyCubemapSize = 24;
-        public const int RenderOptionsSize = 192;
+        public const int RenderOptionsSize = 208;
         public const int CameraSize = 152;
-        public const int FramePacketSize = 80;
-        public const int ViewPacketSize = 504;
+        public const int LightOptionsSize = 16;
+        public const int LightNeeOptionsSize = 16;
+        public const int FramePacketSize = 96;
+        public const int ViewPacketSize = 560;
         public const int ReleasePacketSize = 32;
         public const int UpscalerStatusSize = 32;
-        public const int StatusSize = 536;
+        public const int StatusSize = 568;
 
         // CaelixUnityPacketHeader::kind.
         public const uint PacketFrame = 1u;
@@ -424,6 +500,9 @@ namespace Caelix.Rendering.Native
         public const uint UpscaleFlagResetHistory = 1u;
         /// <summary>DLSS SR: NGX auto exposure instead of a fixed exposure of 1.</summary>
         public const uint UpscaleFlagAutoExposure = 2u;
+
+        /// <summary><c>CAELIX_LIGHT_NEE_FLAG_NO_MIS</c>: exclusive rule instead of the balance heuristic.</summary>
+        public const uint LightNeeFlagNoMis = 1u;
 
         [DllImport(Dll, CallingConvention = CallingConvention.Cdecl)]
         private static extern IntPtr caelix_unity_get_render_event_func();
@@ -506,6 +585,8 @@ namespace Caelix.Rendering.Native
             Expect<CaelixNativeSkyCubemap>(SkyCubemapSize);
             Expect<CaelixNativeRenderOptions>(RenderOptionsSize);
             Expect<CaelixNativeCamera>(CameraSize);
+            Expect<CaelixNativeLightOptions>(LightOptionsSize);
+            Expect<CaelixNativeLightNeeOptions>(LightNeeOptionsSize);
             Expect<CaelixNativeFramePacket>(FramePacketSize);
             Expect<CaelixNativeViewPacket>(ViewPacketSize);
             Expect<CaelixNativeReleasePacket>(ReleasePacketSize);
@@ -516,6 +597,15 @@ namespace Caelix.Rendering.Native
                                   Marshal.OffsetOf<CaelixNativeStatus>(nameof(CaelixNativeStatus.upscaler0)).ToInt32() != 280))
             {
                 wrong = "CaelixNativeStatus upscaler field offsets (expected 164, 276, 280)";
+            }
+            if (wrong == null && (Marshal.OffsetOf<CaelixNativeStatus>(nameof(CaelixNativeStatus.lightBricks)).ToInt32() != 536 ||
+                                  Marshal.OffsetOf<CaelixNativeStatus>(nameof(CaelixNativeStatus.voxelIdViews)).ToInt32() != 556 ||
+                                  Marshal.OffsetOf<CaelixNativeFramePacket>(nameof(CaelixNativeFramePacket.light)).ToInt32() != 80 ||
+                                  Marshal.OffsetOf<CaelixNativeViewPacket>(nameof(CaelixNativeViewPacket.voxelId)).ToInt32() != 520 ||
+                                  Marshal.OffsetOf<CaelixNativeViewPacket>(nameof(CaelixNativeViewPacket.lightNee)).ToInt32() != 544))
+            {
+                wrong = "packet version 7 field offsets (expected status lightBricks 536, voxelIdViews 556, frame packet " +
+                        "light 80, view packet voxelId 520, lightNee 544)";
             }
             if (wrong != null)
             {

@@ -12,7 +12,8 @@ namespace Caelix.Rendering.Native
     /// A view is one camera: every camera that renders through <see cref="CaelixNativeRendererFeature"/>
     /// gets its own view (up to <see cref="CaelixNativeBridge.MaxViews"/>), with its own plugin
     /// renderer (internal targets, denoiser history) over one shared scene. This component owns,
-    /// per view, the four targets the plugin writes (<see cref="CaelixNativeViewTargets"/>).
+    /// per view, the targets the plugin writes (<see cref="CaelixNativeViewTargets"/>: colour, depth,
+    /// motion, albedo and the optional voxel id).
     /// <para>
     /// <see cref="Tick"/> (called once per frame by <see cref="CaelixHost"/> after the client's
     /// <c>PrepareRender</c>, like the ray query renderer) fills ONE frame packet with the scene
@@ -35,8 +36,8 @@ namespace Caelix.Rendering.Native
     /// renders without the upscaler. The camera's own TAA should be off (DLSS replaces it).
     /// </para>
     /// <para>
-    /// Sessions: the scene's block encoding, its material table and its staging ring size are
-    /// fixed for a session. A session starts at the first tick with a client world (and again for
+    /// Sessions: the scene's block encoding, its material table, its staging ring size and its
+    /// light tree options are fixed for a session. A session starts at the first tick with a client world (and again for
     /// a new client world): a release event that destroys the plugin's scene and renderers, then a
     /// frame packet with the reset flag and the session config; every entity is sent as new. It
     /// ends when the component is disabled (another release event: the plugin holds no scene
@@ -88,6 +89,7 @@ namespace Caelix.Rendering.Native
             Motion = 8,
             Material = 9,
             NrdSpecular = 10,
+            VoxelId = 11,
         }
 
         /// <summary>The upscaler of the path trace mode (values = caelix.h <c>CaelixUpscaler</c>).</summary>
@@ -158,7 +160,7 @@ namespace Caelix.Rendering.Native
 
         [Header("Mode")]
         [SerializeField] private RenderMode mode = RenderMode.PathTrace;
-        [SerializeField, Tooltip("Primary mode: views 0..5 and 9. Path trace mode: views 6, 7, 8, 10.")]
+        [SerializeField, Tooltip("Primary mode: views 0..5, 9 and 11. Path trace mode: views 6, 7, 8, 10.")]
         private DebugView debugView = DebugView.Albedo;
         [SerializeField, Range(0, 14)] private int bounces = 4;
         [SerializeField, Range(0, 15)] private int bouncesTransparent = 5;
@@ -212,6 +214,32 @@ namespace Caelix.Rendering.Native
         private int upscalePreset = 0;
         [SerializeField, Tooltip("DLSS Super Resolution only: NGX auto exposure instead of a fixed exposure of 1.")]
         private bool upscaleAutoExposure = false;
+
+        [Header("Light Tree and Light NEE")]
+        [SerializeField, Tooltip("Builds the scene's light BVH over the emissive voxels (the light tree). Fixed for a " +
+                                 "session: a change takes effect at the next session.")]
+        private bool lightTree = true;
+        [SerializeField, Min(0.0f), Tooltip("Light voxel threshold: luminance of the material emission before the emission " +
+                                            "scale. 0 = the library default (20). Fixed for a session.")]
+        private float lightMinEmission = 0.0f;
+        [SerializeField, Min(0), Tooltip("Initial capacity of each of the two light heap buffers in MiB. 0 = the library " +
+                                         "default (16 MiB); the heap grows on demand. Fixed for a session.")]
+        private int lightHeapMiB = 0;
+        [SerializeField, Tooltip("Lighting modes: every diffuse path vertex draws one lamp point from the light tree " +
+                                 "(next-event estimation of the light voxels). Needs the light tree.")]
+        private bool lightNee = true;
+        [SerializeField, Tooltip("Light NEE: balance heuristic between the NEE and the BSDF hits on lamps. Off = the " +
+                                 "exclusive rule (the BSDF path counts no lamp the NEE can sample).")]
+        private bool lightNeeMis = true;
+
+        [Header("Voxel Id")]
+        [SerializeField, Tooltip("One R32_UINT target per view at the camera size: the voxel hash of the camera ray's " +
+                                 "first hit, bound as the global texture _CaelixNativeVoxelId for post-processes. A miss " +
+                                 "is 0xFFFFFFFF.")]
+        private bool voxelIdTarget = true;
+        [SerializeField, Min(0.0f), Tooltip("Hits farther than this along the camera ray count as misses in the voxel id " +
+                                            "target and the voxel id debug view. 0 = no limit.")]
+        private float voxelIdTMax = 0.0f;
 
         /// <summary>The enabled instance the renderer feature draws. One at a time.</summary>
         public static CaelixNativeRenderer Active { get; private set; }
@@ -277,6 +305,21 @@ namespace Caelix.Rendering.Native
         public int UpscalePreset { get => upscalePreset; set => upscalePreset = Mathf.Clamp(value, 0, 15); }
         /// <summary>DLSS Super Resolution only: NGX auto exposure.</summary>
         public bool UpscaleAutoExposure { get => upscaleAutoExposure; set => upscaleAutoExposure = value; }
+
+        /// <summary>Builds the scene's light tree. Fixed for a session: a change takes effect at the next session.</summary>
+        public bool LightTree { get => lightTree; set => lightTree = value; }
+        /// <summary>Light voxel threshold (emission luminance before the emission scale); 0 = the library default. Fixed for a session.</summary>
+        public float LightMinEmission { get => lightMinEmission; set => lightMinEmission = Mathf.Max(0f, value); }
+        /// <summary>Initial capacity of each light heap buffer in MiB; 0 = the library default. Fixed for a session.</summary>
+        public int LightHeapMiB { get => lightHeapMiB; set => lightHeapMiB = Mathf.Max(0, value); }
+        /// <summary>Lighting modes: next-event estimation of the light voxels through the light tree (live).</summary>
+        public bool LightNee { get => lightNee; set => lightNee = value; }
+        /// <summary>Light NEE: balance heuristic (true) or exclusive rule (false) (live).</summary>
+        public bool LightNeeMis { get => lightNeeMis; set => lightNeeMis = value; }
+        /// <summary>One voxel id target per view, bound as the global texture <c>_CaelixNativeVoxelId</c> (live).</summary>
+        public bool VoxelIdTarget { get => voxelIdTarget; set => voxelIdTarget = value; }
+        /// <summary>Hits farther than this count as misses in the voxel id target; 0 = no limit (live).</summary>
+        public float VoxelIdTMax { get => voxelIdTMax; set => voxelIdTMax = Mathf.Max(0f, value); }
 
         /// <summary>
         /// Staging ring of the plugin's scene in MiB. Applied when a session starts; a change during

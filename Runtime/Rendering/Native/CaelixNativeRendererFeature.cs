@@ -17,7 +17,8 @@ namespace Caelix.Rendering.Native
     /// jitter from URP's jittered projection, options, the view's targets, the sky cubemap) and
     /// issues the plugin's render event with it, after a release event when a target was
     /// replaced. The plugin records the trace into Unity's command buffer and writes four
-    /// targets: colour, device depth, motion and albedo (alpha = coverage). The library writes them
+    /// targets: colour, device depth, motion and albedo (alpha = coverage), and the optional voxel
+    /// id target (<see cref="CaelixNativeRenderer.VoxelIdTarget"/>). The library writes them
     /// with <c>CAELIX_RENDER_FLAG_FLIP_Y</c>, so their rows already have Unity's order (row 0 at the
     /// bottom) and no pass flips.</item>
     /// <item><see cref="PresentPass"/> stage 0 (after opaques) draws the pixels with coverage
@@ -40,6 +41,13 @@ namespace Caelix.Rendering.Native
     /// cameras never mix their denoiser history. A camera beyond the limit is not drawn. Scene view
     /// cameras have no TAA, so the motion pass does not run for them.
     /// </para>
+    /// <para>
+    /// The present and motion passes bind the targets as global textures (<c>_CaelixNativeColor</c>,
+    /// <c>_CaelixNativeDepth</c>, <c>_CaelixNativeMotion</c>, <c>_CaelixNativeAlbedo</c> and, when the
+    /// view has it, <c>_CaelixNativeVoxelId</c>: R32_UINT at the camera size, the voxel hash of the
+    /// camera ray's first hit, 0xFFFFFFFF on a miss). The globals stay bound after those passes, so a
+    /// later post-process of the camera can read the voxel id; the present shader does not.
+    /// </para>
     /// The render and release events go through <see cref="CommandBuffer.IssuePluginEventAndData"/>
     /// on the native command buffer of an unsafe pass (<see cref="CommandBufferHelpers.GetNativeCommandBuffer"/>):
     /// the RenderGraph command buffer types do not expose plugin events.
@@ -53,6 +61,7 @@ namespace Caelix.Rendering.Native
         private static readonly int DepthTexId = Shader.PropertyToID("_CaelixNativeDepth");
         private static readonly int MotionTexId = Shader.PropertyToID("_CaelixNativeMotion");
         private static readonly int AlbedoTexId = Shader.PropertyToID("_CaelixNativeAlbedo");
+        private static readonly int VoxelIdTexId = Shader.PropertyToID("_CaelixNativeVoxelId");
         private static readonly int PrimaryViewId = Shader.PropertyToID("_CaelixPrimaryView");
 
         // Shader pass indices of Caelix/NativePresent.
@@ -143,6 +152,8 @@ namespace Caelix.Rendering.Native
             public TextureHandle Depth;
             public TextureHandle Motion;
             public TextureHandle Albedo;
+            /// <summary>Optional: null while the view has no voxel id target.</summary>
+            public TextureHandle VoxelId;
             public bool PrimaryView;
 
             public override void Reset()
@@ -151,6 +162,7 @@ namespace Caelix.Rendering.Native
                 Depth = TextureHandle.nullHandle;
                 Motion = TextureHandle.nullHandle;
                 Albedo = TextureHandle.nullHandle;
+                VoxelId = TextureHandle.nullHandle;
                 PrimaryView = false;
             }
 
@@ -192,6 +204,8 @@ namespace Caelix.Rendering.Native
                 frame.Depth = renderGraph.ImportTexture(native.DepthHandle(view));
                 frame.Motion = renderGraph.ImportTexture(native.MotionHandle(view));
                 frame.Albedo = renderGraph.ImportTexture(native.AlbedoHandle(view));
+                RTHandle voxelId = native.VoxelIdHandle(view);
+                if (voxelId != null) frame.VoxelId = renderGraph.ImportTexture(voxelId);
                 frame.PrimaryView = native.ColorIsDisplayEncoded(view);
 
                 using (var builder = renderGraph.AddUnsafePass<PassData>("Caelix Native Render", out var passData))
@@ -206,6 +220,7 @@ namespace Caelix.Rendering.Native
                     builder.UseTexture(frame.Depth, AccessFlags.Write);
                     builder.UseTexture(frame.Motion, AccessFlags.Write);
                     builder.UseTexture(frame.Albedo, AccessFlags.Write);
+                    if (frame.VoxelId.IsValid()) builder.UseTexture(frame.VoxelId, AccessFlags.Write);
                     builder.AllowPassCulling(false);
                     builder.SetRenderFunc((PassData data, UnsafeGraphContext context) =>
                     {
@@ -222,14 +237,18 @@ namespace Caelix.Rendering.Native
             }
         }
 
-        /// <summary>Binds the four plugin targets as globals for the present shader.</summary>
+        /// <summary>
+        /// Binds the plugin targets as globals: the four the present shader reads, and the voxel id
+        /// (when valid) for later post-processes.
+        /// </summary>
         private static void BindTargets(CommandBuffer cmd, TextureHandle color, TextureHandle depth,
-            TextureHandle motion, TextureHandle albedo, bool primaryView)
+            TextureHandle motion, TextureHandle albedo, TextureHandle voxelId, bool primaryView)
         {
             cmd.SetGlobalTexture(ColorTexId, color);
             cmd.SetGlobalTexture(DepthTexId, depth);
             cmd.SetGlobalTexture(MotionTexId, motion);
             cmd.SetGlobalTexture(AlbedoTexId, albedo);
+            if (voxelId.IsValid()) cmd.SetGlobalTexture(VoxelIdTexId, voxelId);
             cmd.SetGlobalFloat(PrimaryViewId, primaryView ? 1.0f : 0.0f);
         }
 
@@ -244,7 +263,7 @@ namespace Caelix.Rendering.Native
 
             private class PassData
             {
-                internal TextureHandle Color, Depth, Motion, Albedo;
+                internal TextureHandle Color, Depth, Motion, Albedo, VoxelId;
                 internal TextureHandle ColorDest, DepthDest;
                 internal bool PrimaryView;
                 internal Material Material;
@@ -265,6 +284,7 @@ namespace Caelix.Rendering.Native
                     passData.Depth = frame.Depth;
                     passData.Motion = frame.Motion;
                     passData.Albedo = frame.Albedo;
+                    passData.VoxelId = frame.VoxelId;
                     passData.ColorDest = resources.activeColorTexture;
                     passData.DepthDest = resources.activeDepthTexture;
                     passData.PrimaryView = frame.PrimaryView;
@@ -275,6 +295,8 @@ namespace Caelix.Rendering.Native
                     builder.UseTexture(frame.Depth, AccessFlags.Read);
                     builder.UseTexture(frame.Motion, AccessFlags.Read);
                     builder.UseTexture(frame.Albedo, AccessFlags.Read);
+                    // Declared so that the graph keeps the voxel id alive; bound as a global for later passes.
+                    if (frame.VoxelId.IsValid()) builder.UseTexture(frame.VoxelId, AccessFlags.Read);
                     builder.UseTexture(passData.ColorDest, AccessFlags.Write);
                     builder.UseTexture(passData.DepthDest, Stage == 0 ? AccessFlags.Write : AccessFlags.Read);
                     builder.AllowPassCulling(false);
@@ -283,7 +305,7 @@ namespace Caelix.Rendering.Native
                     {
                         CommandBuffer cmd = CommandBufferHelpers.GetNativeCommandBuffer(context.cmd);
                         cmd.SetRenderTarget(data.ColorDest, data.DepthDest);
-                        BindTargets(cmd, data.Color, data.Depth, data.Motion, data.Albedo, data.PrimaryView);
+                        BindTargets(cmd, data.Color, data.Depth, data.Motion, data.Albedo, data.VoxelId, data.PrimaryView);
                         // The library already wrote Unity's row order (CAELIX_RENDER_FLAG_FLIP_Y): no flip.
                         Blitter.BlitTexture(cmd, data.Color, new Vector4(1, 1, 0, 0), data.Material, data.ShaderPass);
                     });
@@ -301,7 +323,7 @@ namespace Caelix.Rendering.Native
 
             private class PassData
             {
-                internal TextureHandle Color, Depth, Motion, Albedo;
+                internal TextureHandle Color, Depth, Motion, Albedo, VoxelId;
                 internal TextureHandle MotionDest, DepthDest;
                 internal Material Material;
             }
@@ -320,6 +342,7 @@ namespace Caelix.Rendering.Native
                     passData.Depth = frame.Depth;
                     passData.Motion = frame.Motion;
                     passData.Albedo = frame.Albedo;
+                    passData.VoxelId = frame.VoxelId;
                     passData.MotionDest = resources.motionVectorColor;
                     passData.DepthDest = resources.activeDepthTexture;
                     passData.Material = Material;
@@ -328,6 +351,7 @@ namespace Caelix.Rendering.Native
                     builder.UseTexture(frame.Depth, AccessFlags.Read);
                     builder.UseTexture(frame.Motion, AccessFlags.Read);
                     builder.UseTexture(frame.Albedo, AccessFlags.Read);
+                    if (frame.VoxelId.IsValid()) builder.UseTexture(frame.VoxelId, AccessFlags.Read);
                     builder.UseTexture(passData.MotionDest, AccessFlags.ReadWrite);
                     builder.UseTexture(passData.DepthDest, AccessFlags.Read);
                     builder.AllowPassCulling(false);
@@ -336,7 +360,7 @@ namespace Caelix.Rendering.Native
                     {
                         CommandBuffer cmd = CommandBufferHelpers.GetNativeCommandBuffer(context.cmd);
                         cmd.SetRenderTarget(data.MotionDest, data.DepthDest);
-                        BindTargets(cmd, data.Color, data.Depth, data.Motion, data.Albedo, false);
+                        BindTargets(cmd, data.Color, data.Depth, data.Motion, data.Albedo, data.VoxelId, false);
                         Blitter.BlitTexture(cmd, data.Motion, new Vector4(1, 1, 0, 0), data.Material, PassMotion);
                     });
                 }
