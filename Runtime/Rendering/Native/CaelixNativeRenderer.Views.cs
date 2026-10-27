@@ -55,6 +55,8 @@ namespace Caelix.Rendering.Native
             public int LastFrame;
             public readonly CaelixNativeViewTargets Targets = new CaelixNativeViewTargets();
             public readonly ViewFrameState State = new ViewFrameState();
+            /// <summary>The newest prepared frame of the view upscales (see <see cref="ViewUpscales"/>).</summary>
+            public bool Upscales;
             /// <summary>The upscaler key whose "not available" warning was logged for this view.</summary>
             public CaelixNativeUpscalerStatus WarnedUnsupported;
             public bool HasWarnedUnsupported;
@@ -130,7 +132,10 @@ namespace Caelix.Rendering.Native
         /// </summary>
         public RTHandle ColorHandle(int view) => viewSlots[view].Targets.Color.Handle;
 
-        /// <summary>Device depth of Unity's GPU projection (R32F) for <paramref name="view"/>; a miss is the far plane.</summary>
+        /// <summary>
+        /// Device depth of Unity's GPU projection (R32F, camera size) for <paramref name="view"/>; a
+        /// miss is the far plane.
+        /// </summary>
         public RTHandle DepthHandle(int view) => viewSlots[view].Targets.Depth.Handle;
 
         /// <summary>
@@ -148,6 +153,19 @@ namespace Caelix.Rendering.Native
         /// (<see cref="VoxelIdTarget"/> off, or before the view's first frame).
         /// </summary>
         public RTHandle VoxelIdHandle(int view) => viewSlots[view].Targets.VoxelId.Handle;
+
+        /// <summary>
+        /// The background input of <paramref name="view"/> (RGBA16F at the geometry size, sampled
+        /// only): the feature downsamples the camera colour into it after Unity's skybox, before the
+        /// render event. Null before the view's first frame.
+        /// </summary>
+        public RTHandle BackgroundHandle(int view) => viewSlots[view].Targets.Background.Handle;
+
+        /// <summary>
+        /// True when the newest prepared frame of <paramref name="view"/> asks for the upscaler with a
+        /// known render size (its geometry targets have that size, so the plugin upscales it).
+        /// </summary>
+        public bool ViewUpscales(int view) => viewSlots[view].Upscales;
 
         /// <summary>
         /// True when the colour target of <paramref name="view"/> holds values meant to be shown as
@@ -191,7 +209,7 @@ namespace Caelix.Rendering.Native
         /// with it before the render event. False when no session is live, every view is taken, or
         /// no packet slot is free (the frame of this camera is skipped and nothing is drawn).
         /// With an upscaler, the colour target keeps <paramref name="width"/> x <paramref name="height"/>
-        /// and the depth, motion and albedo targets get the render size that the plugin's status
+        /// and the motion, albedo and background targets get the render size that the plugin's status
         /// reports for the view's key (see <see cref="ResolveUpscaler"/>).
         /// </summary>
         public bool TryPrepareFrame(Camera camera, Matrix4x4 jitteredProjection, int width, int height,
@@ -230,6 +248,7 @@ namespace Caelix.Rendering.Native
             ViewSlot slot = viewSlots[index];
             slot.LastFrame = Time.frameCount;
             UpscalerRequest upscale = ResolveUpscaler(slot, index, camera, status, width, height);
+            slot.Upscales = upscale.Upscaler != 0 && upscale.RenderWidth != 0 && upscale.RenderHeight != 0;
             int geometryWidth = upscale.RenderWidth != 0 ? (int)upscale.RenderWidth : width;
             int geometryHeight = upscale.RenderHeight != 0 ? (int)upscale.RenderHeight : height;
             // Replacing a target bumps the shared generation, which needs a release event first.
@@ -270,6 +289,7 @@ namespace Caelix.Rendering.Native
                     enabled = lightNee ? 1u : 0u,
                     flags = lightNeeMis ? 0u : CaelixNativeBridge.LightNeeFlagNoMis,
                 },
+                background = slot.Targets.Background.ToPacket(),
             };
             data.camera = BuildCamera(camera, jitteredProjection, width, height, isGame, upscale);
             data.options = BuildOptions(slot, data.camera, upscale);

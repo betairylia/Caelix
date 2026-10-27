@@ -236,7 +236,7 @@ namespace Caelix.Rendering.Native
         public CaelixNativeLightOptions light;
     }
 
-    /// <summary>Mirror of <c>CaelixUnityViewPacket</c> (caelix_unity.h). 560 bytes.</summary>
+    /// <summary>Mirror of <c>CaelixUnityViewPacket</c> (caelix_unity.h). 584 bytes.</summary>
     /// <remarks>One per view per Unity frame, with the render event.</remarks>
     [StructLayout(LayoutKind.Sequential)]
     public struct CaelixNativeViewPacket
@@ -250,11 +250,12 @@ namespace Caelix.Rendering.Native
         public uint targetGeneration;
         public uint pad;
         public CaelixNativeTarget color;
+        /// <summary>Optional depth target (R32F, random write) at the colour size in every case.</summary>
+        public CaelixNativeTarget depth;
         /// <summary>
         /// Optional geometry targets (nativeTexture zero = absent): the colour size, or the
         /// upscaler's render size (<see cref="CaelixNativeUpscalerStatus"/>) while the view upscales.
         /// </summary>
-        public CaelixNativeTarget depth;
         public CaelixNativeTarget motion;
         public CaelixNativeTarget albedo;
         /// <summary>The sky cubemap of the lighting modes; nativeTexture zero = the procedural sky.</summary>
@@ -268,6 +269,13 @@ namespace Caelix.Rendering.Native
         public CaelixNativeTarget voxelId;
         /// <summary>The light NEE options of the view's renderer (set by the plugin when they change).</summary>
         public CaelixNativeLightNeeOptions lightNee;
+        /// <summary>
+        /// Optional background input (packet version 8): Unity's image behind the scene, sampled only
+        /// (no random write), at the geometry size (the upscaler's render size while the view upscales,
+        /// else the colour size). The library writes it into the colour target where the camera ray
+        /// misses; nativeTexture zero = absent.
+        /// </summary>
+        public CaelixNativeTarget background;
     }
 
     /// <summary>Mirror of <c>CaelixUnityReleasePacket</c> (caelix_unity.h). 32 bytes.</summary>
@@ -430,14 +438,14 @@ namespace Caelix.Rendering.Native
     /// All renderer work runs on the render thread inside plugin events issued through
     /// <see cref="UnityEngine.Rendering.CommandBuffer.IssuePluginEventAndData"/>: the frame event
     /// (one per Unity frame, scene records and flush), the render event (one per view per frame)
-    /// and the release event. The contract is caelix_unity.h (packet version 7).
+    /// and the release event. The contract is caelix_unity.h (packet version 8).
     /// </remarks>
     public static class CaelixNativeBridge
     {
         private const string Dll = "caelix_unity";
 
         /// <summary>Must equal <c>CAELIX_UNITY_PACKET_VERSION</c>.</summary>
-        public const uint PacketVersion = 7;
+        public const uint PacketVersion = 8;
 
         /// <summary>Must equal <c>CAELIX_UNITY_MAX_VIEWS</c>: the number of views, one per camera, each with its own plugin renderer.</summary>
         public const uint MaxViews = 8;
@@ -456,7 +464,7 @@ namespace Caelix.Rendering.Native
         public const int LightOptionsSize = 16;
         public const int LightNeeOptionsSize = 16;
         public const int FramePacketSize = 96;
-        public const int ViewPacketSize = 560;
+        public const int ViewPacketSize = 584;
         public const int ReleasePacketSize = 32;
         public const int UpscalerStatusSize = 32;
         public const int StatusSize = 568;
@@ -606,6 +614,10 @@ namespace Caelix.Rendering.Native
             {
                 wrong = "packet version 7 field offsets (expected status lightBricks 536, voxelIdViews 556, frame packet " +
                         "light 80, view packet voxelId 520, lightNee 544)";
+            }
+            if (wrong == null && Marshal.OffsetOf<CaelixNativeViewPacket>(nameof(CaelixNativeViewPacket.background)).ToInt32() != 560)
+            {
+                wrong = "packet version 8 field offset (expected view packet background 560)";
             }
             if (wrong != null)
             {
