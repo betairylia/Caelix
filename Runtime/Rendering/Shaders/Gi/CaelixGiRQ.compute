@@ -1,0 +1,1006 @@
+// The GI resampler: NAADF-style reuse of diffuse path samples across frames and pixels.
+// Design and every layout: Documentation~/internals/rendering/GI_RESAMPLING.md.
+//
+// Seven kernels, dispatched in this order by CaelixGiPass:
+//   GiPreparePixels    per pixel   3x3 virtual-distance range and hash set
+//   GiPrepareBuckets   per bucket  clear counters, normal mask, distance range
+//   GiGenerateSamples  per pixel   one new path sample into the lit or unlit ring
+//   GiPrepareHistory   1 thread    valid sample counts, ring starts, indirect arguments
+//   GiReprojectLit     per sample  move a lit sample to this frame, count it into its bucket
+//   GiReprojectUnlit   per sample  the same for unlit samples (count only)
+//   GiRefineBuckets    per bucket  lit ratio, sample leveling, keep at most 8 samples
+//   GiSpatial          per pixel   reservoir resampling over nearby buckets, visibility ray
+//
+// Set up exactly like CaelixPathTraceRQ.compute so CaelixPathTraceCommon.hlsl provides the shading
+// (CaelixShadeVoxelHit, CaelixMediumExtinction, CaelixSampleSkyRadiance), the blue noise and the
+// material table. The bake kernels are declared only so CaelixMaterialTable.hlsl compiles; the
+// G-buffer stage already filled the shared material buffer this file reads.
+
+#include "UnityRayQuery.cginc"
+
+#pragma target 5.0
+#pragma kernel GiPreparePixels
+#pragma kernel GiPrepareBuckets
+#pragma kernel GiGenerateSamples
+#pragma kernel GiPrepareHistory
+#pragma kernel GiReprojectLit
+#pragma kernel GiReprojectUnlit
+#pragma kernel GiRefineBuckets
+#pragma kernel GiSpatial
+#pragma kernel CaelixBakeMaterialsAlbedo
+#pragma kernel CaelixBakeMaterialsEmission
+#pragma kernel CaelixBakeMaterialsScalars
+#pragma use_dxc
+// Int64 is required by the brick DDA (see CaelixPathTraceRQ.compute).
+#pragma require inlineraytracing Int64 WaveBasic
+// Render group shape, set per dispatch by CaelixRayQueryDispatch.SetGroupKeyword.
+#pragma multi_compile _ CAELIX_GROUP_3_3_3 CAELIX_GROUP_5_5_5 CAELIX_GROUP_4_7_4
+
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Packing.hlsl"
+#include "Assets/Caelix/VoxelMaterials.hlsl"
+
+#include "../RayQuery/CaelixMaterialTable.hlsl"
+
+#include "../RayPayload.hlsl"
+#include "../Utils/Utils.hlsl"
+
+#define CAELIX_INLINE_RAY_QUERY 1
+
+// Per-thread launch index; the blue noise reads it. The GI kernels set it to the texel.
+static uint2 _CaelixLaunchIndex;
+uint2 g_LaunchDim;
+#define CAELIX_LAUNCH_INDEX _CaelixLaunchIndex
+#define CAELIX_LAUNCH_DIM g_LaunchDim
+
+#include "../Utils/BlueNoise.hlsl"
+#include "../def/CaelixRayPayloadUtils.hlsl"
+#include "../def/CaelixUtils.hlsl"
+
+RaytracingAccelerationStructure g_AccelStruct;
+
+#include "../RayQuery/CaelixRayQueryTrace.hlsl"
+
+#define CAELIX_TRACE_RAY(ray, payload) CaelixRayQueryTrace(ray, payload)
+
+#include "../PathTrace_full/CaelixPathTraceCommon.hlsl"
+
+#include "CaelixGiCommon.hlsl"
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// INPUTS AND STATE
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+// G-buffer, written by CaelixPathTraceRQ in GI mode this frame.
+Texture2D<float4> g_GiSurface;      // .xyz real surface, .w virtual distance (K_T_MAX on miss)
+Texture2D<uint4> g_GiKey;           // hash16 | slot << 16, token, flags, block ID
+Texture2D<float4> g_GiNormal;       // NormalTarget: .xy oct-packed normal in [0, 1]
+// The output goes to DiffuseRadianceTarget (declared by CaelixPathTraceCommon.hlsl), bound to the
+// frame's StochasticDiffuse target.
+
+RWStructuredBuffer<GiLitSample> g_GiLitRing;
+RWStructuredBuffer<GiUnlitSample> g_GiUnlitRing;
+RWStructuredBuffer<GiBucketSample> g_GiRefined;
+RWStructuredBuffer<GiBucketSample> g_GiCompact;
+RWStructuredBuffer<GiBucketInfo> g_GiBuckets;
+RWStructuredBuffer<GiPixelInfo> g_GiPixels;
+RWStructuredBuffer<uint> g_GiCounts;
+RWBuffer<uint> g_GiArgs;
+// This frame's own fresh sample per pixel (RGB9E5 incident radiance before the lit/unlit
+// leveling), 0 where no sample was traced. The spatial pass falls back to it instead of writing
+// black when its chosen candidate is occluded or none passed the gates.
+RWTexture2D<uint> g_GiOwnSample;
+Texture2D<float4> g_GiMotionVector;  // .xy previousUV - currentUV (NRD convention), from the tracer
+Texture2D<float4> g_GiPrevIndirect;  // last frame's temporal history: .a = accumulated frame count
+uint g_GiOwnSampleFallback;
+
+// Frames this camera's GI buffers have run since allocation; selects the per-frame count slot.
+uint g_GiRingFrame;
+uint g_GiLitCapacity;
+uint g_GiUnlitCapacity;
+uint g_GiBucketCount;
+
+// Settings (CaelixGiSettings).
+uint g_GiSampleRateDivisor;
+uint g_GiUniformSampleRate;
+uint g_GiHistoryValid;
+float g_GiSkySampleProbability;
+float g_GiLitThreshold;
+uint g_GiUnlitKeepDivisor;
+uint g_GiMaxHistoryFrames;
+uint g_GiSpatialIterations;
+float g_GiSpatialRadius;
+uint g_GiAdaptiveRadius;
+float g_GiRadiusLitFactor;
+uint g_GiSampleLeveling;
+uint g_GiMinBucketSamples;
+float g_GiJacobianMin;
+float g_GiJacobianMax;
+// Diagnostic output of GiSpatial into DiffuseRadianceTarget (CaelixGiSettings.debugMode):
+// 0 off, 1 candidates found / iterations as grey, 2 outcome (red none, blue occluded, green used),
+// 3 this pixel's bucket (R stored / 8, G lit ratio, B total samples / 448), 4 adaptive radius factor.
+uint g_GiDebugMode;
+
+// Kernel ids for the PCG streams.
+#define GI_RAND_REPROJECT 5u
+#define GI_RAND_REFINE 6u
+#define GI_RAND_SPATIAL 7u
+
+uint GiFrameSlot()
+{
+    return g_GiRingFrame % GI_HISTORY_SLOTS;
+}
+
+bool GiTexelInRange(uint2 texel)
+{
+    return all(texel < g_GiFrameSize);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// GiPreparePixels
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+[numthreads(8, 8, 1)]
+void GiPreparePixels(uint3 id : SV_DispatchThreadID)
+{
+    uint2 p = id.xy;
+    if (!GiTexelInRange(p))
+    {
+        return;
+    }
+
+    float centreDistance = g_GiSurface[p].w;
+    float minDistance = centreDistance;
+    float maxDistance = centreDistance;
+    uint centreHash = g_GiKey[p].x & 0xFFFFu;
+    uint bloom = 0u;
+
+    for (int dy = -1; dy <= 1; dy++)
+    {
+        for (int dx = -1; dx <= 1; dx++)
+        {
+            if (dx == 0 && dy == 0)
+            {
+                continue;
+            }
+
+            int2 q = int2(p) + int2(dx, dy);
+            if (any(q < 0) || any(q >= int2(g_GiFrameSize)))
+            {
+                continue;
+            }
+
+            // Misses are included (K_T_MAX), like NAADF: a silhouette pixel accepts the far side too.
+            float d = g_GiSurface[q].w;
+            minDistance = min(minDistance, d);
+            maxDistance = max(maxDistance, d);
+            uint h = g_GiKey[q].x & 0xFFFFu;
+            bloom |= 1u << (h & 15u);
+        }
+    }
+
+    GiPixelInfo info;
+    info.distRange = GiPackF16Pair(minDistance, maxDistance);
+    info.hashes = centreHash | (bloom << 16);
+    g_GiPixels[p.x + p.y * g_GiFrameSize.x] = info;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// GiPrepareBuckets
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+[numthreads(64, 1, 1)]
+void GiPrepareBuckets(uint3 id : SV_DispatchThreadID)
+{
+    // This frame's count slot was last used GI_HISTORY_SLOTS frames ago; GiGenerateSamples
+    // appends into it next, so it is cleared here, one dispatch earlier.
+    if (id.x == 0u)
+    {
+        uint slot = GiFrameSlot();
+        g_GiCounts[GI_COUNT_FRAME_BASE + 2u * slot] = 0u;
+        g_GiCounts[GI_COUNT_FRAME_BASE + 2u * slot + 1u] = 0u;
+    }
+
+    uint b = id.x;
+    if (b >= g_GiBucketCount)
+    {
+        return;
+    }
+
+    uint bucketsX = GiBucketsX();
+    uint2 origin = uint2(b % bucketsX, b / bucketsX) * GI_BUCKET_SIZE;
+
+    uint normalMask = 0u;
+    float minDistance = K_T_MAX;
+    float maxDistance = 0.0f;
+
+    for (uint y = 0u; y < GI_BUCKET_SIZE; y++)
+    {
+        for (uint x = 0u; x < GI_BUCKET_SIZE; x++)
+        {
+            uint2 p = origin + uint2(x, y);
+            if (!GiTexelInRange(p))
+            {
+                continue;
+            }
+
+            if ((g_GiKey[p].z & GI_KEY_FLAG_HIT) == 0u)
+            {
+                continue;
+            }
+
+            float3 n = GiDecodeGBufferNormal(g_GiNormal[p].xy);
+            normalMask |= 1u << GiAxisIndex(n);
+            float d = g_GiSurface[p].w;
+            minDistance = min(minDistance, d);
+            maxDistance = max(maxDistance, d);
+        }
+    }
+
+    GiBucketInfo info;
+    info.litCount = 0u;
+    info.unlitCount = 0u;
+    info.distRange = GiPackF16Pair(minDistance, maxDistance);
+    info.packed = normalMask << 4;
+    info.litRatio = 0.0f;
+    info.maxLuminance = 0.0f;
+    info.reserved0 = 0u;
+    info.reserved1 = 0u;
+    g_GiBuckets[b] = info;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// GiGenerateSamples
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Traces one cosine-distributed path from the pixel's primary surface and decides whether it is
+// stored as a lit sample, an unlit sample, or not at all.
+void GiTraceSample(uint2 p, uint4 key, out GiLitSample sample, out bool isLit, out bool isUnlit, out uint ownRadiance)
+{
+    isLit = false;
+    isUnlit = false;
+    ownRadiance = 0u;
+
+    float4 surface = g_GiSurface[p];
+    float3 P = surface.xyz;
+    float T = surface.w;
+    float3 n = GiDecodeGBufferNormal(g_GiNormal[p].xy);
+
+    uint slot = key.x >> 16;
+    uint hash16 = key.x & 0xFFFFu;
+    CaelixRayQueryInstance inst = g_Instances[slot];
+
+    sample.key = key.x;
+    sample.token = key.y;
+    sample.objectPosition = mul(CaelixInstanceWorldToObject(inst), float4(P, 1.0f)).xyz;
+    // The virtual point is where the camera ray "sees" the surface through the delta chain. With
+    // no interface crossed (hash 0) it IS the real point, so the offset is exactly 0 instead of
+    // the rounding noise of T versus the traced position.
+    float3 virtualPoint = g_GiCameraPosition + GiCameraRayDirection(p) * T;
+    sample.virtualOffset = hash16 == 0u ? float3(0.0f, 0.0f, 0.0f) : virtualPoint - P;
+
+    // Blue noise as the tracer draws it (launch index + g_FrameIndex), but starting at draw 32:
+    // the tracer spent draw 0 on this pixel's lobe choice, and a diffuse pixel is one whose draw 0
+    // came out ABOVE its specular chance, so reusing it here would bias the sample azimuth.
+    uint rngState = 32u;
+    float3 d = SafeNormalize(n + RandomUnitVector(rngState));
+    d = (dot(d, d) > 0.0f) ? d : n;
+
+    CaelixPathState path;
+    CaelixInitPathState(path, rngState);
+    // The primary surface's medium is assumed to be air for the first segment.
+    path.previousTransparentMaterial = 0;
+
+    RayDesc ray;
+    ray.Origin = P + K_RAY_ORIGIN_PUSH_OFF * n;
+    ray.Direction = d;
+    ray.TMin = 0;
+    ray.TMax = K_T_MAX;
+
+    float3 radiance = float3(0.0f, 0.0f, 0.0f);
+    float3 throughput = float3(1.0f, 1.0f, 1.0f);
+    bool isSky = true;
+    float3 secondaryPosition = d;
+    float3 secondaryNormal = float3(0.0f, 0.0f, 1.0f);
+
+    // Same segment budget as the tracer's bounce loop: g_BounceCountOpaque segments in all.
+    for (uint segment = 0u; segment < g_BounceCountOpaque; segment++)
+    {
+        RayPayload payload;
+        CaelixClearRayPayload(payload);
+        CAELIX_TRACE_RAY(ray, payload);
+
+        throughput *= CaelixMediumExtinction(path.previousTransparentMaterial, payload.T);
+
+        if (!CaelixRayPayloadHasHit(payload))
+        {
+            if (RandomFloat01(path.rngState) < g_GiSkySampleProbability)
+            {
+                radiance += CaelixSampleSkyRadiance(ray.Direction) * throughput / g_GiSkySampleProbability;
+            }
+
+            break;
+        }
+
+        float3 hitPosition = ray.Origin + ray.Direction * payload.T;
+        if (segment == 0u)
+        {
+            isSky = false;
+            secondaryPosition = hitPosition;
+            float3 nq = CaelixUnpackWorldNormal(payload.packedWorldNormal);
+            secondaryNormal = dot(nq, ray.Direction) > 0.0f ? -nq : nq;
+        }
+
+        CaelixShadeResult shade;
+        CaelixShadeVoxelHit(payload, hitPosition, ray.Direction, path, shade);
+
+        radiance += shade.emission * throughput;
+        throughput *= shade.albedo / max(0.001, shade.k);
+
+        // Russian roulette, as the tracer. A zero throughput must stop here (see the tracer).
+        float pathStopProbability = max(throughput.r, max(throughput.g, throughput.b));
+        if (pathStopProbability <= 0.0f || pathStopProbability < RandomFloat01(path.rngState))
+        {
+            break;
+        }
+
+        throughput *= 1.0f / pathStopProbability;
+
+        ray.Origin = shade.bounceRayOrigin;
+        ray.Direction = shade.bounceRayDirection;
+        ray.TMin = 0;
+        ray.TMax = K_T_MAX;
+    }
+
+    float3 c = CaelixSanitizeRadiance(radiance);
+    ownRadiance = GiPackRadiance(c);
+
+    // Lit / unlit split with NAADF radiance leveling: a dim sample survives with probability
+    // keep and is boosted by 1 / keep, so the lit ring holds fewer, brighter samples.
+    float s = GiLuminance(c);
+    if (s < g_GiLitThreshold)
+    {
+        float keep = max(s, 0.05f * g_GiLitThreshold) / g_GiLitThreshold;
+        c *= 1.0f / keep;
+        if (RandomFloat01(path.rngState) > keep)
+        {
+            c = float3(0.0f, 0.0f, 0.0f);
+        }
+    }
+
+    sample.primaryNormal = GiAxisIndex(n) | (isSky ? GI_SAMPLE_SKY_FLAG : 0u);
+    sample.secondaryPosition = secondaryPosition;
+    sample.secondaryNormal = isSky ? 0u : GiPackOct16(secondaryNormal);
+    sample.radiance = GiPackRadiance(c);
+
+    if (any(c > 0.0f) && sample.radiance != 0u)
+    {
+        isLit = true;
+    }
+    else if (RandomFloat01(path.rngState) < 1.0f / float(g_GiUnlitKeepDivisor))
+    {
+        isUnlit = true;
+    }
+}
+
+// NAADF rayQueueCalc.fx shouldRay: a pixel with n frames of valid temporal history traces every
+// min(n + 1, divisor) frames. A pixel that just appeared (screen edge, disocclusion) therefore
+// samples every frame and its bucket is full after one frame instead of after `divisor` frames,
+// which is what keeps the revealed band of a moving camera from going dark.
+uint GiSampleModulo(uint2 p)
+{
+    if (g_GiSampleRateDivisor <= 1u)
+    {
+        return 1u;
+    }
+
+    if (g_GiUniformSampleRate != 0u)
+    {
+        return g_GiSampleRateDivisor;
+    }
+
+    if (g_GiHistoryValid == 0u)
+    {
+        return 1u;
+    }
+
+    float2 previousUV = (float2(p) + 0.5f + g_GiJitter) / float2(g_GiFrameSize) + g_GiMotionVector[p].xy;
+    if (any(previousUV < 0.0f) || any(previousUV > 1.0f))
+    {
+        return 1u;
+    }
+
+    int2 q = clamp(int2(floor(previousUV * float2(g_GiFrameSize))), int2(0, 0), int2(g_GiFrameSize) - 1);
+    float age = g_GiPrevIndirect[q].a;
+    return clamp(uint(age) + 1u, 1u, g_GiSampleRateDivisor);
+}
+
+[numthreads(8, 8, 1)]
+void GiGenerateSamples(uint3 id : SV_DispatchThreadID)
+{
+    uint2 p = id.xy;
+    if (!GiTexelInRange(p))
+    {
+        return;
+    }
+
+    _CaelixLaunchIndex = p;
+
+    uint4 key = g_GiKey[p];
+    bool eligible = (key.z & (GI_KEY_FLAG_HIT | GI_KEY_FLAG_DIFFUSE)) == (GI_KEY_FLAG_HIT | GI_KEY_FLAG_DIFFUSE)
+        && ((g_FrameIndex + p.x + p.y) % GiSampleModulo(p)) == 0u;
+
+    GiLitSample sample = (GiLitSample)0;
+    bool isLit = false;
+    bool isUnlit = false;
+    uint ownRadiance = 0u;
+    if (eligible)
+    {
+        GiTraceSample(p, key, sample, isLit, isUnlit, ownRadiance);
+    }
+
+    g_GiOwnSample[p] = ownRadiance;
+
+    // Wave-aggregated ring append: one atomic per wave per ring. Every lane that passed the range
+    // test reaches this point, so the first active lane is the one that owns the atomic.
+    uint slot = GiFrameSlot();
+
+    uint litWaveCount = WaveActiveCountBits(isLit);
+    uint litLaneOffset = WavePrefixCountBits(isLit);
+    uint litWaveBase = 0u;
+    if (WaveIsFirstLane() && litWaveCount > 0u)
+    {
+        InterlockedAdd(g_GiCounts[GI_COUNT_FRAME_BASE + 2u * slot], litWaveCount, litWaveBase);
+    }
+
+    litWaveBase = WaveReadLaneFirst(litWaveBase);
+    if (isLit)
+    {
+        uint index = (g_GiCounts[GI_COUNT_LIT_HEAD] + litWaveBase + litLaneOffset) % g_GiLitCapacity;
+        g_GiLitRing[index] = sample;
+    }
+
+    uint unlitWaveCount = WaveActiveCountBits(isUnlit);
+    uint unlitLaneOffset = WavePrefixCountBits(isUnlit);
+    uint unlitWaveBase = 0u;
+    if (WaveIsFirstLane() && unlitWaveCount > 0u)
+    {
+        InterlockedAdd(g_GiCounts[GI_COUNT_FRAME_BASE + 2u * slot + 1u], unlitWaveCount, unlitWaveBase);
+    }
+
+    unlitWaveBase = WaveReadLaneFirst(unlitWaveBase);
+    if (isUnlit)
+    {
+        uint index = (g_GiCounts[GI_COUNT_UNLIT_HEAD] + unlitWaveBase + unlitLaneOffset) % g_GiUnlitCapacity;
+        GiUnlitSample unlit;
+        unlit.key = sample.key;
+        unlit.token = sample.token;
+        unlit.objectPosition = sample.objectPosition;
+        unlit.virtualOffset = sample.virtualOffset;
+        unlit.primaryNormal = sample.primaryNormal;
+        g_GiUnlitRing[index] = unlit;
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// GiPrepareHistory
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+// ring 0 = lit, 1 = unlit.
+void GiPrepareRingHistory(uint ring, uint capacity, uint slot)
+{
+    // This frame's samples are now below the head.
+    uint head = (g_GiCounts[GI_COUNT_LIT_HEAD + ring] + g_GiCounts[GI_COUNT_FRAME_BASE + 2u * slot + ring]) % capacity;
+    g_GiCounts[GI_COUNT_LIT_HEAD + ring] = head;
+
+    uint total = 0u;
+    for (uint i = 0u; i < g_GiMaxHistoryFrames; i++)
+    {
+        uint frameSlot = (slot + GI_HISTORY_SLOTS - i) % GI_HISTORY_SLOTS;
+        uint n = g_GiCounts[GI_COUNT_FRAME_BASE + 2u * frameSlot + ring];
+        if (total + n > capacity)
+        {
+            break;
+        }
+
+        total += n;
+    }
+
+    g_GiCounts[GI_COUNT_LIT_VALID + ring] = total;
+    g_GiCounts[GI_COUNT_LIT_START + ring] = (head + capacity - total) % capacity;
+    g_GiCounts[GI_COUNT_LIT_COPRIME + ring] = GiPcg(g_FrameIndex * 2u + ring) | 1u;
+
+    // Power-of-two group count: the odd multiplier then shuffles the groups bijectively.
+    uint groups = total == 0u ? 0u : GiNextPow2((total + 63u) / 64u);
+    g_GiArgs[3u * ring + 0u] = min(groups, GI_MAX_GROUPS_X);
+    g_GiArgs[3u * ring + 1u] = max(1u, groups / GI_MAX_GROUPS_X);
+    g_GiArgs[3u * ring + 2u] = 1u;
+}
+
+[numthreads(1, 1, 1)]
+void GiPrepareHistory(uint3 id : SV_DispatchThreadID)
+{
+    uint slot = GiFrameSlot();
+    GiPrepareRingHistory(0u, g_GiLitCapacity, slot);
+    GiPrepareRingHistory(1u, g_GiUnlitCapacity, slot);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// GiReprojectLit / GiReprojectUnlit
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Sample number this thread processes, or false when it has none.
+bool GiShuffledSampleIndex(uint ring, uint2 groupId, uint lane, out uint index)
+{
+    index = 0u;
+    uint valid = g_GiCounts[GI_COUNT_LIT_VALID + ring];
+    if (valid == 0u)
+    {
+        return false;
+    }
+
+    uint groups = GiNextPow2((valid + 63u) / 64u);
+    uint group = groupId.x + groupId.y * GI_MAX_GROUPS_X;
+    if (group >= groups)
+    {
+        return false;
+    }
+
+    // groups divides 2^32, so the 32-bit wrap of the product does not change the result mod groups.
+    uint coprime = g_GiCounts[GI_COUNT_LIT_COPRIME + ring];
+    uint shuffled = ((coprime * group + g_FrameIndex) % groups) * 64u + lane;
+    if (shuffled >= valid)
+    {
+        return false;
+    }
+
+    index = shuffled;
+    return true;
+}
+
+// Moves a stored sample's primary surface to this frame and validates it at its landing pixel.
+bool GiReprojectToBucket(
+    uint key, uint token, float3 objectPosition, float3 virtualOffset,
+    out float3 worldPosition, out uint bucket)
+{
+    worldPosition = float3(0.0f, 0.0f, 0.0f);
+    bucket = 0u;
+
+    // Token 0 is never handed out; a zero record is a freed slot or never-written ring memory.
+    if (token == 0u)
+    {
+        return false;
+    }
+
+    CaelixRayQueryInstance inst = g_Instances[key >> 16];
+    if (inst.lifetimeToken != token)
+    {
+        return false;
+    }
+
+    worldPosition = mul(CaelixInstanceObjectToWorld(inst), float4(objectPosition, 1.0f)).xyz;
+    float3 virtualPoint = worldPosition + virtualOffset;
+
+    int2 texel;
+    if (!GiProjectToTexel(virtualPoint, texel))
+    {
+        return false;
+    }
+
+    GiPixelInfo info = g_GiPixels[texel.x + texel.y * g_GiFrameSize.x];
+    float2 range = GiUnpackF16Pair(info.distRange);
+    float distance = length(virtualPoint - g_GiCameraPosition);
+    if (distance < range.x * (1022.0f / 1024.0f) || distance > range.y * (1026.0f / 1024.0f))
+    {
+        return false;
+    }
+
+    uint hash16 = key & 0xFFFFu;
+    uint centreHash = info.hashes & 0xFFFFu;
+    uint bloom = info.hashes >> 16;
+    if (hash16 != centreHash && (bloom & (1u << (hash16 & 15u))) == 0u)
+    {
+        return false;
+    }
+
+    bucket = GiBucketIndex(uint2(texel));
+    return true;
+}
+
+[numthreads(64, 1, 1)]
+void GiReprojectLit(uint3 groupId : SV_GroupID, uint lane : SV_GroupIndex)
+{
+    uint i;
+    if (!GiShuffledSampleIndex(0u, groupId.xy, lane, i))
+    {
+        return;
+    }
+
+    GiLitSample sample = g_GiLitRing[(g_GiCounts[GI_COUNT_LIT_START] + i) % g_GiLitCapacity];
+
+    float3 worldPosition;
+    uint bucket;
+    if (!GiReprojectToBucket(sample.key, sample.token, sample.objectPosition, sample.virtualOffset, worldPosition, bucket))
+    {
+        return;
+    }
+
+    uint k;
+    InterlockedAdd(g_GiBuckets[bucket].litCount, 1u, k);
+    if (k < GI_REFINED_PER_BUCKET)
+    {
+        bool isSky = (sample.primaryNormal & GI_SAMPLE_SKY_FLAG) != 0u;
+        GiBucketSample refined;
+        refined.primaryPosition = worldPosition;
+        refined.normals = (sample.primaryNormal & 7u)
+            | (isSky ? GI_BUCKET_SKY_FLAG : 0u)
+            | GiOct16To12(sample.secondaryNormal);
+        refined.secondaryPosition = sample.secondaryPosition;
+        refined.radiance = sample.radiance;
+        g_GiRefined[bucket * GI_REFINED_PER_BUCKET + k] = refined;
+    }
+}
+
+[numthreads(64, 1, 1)]
+void GiReprojectUnlit(uint3 groupId : SV_GroupID, uint lane : SV_GroupIndex)
+{
+    uint i;
+    if (!GiShuffledSampleIndex(1u, groupId.xy, lane, i))
+    {
+        return;
+    }
+
+    GiUnlitSample sample = g_GiUnlitRing[(g_GiCounts[GI_COUNT_UNLIT_START] + i) % g_GiUnlitCapacity];
+
+    float3 worldPosition;
+    uint bucket;
+    if (!GiReprojectToBucket(sample.key, sample.token, sample.objectPosition, sample.virtualOffset, worldPosition, bucket))
+    {
+        return;
+    }
+
+    InterlockedAdd(g_GiBuckets[bucket].unlitCount, g_GiUnlitKeepDivisor);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// GiRefineBuckets
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+[numthreads(64, 1, 1)]
+void GiRefineBuckets(uint3 id : SV_DispatchThreadID)
+{
+    uint b = id.x;
+    if (b >= g_GiBucketCount)
+    {
+        return;
+    }
+
+    GiBucketInfo info = g_GiBuckets[b];
+    uint litCount = info.litCount;
+    uint unlitCount = info.unlitCount;
+    uint lit = min(litCount, GI_REFINED_PER_BUCKET);
+    // NAADF: when the lit samples overflowed the 32 slots, scale the unlit count down by the same ratio.
+    float unlitEffective = float(unlitCount) * (float(lit) / float(max(litCount, 1u)));
+
+    float maxLuminance = 0.0f;
+    for (uint i = 0u; i < lit; i++)
+    {
+        maxLuminance = max(maxLuminance, GiLuminance(GiUnpackRadiance(g_GiRefined[b * GI_REFINED_PER_BUCKET + i].radiance)));
+    }
+
+    uint rng = GiRandSeed(uint2(b, 0u), g_FrameIndex, GI_RAND_REFINE);
+    uint extraUnlit = 0u;
+    uint stored = 0u;
+    for (uint j = 0u; j < lit; j++)
+    {
+        GiBucketSample s = g_GiRefined[b * GI_REFINED_PER_BUCKET + j];
+        float3 radiance = GiUnpackRadiance(s.radiance);
+        float r = g_GiSampleLeveling != 0u ? maxLuminance / max(GiLuminance(radiance), 1e-6f) : 1.0f;
+
+        // Removed with probability 1 - 1/r; a removed lit sample counts as unlit from here on.
+        if (GiRand(rng) * r > 1.0f)
+        {
+            extraUnlit++;
+            continue;
+        }
+
+        if (stored < GI_COMPACT_PER_BUCKET)
+        {
+            s.radiance = GiPackRadiance(radiance * r);
+            g_GiCompact[b * GI_COMPACT_PER_BUCKET + stored] = s;
+            stored++;
+        }
+    }
+
+    float keptLit = float(lit - extraUnlit);
+    float litRatio = keptLit / max(1.0f, keptLit + unlitEffective + float(extraUnlit));
+    if (float(lit) + unlitEffective < float(g_GiMinBucketSamples))
+    {
+        stored = 0u;
+    }
+
+    uint normalMask = (info.packed >> 4) & 63u;
+    uint totalComp = min(7u, (litCount + unlitCount) / 64u);
+    g_GiBuckets[b].packed = stored | (normalMask << 4) | (totalComp << 10);
+    g_GiBuckets[b].litRatio = litRatio;
+    g_GiBuckets[b].maxLuminance = maxLuminance;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+// GiSpatial
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+int GiMirror(int x, int size)
+{
+    x = x < 0 ? -x : (x >= size ? 2 * size - 2 - x : x);
+    return clamp(x, 0, size - 1);
+}
+
+uint2 GiNeighbourTexel(uint2 p, float2 offset)
+{
+    int2 q = int2(floor(float2(p) + offset));
+    return uint2(GiMirror(q.x, int(g_GiFrameSize.x)), GiMirror(q.y, int(g_GiFrameSize.y)));
+}
+
+// The mask and distance tests every spatial probe applies to a bucket.
+bool GiBucketAccepts(GiBucketInfo b, uint myAxis, float myDistance, float distanceFactor)
+{
+    uint normalMask = (b.packed >> 4) & 63u;
+    if ((normalMask & (1u << myAxis)) == 0u)
+    {
+        return false;
+    }
+
+    float2 range = GiUnpackF16Pair(b.distRange);
+    return !(myDistance < range.x * distanceFactor || myDistance > min(range.x * 2.0f, range.y) / distanceFactor);
+}
+
+// NAADF's isVaryingResmaplingRadius probe (renderSpatialResampling.fx lines 82-149), with
+// litRatio, stored, totalComp and maxLuminance from GiBucketInfo in place of NAADF's packed fields.
+float GiAdaptiveRadiusFactor(uint2 p, uint myAxis, float myDistance, float distanceFactor, float radius, inout uint rng)
+{
+    int validBucketCountSmall = 0, validBucketCountBig = 0;
+    float maxColorSmall = 0, maxColorSumSmall = 1;
+    float worstLitSmall = 0.0001f, worstLitBig = 0.0001f;
+
+    // Find smallest radius without introducing much flickering
+    for (int i = 0; i < 12; ++i)
+    {
+        float2 xy = (-radius * 0.5f + radius * GiRand2(rng)) * (i < 6 ? 0.1f : 1.0f);
+        uint2 texel = GiNeighbourTexel(p, xy);
+        GiBucketInfo b = g_GiBuckets[GiBucketIndex(texel)];
+
+        if (!GiBucketAccepts(b, myAxis, myDistance, distanceFactor))
+            continue;
+
+        uint bucketValidStored = b.packed & 15u;
+        float bucketLitRatio = b.litRatio;
+        float samplesColorMax = b.maxLuminance;
+        float totalSampleCountComp = ((b.packed >> 10) & 7u) / 7.0f;
+
+        if (bucketValidStored > 0)
+        {
+            if (i < 6)
+            {
+                validBucketCountSmall++;
+                maxColorSmall = max(maxColorSmall, samplesColorMax);
+                worstLitSmall += (pow(bucketLitRatio, 2) * bucketValidStored) * pow(totalSampleCountComp, 2);
+                maxColorSumSmall += samplesColorMax;
+            }
+            else
+            {
+                validBucketCountBig++;
+                worstLitBig += pow(bucketLitRatio, 2) * bucketValidStored;
+            }
+        }
+    }
+
+    validBucketCountSmall = max(1, validBucketCountSmall);
+    validBucketCountBig = max(1, validBucketCountBig);
+    if (validBucketCountSmall == 0)
+        maxColorSmall = 100;
+
+    maxColorSumSmall /= validBucketCountSmall;
+    worstLitSmall /= validBucketCountSmall;
+    worstLitBig /= validBucketCountBig;
+
+    float radiusFacRaw = (max(1, pow(maxColorSmall / maxColorSumSmall, 1)) / (1 * pow(worstLitSmall, 1))) * sqrt(worstLitBig) * g_GiRadiusLitFactor * 0.01f;
+    return 0.07f + clamp(1.0f - (1.0f / (1.0f + radiusFacRaw)), 0, 1);
+}
+
+[numthreads(8, 8, 1)]
+void GiSpatial(uint3 id : SV_DispatchThreadID)
+{
+    uint2 p = id.xy;
+    if (!GiTexelInRange(p))
+    {
+        return;
+    }
+
+    _CaelixLaunchIndex = p;
+
+    uint4 key = g_GiKey[p];
+    if ((key.z & GI_KEY_FLAG_DIFFUSE) == 0u)
+    {
+        DiffuseRadianceTarget[p] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+
+    float4 surface = g_GiSurface[p];
+    float3 P = surface.xyz;
+    float myDistance = surface.w;
+    float3 n = GiDecodeGBufferNormal(g_GiNormal[p].xy);
+    float3 V = normalize(g_GiCameraPosition - P);
+    uint myAxis = GiAxisIndex(n);
+    float distanceFactor = 0.95f * max(0.2f, pow(max(dot(n, V), 0.0f), 0.25f));
+
+    uint rng = GiRandSeed(p, g_FrameIndex, GI_RAND_SPATIAL);
+
+    float radius = g_GiSpatialRadius;
+    if (g_GiAdaptiveRadius != 0u)
+    {
+        radius *= GiAdaptiveRadiusFactor(p, myAxis, myDistance, distanceFactor, g_GiSpatialRadius, rng);
+    }
+
+    float sumW = 0.0f;
+    float M = 0.0f;
+    bool hasSelected = false;
+    float3 selectedColor = float3(0.0f, 0.0f, 0.0f);
+    float3 selectedDirection = n;
+    float selectedDistance2 = 0.0f;
+    float selectedPHat = 0.0f;
+    float selectedCos = 0.0f;
+    bool selectedSky = false;
+
+    for (uint it = 0u; it < g_GiSpatialIterations; it++)
+    {
+        float2 offset = (GiRand2(rng) - 0.5f) * radius;
+        uint2 texel = GiNeighbourTexel(p, offset);
+        uint bucket = GiBucketIndex(texel);
+        GiBucketInfo b = g_GiBuckets[bucket];
+
+        if (!GiBucketAccepts(b, myAxis, myDistance, distanceFactor))
+        {
+            continue;
+        }
+
+        uint stored = b.packed & 15u;
+        if (stored == 0u)
+        {
+            // An all-unlit bucket counts as one zero sample (NAADF).
+            M += 1.0f;
+            continue;
+        }
+
+        uint pick = min(uint(GiRand(rng) * float(stored)), stored - 1u);
+        GiBucketSample s = g_GiCompact[bucket * GI_COMPACT_PER_BUCKET + pick];
+        if ((s.normals & 7u) != myAxis)
+        {
+            continue;
+        }
+
+        bool isSky = (s.normals & GI_BUCKET_SKY_FLAG) != 0u;
+        float3 d;
+        float J;
+        float dist2;
+        float3 sourceDirection;
+        if (isSky)
+        {
+            d = s.secondaryPosition;
+            J = 1.0f;
+            dist2 = K_T_MAX * K_T_MAX;
+            sourceDirection = d;
+        }
+        else
+        {
+            float3 seg = s.secondaryPosition - P;
+            dist2 = dot(seg, seg);
+            d = seg * rsqrt(max(dist2, 1e-12f));
+            float3 nq = GiUnpackOct12(s.normals);
+            float cosQnew = dot(nq, -d);
+            float3 segOld = s.secondaryPosition - s.primaryPosition;
+            float segOldLength2 = dot(segOld, segOld);
+            sourceDirection = segOld * rsqrt(max(segOldLength2, 1e-12f));
+            float cosQold = dot(nq, -sourceDirection);
+            if (cosQold <= 1e-7f || cosQnew <= 0.0f)
+            {
+                continue;
+            }
+
+            J = (cosQnew / cosQold) * segOldLength2 / max(dist2, 1e-12f);
+        }
+
+        float cosNew = dot(n, d);
+        if (cosNew <= 1e-4f)
+        {
+            continue;
+        }
+
+        if (J < g_GiJacobianMin || J > g_GiJacobianMax)
+        {
+            continue;
+        }
+
+        float3 c = GiUnpackRadiance(s.radiance) * b.litRatio;
+        float pHat = GiLuminance(c) * cosNew;
+        // The sample was drawn cosine-distributed at its own primary surface, whose normal is the
+        // same axis as this pixel's (checked above).
+        float pdfOld = max(dot(n, sourceDirection), 1e-4f) / K_PI;
+        float w = pHat * J / pdfOld;
+
+        M += 1.0f;
+        sumW += w;
+        if (GiRand(rng) * sumW < w)
+        {
+            hasSelected = true;
+            selectedColor = c;
+            selectedDirection = d;
+            selectedDistance2 = dist2;
+            selectedPHat = pHat;
+            selectedCos = cosNew;
+            selectedSky = isSky;
+        }
+    }
+
+    if (g_GiDebugMode != 0u)
+    {
+        float3 dbg = float3(0.0f, 0.0f, 0.0f);
+        GiBucketInfo own = g_GiBuckets[GiBucketIndex(p)];
+        if (g_GiDebugMode == 1u) dbg = M / float(max(1u, g_GiSpatialIterations));
+        else if (g_GiDebugMode == 3u) dbg = float3(float(own.packed & 15u) / 8.0f, own.litRatio, float((own.packed >> 10) & 7u) / 7.0f);
+        else if (g_GiDebugMode == 4u) dbg = radius / g_GiSpatialRadius;
+        if (g_GiDebugMode != 2u)
+        {
+            DiffuseRadianceTarget[p] = float4(dbg, K_T_MAX);
+            return;
+        }
+    }
+
+    // Fallback for a pixel the reuse cannot serve: its own fresh sample is an unbiased (noisy)
+    // estimate, and writing it instead of black removes most of the darkening that occluded
+    // reconnections cause on walls and in recesses.
+    float4 fallback = float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (g_GiOwnSampleFallback != 0u)
+    {
+        uint own = g_GiOwnSample[p];
+        if (own != 0u)
+        {
+            fallback = float4(GiUnpackRadiance(own), K_T_MAX);
+        }
+    }
+
+    if (!hasSelected || sumW <= 0.0f || selectedPHat <= 0.0f)
+    {
+        DiffuseRadianceTarget[p] = g_GiDebugMode == 2u ? float4(1.0f, 0.0f, 0.0f, K_T_MAX) : fallback;
+        return;
+    }
+
+    float selectedDistance = selectedSky ? K_T_MAX : sqrt(selectedDistance2);
+
+    RayDesc ray;
+    ray.Origin = P + K_RAY_ORIGIN_PUSH_OFF * n;
+    ray.Direction = selectedDirection;
+    ray.TMin = 0;
+    ray.TMax = selectedSky ? K_T_MAX : max(selectedDistance - 2.0f * K_RAY_ORIGIN_PUSH_OFF, 1e-4f);
+
+    RayPayload payload;
+    CaelixClearRayPayload(payload);
+    CAELIX_TRACE_RAY(ray, payload);
+    if (CaelixRayPayloadHasHit(payload))
+    {
+        DiffuseRadianceTarget[p] = g_GiDebugMode == 2u ? float4(0.0f, 0.0f, 1.0f, K_T_MAX) : fallback;
+        return;
+    }
+
+    if (g_GiDebugMode == 2u)
+    {
+        DiffuseRadianceTarget[p] = float4(0.0f, 1.0f, 0.0f, K_T_MAX);
+        return;
+    }
+
+    float W = sumW / (M * selectedPHat);
+    // Incident radiance in the cosine-sampled convention: a pixel's own sample gives L = c, which
+    // is what the tracer writes, so the composite (albedo * indirect) is unchanged.
+    float3 L = selectedColor * selectedCos * W / K_PI;
+    DiffuseRadianceTarget[p] = float4(CaelixSanitizeRadiance(L), selectedDistance);
+}

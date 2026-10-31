@@ -29,6 +29,12 @@ Shader "Caelix/PostFlip"
 
         int _DebugView;
 
+        // 0 = the opaque body of the image, drawn before the skybox so it writes camera depth for
+        // everything that reads _CameraDepthTexture. 1 = the partially covered silhouette pixels the
+        // colour resolve produced, drawn AFTER the skybox because they have to blend against it.
+        // The two stages partition the image by alpha, so no pixel is drawn twice.
+        int _CaelixPresentStage;
+
         // The Caelix G-buffer carries linear view depth, but SV_Depth wants a raw
         // (post-projection, platform-convention) depth. This is the inverse of LinearEyeDepth,
         // which is 1/(z*raw + w) -- this conversion belongs here, at the only point the depth is
@@ -52,6 +58,19 @@ Shader "Caelix/PostFlip"
             float linearViewDepth = SAMPLE_TEXTURE2D(_DepthTex, sampler_PointClamp, uv).r;
             float rawDepth = CaelixEyeDepthToRawDepth(linearViewDepth);
             outDepth = rawDepth;
+
+            if (_CaelixPresentStage == 1)
+            {
+                // Only the silhouette band, and only for the regular view: every debug view is
+                // shown opaque and has already been drawn in full by stage 0.
+                if (_DebugView != CAELIX_DEBUG_REGULAR || source.a < 0.01f || source.a >= 0.99f)
+                {
+                    clip(-1);
+                }
+
+                // Premultiplied by coverage already, so the blend state does the rest.
+                return source;
+            }
 
             if (_DebugView == CAELIX_DEBUG_MOTION_VECTOR)
             {
@@ -87,7 +106,9 @@ Shader "Caelix/PostFlip"
                 return float4(source.rgb, 1.0f);
             }
 
-            if (source.a < 0.01f)
+            // Anything short of full coverage is left to stage 1: blending it here would blend it
+            // against whatever the camera target held before the skybox was drawn.
+            if (source.a < 0.99f)
             {
                 clip(-1);
             }
@@ -106,6 +127,26 @@ Shader "Caelix/PostFlip"
         Pass
         {
             Name "CaelixPresent"
+
+            HLSLPROGRAM
+
+            #pragma vertex Vert
+            #pragma fragment Flip
+
+            ENDHLSL
+        }
+
+        Pass
+        {
+            Name "CaelixPresentEdges"
+
+            // Premultiplied-alpha blend, because the colour resolve's partial-coverage pixels carry
+            // colour already scaled by their coverage. ZTest LEqual keeps them behind any opaque
+            // geometry drawn in between; ZWrite still fills in the depth stage 0 clipped away.
+            Blend One OneMinusSrcAlpha
+            ZWrite On
+            ZTest LEqual
+            Cull Off
 
             HLSLPROGRAM
 

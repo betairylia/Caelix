@@ -12,15 +12,26 @@ using UnityEngine.Rendering.Universal;
 /// <see cref="CaelixFrameResources"/> is used as the blit source and how the flip shader decodes
 /// it, so a debug view costs nothing extra to render. Camera depth always comes from the G-buffer
 /// depth target regardless of the view, so scene geometry keeps depth-testing correctly.
+/// <para>
+/// The stage runs twice per frame, as two instances. <see cref="Stage"/> 0 draws the fully covered
+/// body of the image before the skybox, so it writes camera depth in time for everything that reads
+/// <c>_CameraDepthTexture</c>; stage 1 draws the partially covered silhouette pixels the colour
+/// resolve produced, after the skybox, so they blend against it. The two partition the image by
+/// alpha, so nothing is drawn twice.
+/// </para>
 /// </remarks>
 public class CaelixPresentPass : ScriptableRenderPass
 {
     private Material flipMaterial;
     private CaelixDebugView debugView = CaelixDebugView.Regular;
 
+    /// <summary>0 = the opaque body of the image, 1 = the partially covered silhouette pixels.</summary>
+    public int Stage { get; set; }
+
     internal class PassData
     {
         internal CaelixDebugView debugView;
+        internal int stage;
         internal TextureHandle Source;
         internal TextureHandle ColorDest;
         internal TextureHandle DepthDest;
@@ -50,17 +61,21 @@ public class CaelixPresentPass : ScriptableRenderPass
             return;
         }
 
-        TextureHandle source = resources.SelectDebugSource(debugView);
+        // Stage 1 only ever fills in silhouette pixels of the composited image, so it ignores the
+        // debug selection outright rather than trying to blend a G-buffer against the skybox.
+        TextureHandle source = Stage == 0 ? resources.SelectDebugSource(debugView) : resources.Color;
         if (!source.IsValid())
         {
             source = resources.Color;
         }
 
         UniversalResourceData cameraResources = frameData.Get<UniversalResourceData>();
+        string passName = Stage == 0 ? "Caelix Copy To Camera" : "Caelix Copy To Camera (Edges)";
 
-        using (var builder = renderGraph.AddUnsafePass<PassData>("Caelix Copy To Camera", out var passData))
+        using (var builder = renderGraph.AddUnsafePass<PassData>(passName, out var passData))
         {
             passData.debugView = debugView;
+            passData.stage = Stage;
             passData.Source = source;
             passData.ColorDest = cameraResources.activeColorTexture;
             passData.DepthDest = cameraResources.activeDepthTexture;
@@ -82,6 +97,7 @@ public class CaelixPresentPass : ScriptableRenderPass
 
         cmd.SetRenderTarget(data.ColorDest, data.DepthDest);
         data.flipMaterial.SetInt(CaelixShaderIDs.DebugView, (int)data.debugView);
-        Blitter.BlitTexture(cmd, data.Source, new Vector4(1, 1, 0, 0), data.flipMaterial, 0);
+        data.flipMaterial.SetInt(CaelixShaderIDs.PresentStage, data.stage);
+        Blitter.BlitTexture(cmd, data.Source, new Vector4(1, 1, 0, 0), data.flipMaterial, data.stage);
     }
 }

@@ -15,7 +15,7 @@ namespace Caelix.Rendering.Meshing
         [SerializeField] private CaelixHost host;
 
         [Header("Mesh Settings")]
-        [Tooltip("Size of each mesh chunk (default 32). Sectors are subdivided into chunks of this size.")]
+        [Tooltip("Size of each mesh chunk (default 32), in blocks. Render groups are subdivided into chunks of this size. Rounded to a multiple of 8, because a chunk is meshed from whole bricks.")]
         [Range(8, 128)]
         [SerializeField] private int chunkSize = 32;
 
@@ -26,8 +26,8 @@ namespace Caelix.Rendering.Meshing
         [Tooltip("Number of VoxelEntity instances currently being rendered")]
         [SerializeField, ReadOnly] private int trackedEntityCount;
 
-        [Tooltip("Total number of sector renderers active")]
-        [SerializeField, ReadOnly] private int sectorRendererCount;
+        [Tooltip("Total number of render group renderers active")]
+        [SerializeField, ReadOnly] private int groupRendererCount;
 
         [Header("Debug")]
         [Tooltip("Regenerate all meshes on the next frame")]
@@ -76,9 +76,11 @@ namespace Caelix.Rendering.Meshing
 
         private void OnValidate()
         {
-            // Ensure chunk size is a valid value
+            // Ensure chunk size is a valid value. A chunk is meshed from whole bricks, so its
+            // size has to be a multiple of the brick size.
             if (chunkSize < 8) chunkSize = 8;
             if (chunkSize > 128) chunkSize = 128;
+            chunkSize -= chunkSize % BrickKey.BlocksPerAxis;
 
             // Warn if no material assigned
             if (material == null)
@@ -134,7 +136,7 @@ namespace Caelix.Rendering.Meshing
 
             // Update runtime info for inspector
             trackedEntityCount = meshRenderer.TrackedEntityCount;
-            sectorRendererCount = meshRenderer.SectorRendererCount;
+            groupRendererCount = meshRenderer.GroupRendererCount;
         }
 
         private void OnDisable()

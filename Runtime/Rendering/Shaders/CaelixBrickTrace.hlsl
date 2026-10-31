@@ -11,21 +11,28 @@
 #define SIZE_IN_BLOCKS_U (1u << SHIFT_SIZE_IN_BLOCKS_U)
 #endif
 
-#ifndef SHIFT_SIZE_IN_BRICKS
-#define SHIFT_SIZE_IN_BRICKS 4
+// Render group shape: bits of the group-local brick index per axis. Must match
+// RenderGroupPresets.Keyword on the C# side. Default (no keyword) is 16x16x16 bricks.
+#if defined(CAELIX_GROUP_3_3_3)
+#define CAELIX_GROUP_SHIFT_X 3u
+#define CAELIX_GROUP_SHIFT_Y 3u
+#define CAELIX_GROUP_SHIFT_Z 3u
+#elif defined(CAELIX_GROUP_5_5_5)
+#define CAELIX_GROUP_SHIFT_X 5u
+#define CAELIX_GROUP_SHIFT_Y 5u
+#define CAELIX_GROUP_SHIFT_Z 5u
+#elif defined(CAELIX_GROUP_4_7_4)
+#define CAELIX_GROUP_SHIFT_X 4u
+#define CAELIX_GROUP_SHIFT_Y 7u
+#define CAELIX_GROUP_SHIFT_Z 4u
+#else
+#define CAELIX_GROUP_SHIFT_X 4u
+#define CAELIX_GROUP_SHIFT_Y 4u
+#define CAELIX_GROUP_SHIFT_Z 4u
 #endif
 
-#ifndef SIZE_IN_BRICKS
-#define SIZE_IN_BRICKS (1 << SHIFT_SIZE_IN_BRICKS)
-#endif
-
-#ifndef BRICK_POS_MASK
-#define BRICK_POS_MASK 15u
-#endif
-
-#ifndef SIZE_IN_BRICKS_SQUARED
-#define SIZE_IN_BRICKS_SQUARED 256
-#endif
+#define CAELIX_GROUP_MASK_X ((1u << CAELIX_GROUP_SHIFT_X) - 1u)
+#define CAELIX_GROUP_MASK_Y ((1u << CAELIX_GROUP_SHIFT_Y) - 1u)
 
 #ifndef BRICK_RAY_MAX_STEPS
 #define BRICK_RAY_MAX_STEPS 22
@@ -41,7 +48,7 @@
 
 // Word 0: absolute brick index + coarse occupancy. Word 1: packed tight occupied
 // bounds (also keeps uint64_t occupancy loads 8-byte aligned).
-// Word 1 layout (matches SectorRenderer.PackBrickTightBounds, both bounds inclusive):
+// Word 1 layout (matches BrickRecordLayout.PackBrickTightBounds, both bounds inclusive):
 // [minX:0-2][minY:3-5][minZ:6-8][maxX:9-11][maxY:12-14][maxZ:15-17]
 #define BRICK_INFO_WORDS 2
 #define BRICK_TIGHT_AXIS_MASK 7u
@@ -49,7 +56,7 @@
 #define BRICK_OCCUPANCY_WORDS 16
 #define BRICK_BLOCK_DATA_OFFSET 18
 #define BRICK_DATA_LENGTH 274
-#define BRICK_INFO_ABSOLUTE_INDEX_MASK 0xFFFu
+#define BRICK_INFO_ABSOLUTE_INDEX_MASK 0xFFFFu
 #define BRICK_INFO_COARSE_OCCUPANCY_SHIFT 16u
 #define BRICK_INFO_COARSE_OCCUPANCY_MASK 0xFFu
 #define BRICK_COARSE_SIZE_IN_BLOCKS 4
@@ -108,10 +115,9 @@ inline half3 UnpackObjectNormal(uint normalFlag)
     return objectNormals[firstbitlow(normalFlag)];
 }
 
-// StructuredBuffer<uint> g_bricks;
-ByteAddressBuffer g_bricks;
-float4x4 _PrevObjectToWorld;
-uint _SectorHashSeed;
+// Brick record loads. Every brick lives in the shared brick pool, so the three macros route
+// through the page switch in CaelixBrickPages.hlsl; the including file defines them before it
+// includes this one (CaelixRayQueryTrace.hlsl is where that order is fixed).
 
 inline CaelixBrickHit CaelixMakeBrickMiss()
 {
@@ -142,17 +148,12 @@ inline uint CaelixFaceID(int3 normal)
     return 5u;
 }
 
-inline uint CaelixMakeVoxelFaceHash(int3 sectorLocalVoxelPos, int3 normal)
+// No face hash is produced: NormalTarget.b carries the 6-bit face-direction flags instead. The
+// per-instance seed the old body hashed with lives in the instance record (hashSeed) if this is
+// ever revived.
+inline uint CaelixMakeVoxelFaceHash(int3 localVoxelPos, int3 normal)
 {
     return 0u;
-    uint voxelKey =
-        uint(sectorLocalVoxelPos.x & 0x7F) |
-        (uint(sectorLocalVoxelPos.y & 0x7F) << 7) |
-        (uint(sectorLocalVoxelPos.z & 0x7F) << 14) |
-        (CaelixFaceID(normal) << 21);
-
-    uint hash = CaelixHashAvalanche(_SectorHashSeed ^ voxelKey) & VOXEL_FACE_HASH_MASK;
-    return hash == 0u ? 1u : (hash & 0xFFFF);
 }
 
 inline int3 CaelixBrickRayIntMask(bool3 mask)
@@ -226,7 +227,7 @@ inline int CaelixReadBrick(uint brickBase, int3 localBlockPos)
 {
     uint shift = uint((1 - (localBlockPos.x & 1)) << 4);
     // return int((g_bricks[brickBase + ((localBlockPos.x >> 1) + (localBlockPos.y << 2) + (localBlockPos.z << 5))] >> shift) & 0xFFFFu);
-    return int((g_bricks.Load((brickBase + ((localBlockPos.x >> 1) + (localBlockPos.y << 2) + (localBlockPos.z << 5))) << 2) >> shift) & 0xFFFFu);
+    return int((CAELIX_BRICKS_LOAD((brickBase + ((localBlockPos.x >> 1) + (localBlockPos.y << 2) + (localBlockPos.z << 5))) << 2) >> shift) & 0xFFFFu);
 }
 
 inline uint CaelixBrickBase(uint brickID)
@@ -247,7 +248,7 @@ inline uint CaelixMicroOccupancyBit(int3 microCell)
 inline void CaelixLoadMicroOccupancy(uint brickBase, uint coarseBit, out uint64_t occ)
 {
     uint occupancyBase = brickBase + BRICK_INFO_WORDS + coarseBit * 2u;
-    occ = g_bricks.Load<uint64_t>(occupancyBase << 2);
+    occ = CAELIX_BRICKS_LOAD64(occupancyBase << 2);
     // occLo = g_bricks[occupancyBase];
     // occHi = g_bricks[occupancyBase + 1u];
 }
@@ -287,11 +288,10 @@ inline int3 VRTStep(int3 cell, float3 tStart, float3 origin, float3 rayDir, half
     return int3(floor(currPos));
 }
 
-inline float CaelixTraceBrickRay(float3 entryPositionInBrick, float3 rayDir, float entryT, uint entryNormal_coarseOccupancy, out AttributeData attrib)
+inline float CaelixTraceBrickRay(uint brickBase, float3 entryPositionInBrick, float3 rayDir, float entryT, uint entryNormal_coarseOccupancy, out AttributeData attrib)
 {
     uint64_t occ = 0ull;
-    
-    uint brickBase = CaelixBrickBase(PrimitiveIndex());
+
     half3 invDir = CaelixBrickRaySafeInvDir(rayDir);
     float3 tStart = (CaelixBrickRayBoundaryOffset(rayDir) - entryPositionInBrick) * invDir;
     float3 origin = clamp(entryPositionInBrick, 0.0f, float3(SIZE_IN_BLOCKS, SIZE_IN_BLOCKS, SIZE_IN_BLOCKS) - BRICK_RAY_GRID_EPSILON);
@@ -333,7 +333,7 @@ inline float CaelixTraceBrickRay(float3 entryPositionInBrick, float3 rayDir, flo
         uint microBit = CaelixMicroOccupancyBit(microCell);
         if (CaelixIsMicroOccupied(occ, microBit))
         {
-            int blockID = CaelixReadBrick(CaelixBrickBase(PrimitiveIndex()) + BRICK_BLOCK_DATA_OFFSET, cell);
+            int blockID = CaelixReadBrick(brickBase + BRICK_BLOCK_DATA_OFFSET, cell);
             float T;
             uint normalFlags = CaelixBrickRayNormalFlags(rayStep, prevCell, tStart, rayDir, invDir, (entryNormal_coarseOccupancy >> 26), T);
             bool shouldTerminate = CaelixShouldTerminateBrickRay(
@@ -355,12 +355,16 @@ inline float CaelixTraceBrickRay(float3 entryPositionInBrick, float3 rayDir, flo
     return 0;
 }
 
-inline float CaelixTraceBrickPrimitive(out AttributeData attrib)
+// Ray-vs-brick intersection, with every input passed in rather than read from a DXR intrinsic, so
+// the inline ray query kernel can run it on each procedural candidate. `brickBase` is the word
+// offset of the brick record inside the brick pool page the candidate's instance record names,
+// which is the buffer CAELIX_BRICKS_LOAD reads.
+inline float CaelixTraceBrickPrimitiveCore(uint brickBase, float3 objectRayOrigin, float3 objectRayDir, float tCurrent, out AttributeData attrib)
 {
     // attrib.matID_faceNormal = ((0x8001 & 0xFFFF) << 16) + (0b010000 >> 26);
     // return 10;
 
-    uint2 brickInfo = g_bricks.Load2(CaelixBrickBase(PrimitiveIndex()) << 2);
+    uint2 brickInfo = CAELIX_BRICKS_LOAD2(brickBase << 2);
 
     // Empty brick
     // if(CaelixGetCoarseOccupancy(brickInfo.x) == 0)
@@ -371,9 +375,9 @@ inline float CaelixTraceBrickPrimitive(out AttributeData attrib)
     // AABB Intersection against the tight occupied-bounds box (word 1).
     // The DDA below still runs in full-brick coordinates; only the entry point moves.
     uint idx = brickInfo.x & BRICK_INFO_ABSOLUTE_INDEX_MASK;
-    int bX = int((idx & BRICK_POS_MASK) << SHIFT_SIZE_IN_BLOCKS);
-    int bY = int(((idx >> SHIFT_SIZE_IN_BRICKS) & BRICK_POS_MASK) << SHIFT_SIZE_IN_BLOCKS);
-    int bZ = int((idx >> (SHIFT_SIZE_IN_BRICKS + SHIFT_SIZE_IN_BRICKS)) << SHIFT_SIZE_IN_BLOCKS);
+    int bX = int((idx & CAELIX_GROUP_MASK_X) << SHIFT_SIZE_IN_BLOCKS);
+    int bY = int(((idx >> CAELIX_GROUP_SHIFT_X) & CAELIX_GROUP_MASK_Y) << SHIFT_SIZE_IN_BLOCKS);
+    int bZ = int((idx >> (CAELIX_GROUP_SHIFT_X + CAELIX_GROUP_SHIFT_Y)) << SHIFT_SIZE_IN_BLOCKS);
 
     uint tightBounds = brickInfo.y;
     float3 tightMin = float3(
@@ -389,10 +393,10 @@ inline float CaelixTraceBrickPrimitive(out AttributeData attrib)
     float3 aabbMin = brickOrigin + tightMin;
     float3 aabbMax = brickOrigin + tightMax;
 
-    float3 rayDir = ObjectRayDirection();
+    float3 rayDir = objectRayDir;
     half3 invDir = 1.0h / rayDir;
-    float3 t0 = (aabbMin - ObjectRayOrigin()) * invDir;
-    float3 t1 = (aabbMax - ObjectRayOrigin()) * invDir;
+    float3 t0 = (aabbMin - objectRayOrigin) * invDir;
+    float3 t1 = (aabbMax - objectRayOrigin) * invDir;
 
     float3 tmin = min(t0, t1);
     float3 tmax = max(t0, t1);
@@ -400,14 +404,14 @@ inline float CaelixTraceBrickPrimitive(out AttributeData attrib)
     float largestTmin = max(max(tmin.x, tmin.y), tmin.z);
     float smallestTmax = min(min(tmax.x, tmax.y), tmax.z);
 
-    if (largestTmin > smallestTmax || smallestTmax < 0 || largestTmin > RayTCurrent())
+    if (largestTmin > smallestTmax || smallestTmax < 0 || largestTmin > tCurrent)
     {
         attrib.matID_faceNormal = 0;
         return 0;
     }
-    
+
     float t = max(0, largestTmin);
-    float3 entryPositionInBrick = ObjectRayOrigin() + rayDir * t - brickOrigin;
+    float3 entryPositionInBrick = objectRayOrigin + rayDir * t - brickOrigin;
 
     // TODO: Do coarse bit (2x2x2) early reject here?
     // CaelixGetCoarseOccupancy(brickInfo.x)
@@ -428,7 +432,7 @@ inline float CaelixTraceBrickPrimitive(out AttributeData attrib)
     }
 
     CaelixBrickHit result = CaelixMakeBrickMiss();
-    return CaelixTraceBrickRay(entryPositionInBrick, rayDir, t,
+    return CaelixTraceBrickRay(brickBase, entryPositionInBrick, rayDir, t,
         (normalFlags << 26)  | CaelixGetCoarseOccupancy(brickInfo.x),
         attrib);
 }

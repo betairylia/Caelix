@@ -14,7 +14,9 @@ using UnityEngine.Rendering.Universal;
 /// and skip the rest of this pass);</item>
 /// <item>spatial filter — separable 15-tap, or a multi-iteration a-trous, or nothing;</item>
 /// <item>temporal accumulation against last frame's reprojected history;</item>
-/// <item>composite — deterministic radiance plus albedo-modulated indirect, into the final colour target.</item>
+/// <item>composite — deterministic radiance plus albedo-modulated indirect, into the final colour target;</item>
+/// <item>cross resolve — averages the delta checkerboard back together;</item>
+/// <item>colour resolve — TAA-style accumulation of the jittered samples, into the colour history.</item>
 /// </list>
 /// Reads only <see cref="CaelixFrameResources"/>; it has no knowledge of the tracer.
 /// </remarks>
@@ -26,6 +28,7 @@ public class CaelixDenoisePass : ScriptableRenderPass
     private const int PassComposite = 3;
     private const int PassCombineStochastic = 4;
     private const int PassCrossResolve = 5;
+    private const int PassColorResolve = 6;
     private const int PassATrousFilter = 0;
 
     private Material indirectMaterial;
@@ -38,20 +41,19 @@ public class CaelixDenoisePass : ScriptableRenderPass
 
     private CaelixIndirectDenoisingSettings denoisingSettings = CaelixIndirectDenoisingSettings.Default;
     private CaelixTemporalRadianceSettings temporalSettings = new CaelixTemporalRadianceSettings().Validated();
+    private CaelixColorResolveSettings colorResolveSettings = CaelixColorResolveSettings.Default;
     private bool resolveDeltaCheckerboard = true;
 
     internal class CombinePassData
     {
-        internal int width;
-        internal int height;
+        internal CaelixDenoiseUniforms.Snapshot uniforms;
         internal TextureHandle Source;
         internal Material material;
     }
 
     internal class SpatialFilterPassData
     {
-        internal int width;
-        internal int height;
+        internal CaelixDenoiseUniforms.Snapshot uniforms;
         internal CaelixSeparable15TapFilterSettings settings;
         internal TextureHandle Source;
         internal Material material;
@@ -60,8 +62,7 @@ public class CaelixDenoisePass : ScriptableRenderPass
 
     internal class ATrousFilterPassData
     {
-        internal int width;
-        internal int height;
+        internal CaelixDenoiseUniforms.Snapshot uniforms;
         internal int stepWidth;
         internal int frameIndex;
         internal CaelixATrousFilterSettings settings;
@@ -71,8 +72,7 @@ public class CaelixDenoisePass : ScriptableRenderPass
 
     internal class TemporalAccumulationPassData
     {
-        internal int width;
-        internal int height;
+        internal CaelixDenoiseUniforms.Snapshot uniforms;
         internal bool historyValid;
         internal CaelixTemporalRadianceSettings settings;
         internal TextureHandle FilteredIndirectRadiance;
@@ -84,17 +84,25 @@ public class CaelixDenoisePass : ScriptableRenderPass
 
     internal class CompositePassData
     {
-        internal int width;
-        internal int height;
+        internal CaelixDenoiseUniforms.Snapshot uniforms;
         internal TextureHandle DeterministicRadiance;
         internal Material material;
     }
 
     internal class CrossResolvePassData
     {
-        internal int width;
-        internal int height;
+        internal CaelixDenoiseUniforms.Snapshot uniforms;
         internal TextureHandle Source;
+        internal Material material;
+    }
+
+    internal class ColorResolvePassData
+    {
+        internal CaelixDenoiseUniforms.Snapshot uniforms;
+        internal bool historyValid;
+        internal CaelixColorResolveSettings settings;
+        internal TextureHandle Source;
+        internal TextureHandle PreviousColorHistory;
         internal Material material;
     }
 
@@ -109,10 +117,12 @@ public class CaelixDenoisePass : ScriptableRenderPass
     public void ConfigureSettings(
         CaelixIndirectDenoisingSettings denoising,
         CaelixTemporalRadianceSettings temporal,
+        CaelixColorResolveSettings colorResolve,
         bool resolveCheckerboard)
     {
         denoisingSettings = denoising.Validated();
         temporalSettings = temporal.Validated();
+        colorResolveSettings = colorResolve.Validated();
         resolveDeltaCheckerboard = resolveCheckerboard;
     }
 
@@ -131,6 +141,18 @@ public class CaelixDenoisePass : ScriptableRenderPass
         CaelixCameraHistory history = resources.History;
         int width = cameraData.scaledWidth;
         int height = cameraData.scaledHeight;
+        CaelixDenoiseUniforms.Snapshot uniforms = CaelixDenoiseUniforms.Capture(history, width, height);
+
+        // Both colour history halves are imported here, before anything flips the double buffer, so
+        // "current" and "previous" name the halves this frame's passes were recorded against. Each
+        // RTHandle enters the graph exactly once.
+        TextureHandle currentColorHistory = TextureHandle.nullHandle;
+        TextureHandle previousColorHistory = TextureHandle.nullHandle;
+        if (colorResolveSettings.enabled)
+        {
+            currentColorHistory = renderGraph.ImportTexture(history.CurrentColor);
+            previousColorHistory = renderGraph.ImportTexture(history.PreviousColor);
+        }
 
         RenderTextureDescriptor indirectDesc =
             CaelixFrameResources.DescriptorWithFormat(cameraData, RenderTextureFormat.ARGBHalf);
@@ -140,24 +162,32 @@ public class CaelixDenoisePass : ScriptableRenderPass
             renderGraph, indirectDesc, "Caelix_outIndirectRadianceFiltered", false);
 
         resources.RawIndirectRadiance = RecordCombineStochastic(
-            renderGraph, resources, indirectDesc, width, height);
+            renderGraph, resources, indirectDesc, uniforms);
 
         resources.FilteredIndirectRadiance = RecordSpatialFilter(
-            renderGraph, resources, width, height, scratch, filtered);
+            renderGraph, resources, uniforms, scratch, filtered);
 
         resources.AccumulatedIndirectRadiance = RecordTemporalAccumulation(
-            renderGraph, resources, history, width, height);
+            renderGraph, resources, history, uniforms);
 
-        // The double buffer flips once the write into "current" has been recorded; everything above
-        // has already captured the handles it needs, and nothing downstream reads history this frame.
-        history.EndFrame();
-
-        resources.Color = RecordComposite(renderGraph, resources, cameraData, width, height);
+        resources.Color = RecordComposite(renderGraph, resources, cameraData, uniforms);
 
         if (resolveDeltaCheckerboard)
         {
-            resources.Color = RecordCrossResolve(renderGraph, resources, cameraData, width, height);
+            resources.Color = RecordCrossResolve(renderGraph, resources, cameraData, uniforms);
         }
+
+        if (colorResolveSettings.enabled)
+        {
+            resources.Color = RecordColorResolve(
+                renderGraph, resources, history, uniforms, currentColorHistory, previousColorHistory);
+            history.MarkColorHistoryWritten();
+        }
+
+        // The double buffers flip once every write into a "current" half has been recorded. Every
+        // handle above was captured before this point, and nothing downstream reads history this
+        // frame, so the flip belongs at the end rather than in the middle of the chain.
+        history.EndFrame();
     }
 
     // --- Combine ------------------------------------------------------------
@@ -171,16 +201,14 @@ public class CaelixDenoisePass : ScriptableRenderPass
         RenderGraph renderGraph,
         CaelixFrameResources resources,
         RenderTextureDescriptor descriptor,
-        int width,
-        int height)
+        in CaelixDenoiseUniforms.Snapshot uniforms)
     {
         TextureHandle combined = UniversalRenderer.CreateRenderGraphTexture(
             renderGraph, descriptor, "Caelix_outIndirectRadianceRaw", false);
 
         using (var builder = renderGraph.AddRasterRenderPass<CombinePassData>("Caelix Combine Stochastic", out var passData))
         {
-            passData.width = width;
-            passData.height = height;
+            passData.uniforms = uniforms;
             passData.Source = resources.StochasticDiffuse;
             passData.material = indirectMaterial;
 
@@ -196,7 +224,7 @@ public class CaelixDenoisePass : ScriptableRenderPass
             builder.AllowGlobalStateModification(true);
             builder.SetRenderFunc((CombinePassData data, RasterGraphContext ctx) =>
             {
-                SetFrameSize(data.material, data.width, data.height);
+                CaelixDenoiseUniforms.Apply(data.material, data.uniforms);
                 Blitter.BlitTexture(ctx.cmd, data.Source, FullScreenScaleBias, data.material, PassCombineStochastic);
             });
         }
@@ -209,17 +237,16 @@ public class CaelixDenoisePass : ScriptableRenderPass
     private TextureHandle RecordSpatialFilter(
         RenderGraph renderGraph,
         CaelixFrameResources resources,
-        int width,
-        int height,
+        in CaelixDenoiseUniforms.Snapshot uniforms,
         TextureHandle scratch,
         TextureHandle filtered)
     {
         switch (denoisingSettings.mode)
         {
             case CaelixIndirectSpatialFilterMode.ATrous:
-                return RecordATrousFilter(renderGraph, resources, width, height, scratch, filtered);
+                return RecordATrousFilter(renderGraph, resources, uniforms, scratch, filtered);
             case CaelixIndirectSpatialFilterMode.Separable15Tap:
-                return RecordSeparable15TapFilter(renderGraph, resources, width, height, scratch, filtered);
+                return RecordSeparable15TapFilter(renderGraph, resources, uniforms, scratch, filtered);
             case CaelixIndirectSpatialFilterMode.Disabled:
             default:
                 return resources.RawIndirectRadiance;
@@ -229,15 +256,14 @@ public class CaelixDenoisePass : ScriptableRenderPass
     private TextureHandle RecordSeparable15TapFilter(
         RenderGraph renderGraph,
         CaelixFrameResources resources,
-        int width,
-        int height,
+        in CaelixDenoiseUniforms.Snapshot uniforms,
         TextureHandle scratch,
         TextureHandle filtered)
     {
         RecordSeparablePass(renderGraph, "Caelix Indirect Spatial Filter X",
-            resources.RawIndirectRadiance, scratch, resources.Normal, width, height, PassSpatialFilterX);
+            resources.RawIndirectRadiance, scratch, resources.Normal, uniforms, PassSpatialFilterX);
         RecordSeparablePass(renderGraph, "Caelix Indirect Spatial Filter Y",
-            scratch, filtered, resources.Normal, width, height, PassSpatialFilterY);
+            scratch, filtered, resources.Normal, uniforms, PassSpatialFilterY);
 
         return filtered;
     }
@@ -248,14 +274,12 @@ public class CaelixDenoisePass : ScriptableRenderPass
         TextureHandle source,
         TextureHandle destination,
         TextureHandle normal,
-        int width,
-        int height,
+        in CaelixDenoiseUniforms.Snapshot uniforms,
         int passIndex)
     {
         using (var builder = renderGraph.AddRasterRenderPass<SpatialFilterPassData>(passName, out var passData))
         {
-            passData.width = width;
-            passData.height = height;
+            passData.uniforms = uniforms;
             passData.settings = denoisingSettings.separable15Tap;
             passData.Source = source;
             passData.material = indirectMaterial;
@@ -271,7 +295,7 @@ public class CaelixDenoisePass : ScriptableRenderPass
             builder.AllowGlobalStateModification(true);
             builder.SetRenderFunc((SpatialFilterPassData data, RasterGraphContext ctx) =>
             {
-                SetFrameSize(data.material, data.width, data.height);
+                CaelixDenoiseUniforms.Apply(data.material, data.uniforms);
                 data.material.SetInt(CaelixShaderIDs.SpatialFilterEnabled, 1);
                 data.material.SetInt(CaelixShaderIDs.SeparableFilterRadius, data.settings.radius);
                 data.material.SetFloat(CaelixShaderIDs.SeparableFilterDistanceSigma, data.settings.distanceSigma);
@@ -284,8 +308,7 @@ public class CaelixDenoisePass : ScriptableRenderPass
     private TextureHandle RecordATrousFilter(
         RenderGraph renderGraph,
         CaelixFrameResources resources,
-        int width,
-        int height,
+        in CaelixDenoiseUniforms.Snapshot uniforms,
         TextureHandle scratch,
         TextureHandle filtered)
     {
@@ -305,8 +328,7 @@ public class CaelixDenoisePass : ScriptableRenderPass
 
             using (var builder = renderGraph.AddRasterRenderPass<ATrousFilterPassData>(passName, out var passData))
             {
-                passData.width = width;
-                passData.height = height;
+                passData.uniforms = uniforms;
                 passData.stepWidth = 1 << iteration;
                 passData.frameIndex = Time.frameCount;
                 passData.settings = denoisingSettings.aTrous;
@@ -325,14 +347,14 @@ public class CaelixDenoisePass : ScriptableRenderPass
                 builder.AllowGlobalStateModification(true);
                 builder.SetRenderFunc((ATrousFilterPassData data, RasterGraphContext ctx) =>
                 {
-                    SetFrameSize(data.material, data.width, data.height);
+                    CaelixDenoiseUniforms.Apply(data.material, data.uniforms);
                     data.material.SetInt(CaelixShaderIDs.ATrousStepWidth, data.stepWidth);
                     data.material.SetInt(CaelixShaderIDs.ATrousUseFaceHash, data.settings.useFaceHash ? 1 : 0);
                     data.material.SetInt(CaelixShaderIDs.ATrousJitterTaps, data.settings.jitterTaps ? 1 : 0);
                     data.material.SetInt(CaelixShaderIDs.ATrousFrameIndex, data.frameIndex);
                     data.material.SetFloat(CaelixShaderIDs.ATrousNormalPower, data.settings.normalPower);
-                    data.material.SetFloat(CaelixShaderIDs.ATrousDepthSigma, data.settings.depthSigma);
-                    data.material.SetFloat(CaelixShaderIDs.ATrousRelativeDepthSigma, data.settings.relativeDepthSigma);
+                    data.material.SetFloat(CaelixShaderIDs.ATrousDepthTolerance, data.settings.depthTolerance);
+                    data.material.SetFloat(CaelixShaderIDs.ATrousRelativeDepthTolerance, data.settings.relativeDepthTolerance);
                     data.material.SetFloat(CaelixShaderIDs.ATrousRadianceSigma, data.settings.radianceSigma);
 
                     Blitter.BlitTexture(ctx.cmd, data.Source, FullScreenScaleBias, data.material, PassATrousFilter);
@@ -351,8 +373,7 @@ public class CaelixDenoisePass : ScriptableRenderPass
         RenderGraph renderGraph,
         CaelixFrameResources resources,
         CaelixCameraHistory history,
-        int width,
-        int height)
+        in CaelixDenoiseUniforms.Snapshot uniforms)
     {
         TextureHandle accumulated = renderGraph.ImportTexture(history.CurrentIndirectRadiance);
         TextureHandle previousIndirect = renderGraph.ImportTexture(history.PreviousIndirectRadiance);
@@ -362,8 +383,7 @@ public class CaelixDenoisePass : ScriptableRenderPass
         using (var builder = renderGraph.AddRasterRenderPass<TemporalAccumulationPassData>(
                    "Caelix Indirect Temporal Accumulation", out var passData))
         {
-            passData.width = width;
-            passData.height = height;
+            passData.uniforms = uniforms;
             passData.historyValid = history.IsValid;
             passData.settings = temporalSettings;
             passData.FilteredIndirectRadiance = resources.FilteredIndirectRadiance;
@@ -390,7 +410,7 @@ public class CaelixDenoisePass : ScriptableRenderPass
             builder.SetRenderFunc((TemporalAccumulationPassData data, RasterGraphContext ctx) =>
             {
                 Material material = data.material;
-                SetFrameSize(material, data.width, data.height);
+                CaelixDenoiseUniforms.Apply(material, data.uniforms);
                 material.SetInt(CaelixShaderIDs.IndirectRadianceHistoryValid, data.historyValid ? 1 : 0);
                 material.SetInt(CaelixShaderIDs.TemporalRadianceEnabled, data.settings.enabled ? 1 : 0);
                 material.SetInt(CaelixShaderIDs.TemporalRadianceBilinearHistory, data.settings.bilinearHistory ? 1 : 0);
@@ -418,16 +438,14 @@ public class CaelixDenoisePass : ScriptableRenderPass
         RenderGraph renderGraph,
         CaelixFrameResources resources,
         UniversalCameraData cameraData,
-        int width,
-        int height)
+        in CaelixDenoiseUniforms.Snapshot uniforms)
     {
         TextureHandle color = UniversalRenderer.CreateRenderGraphTexture(
             renderGraph, CaelixFrameResources.BaseDescriptor(cameraData), "Caelix_outColor", false);
 
         using (var builder = renderGraph.AddRasterRenderPass<CompositePassData>("Caelix Composite", out var passData))
         {
-            passData.width = width;
-            passData.height = height;
+            passData.uniforms = uniforms;
             passData.DeterministicRadiance = resources.DeterministicRadiance;
             passData.material = indirectMaterial;
 
@@ -441,7 +459,7 @@ public class CaelixDenoisePass : ScriptableRenderPass
             builder.AllowPassCulling(false);
             builder.SetRenderFunc((CompositePassData data, RasterGraphContext ctx) =>
             {
-                SetFrameSize(data.material, data.width, data.height);
+                CaelixDenoiseUniforms.Apply(data.material, data.uniforms);
                 Blitter.BlitTexture(ctx.cmd, data.DeterministicRadiance, FullScreenScaleBias, data.material, PassComposite);
             });
         }
@@ -465,8 +483,7 @@ public class CaelixDenoisePass : ScriptableRenderPass
         RenderGraph renderGraph,
         CaelixFrameResources resources,
         UniversalCameraData cameraData,
-        int width,
-        int height)
+        in CaelixDenoiseUniforms.Snapshot uniforms)
     {
         TextureHandle resolved = UniversalRenderer.CreateRenderGraphTexture(
             renderGraph, CaelixFrameResources.BaseDescriptor(cameraData), "Caelix_outColorResolved", false);
@@ -474,8 +491,7 @@ public class CaelixDenoisePass : ScriptableRenderPass
         using (var builder = renderGraph.AddRasterRenderPass<CrossResolvePassData>(
                    "Caelix Delta Checkerboard Resolve", out var passData))
         {
-            passData.width = width;
-            passData.height = height;
+            passData.uniforms = uniforms;
             passData.Source = resources.Color;
             passData.material = indirectMaterial;
 
@@ -486,7 +502,7 @@ public class CaelixDenoisePass : ScriptableRenderPass
             builder.AllowPassCulling(false);
             builder.SetRenderFunc((CrossResolvePassData data, RasterGraphContext ctx) =>
             {
-                SetFrameSize(data.material, data.width, data.height);
+                CaelixDenoiseUniforms.Apply(data.material, data.uniforms);
                 Blitter.BlitTexture(ctx.cmd, data.Source, FullScreenScaleBias, data.material, PassCrossResolve);
             });
         }
@@ -494,14 +510,58 @@ public class CaelixDenoisePass : ScriptableRenderPass
         return resolved;
     }
 
-    private static readonly Vector4 FullScreenScaleBias = new Vector4(1, 1, 0, 0);
+    // --- Colour resolve -----------------------------------------------------
 
-    private static void SetFrameSize(Material material, int width, int height)
+    /// <summary>
+    /// Accumulates the jittered primary samples into an anti-aliased image, TAA-style, and leaves
+    /// the result in the colour history for the next frame.
+    /// </summary>
+    /// <remarks>
+    /// Last in the chain because it works on colour, not on any G-buffer: at a silhouette the guides
+    /// describe different surfaces on either side, and only the composited colour has collapsed them
+    /// into one value. It writes directly into the history half rather than into a pooled target, so
+    /// no extra copy is needed to keep the frame; the pass's own output is what the present stage
+    /// then shows.
+    /// </remarks>
+    private TextureHandle RecordColorResolve(
+        RenderGraph renderGraph,
+        CaelixFrameResources resources,
+        CaelixCameraHistory history,
+        in CaelixDenoiseUniforms.Snapshot uniforms,
+        TextureHandle currentColorHistory,
+        TextureHandle previousColorHistory)
     {
-        material.SetVector(CaelixShaderIDs.FrameSize, new Vector4(
-            width,
-            height,
-            width > 0 ? 1.0f / width : 0.0f,
-            height > 0 ? 1.0f / height : 0.0f));
+        using (var builder = renderGraph.AddRasterRenderPass<ColorResolvePassData>(
+                   "Caelix Colour Resolve", out var passData))
+        {
+            passData.uniforms = uniforms;
+            passData.historyValid = history.ColorHistoryValid;
+            passData.settings = colorResolveSettings;
+            passData.Source = resources.Color;
+            passData.PreviousColorHistory = previousColorHistory;
+            passData.material = indirectMaterial;
+
+            builder.UseTexture(passData.Source, AccessFlags.Read);
+            builder.UseTexture(resources.MotionVector, AccessFlags.Read);
+            builder.UseTexture(passData.PreviousColorHistory, AccessFlags.Read);
+            builder.UseGlobalTexture(CaelixShaderIDs.MotionVectorTex);
+            builder.SetRenderAttachment(currentColorHistory, 0, AccessFlags.Write);
+            builder.AllowPassCulling(false);
+            builder.SetRenderFunc((ColorResolvePassData data, RasterGraphContext ctx) =>
+            {
+                Material material = data.material;
+                CaelixDenoiseUniforms.Apply(material, data.uniforms);
+                material.SetInt(CaelixShaderIDs.ColorHistoryValid, data.historyValid ? 1 : 0);
+                material.SetFloat(CaelixShaderIDs.ColorResolveBlend, data.settings.blend);
+                material.SetFloat(CaelixShaderIDs.ColorResolveClipScale, data.settings.clipScale);
+                material.SetTexture(CaelixShaderIDs.PreviousColorHistoryTex, data.PreviousColorHistory);
+
+                Blitter.BlitTexture(ctx.cmd, data.Source, FullScreenScaleBias, material, PassColorResolve);
+            });
+        }
+
+        return currentColorHistory;
     }
+
+    private static readonly Vector4 FullScreenScaleBias = new Vector4(1, 1, 0, 0);
 }

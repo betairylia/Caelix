@@ -37,6 +37,13 @@ namespace Caelix.Client
         /// </summary>
         public bool ShouldResetMotionVectors;
 
+        /// <summary>
+        /// True once a brick batch has been handed to the applier for this view in the current
+        /// client frame. It is the client's only source of brick dirt, so the render propagation
+        /// skips every view that has none. Cleared by <see cref="ClientWorld.EndFrame"/>.
+        /// </summary>
+        internal bool BricksAppliedThisFrame;
+
         public Transform Transform => Component != null ? Component.transform : null;
 
         public string Name => Component != null ? Component.name : Guid.ToString();

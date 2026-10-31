@@ -11,6 +11,7 @@ Shader "Hidden/Caelix/IndirectRadiancePipeline"
 
         #include "Denoise/CaelixTemporal.hlsl"
         #include "Denoise/CaelixCrossResolve.hlsl"
+        #include "Denoise/CaelixColorResolve.hlsl"
 
         TEXTURE2D(_DeterministicRadianceTex);
         TEXTURE2D(_DiffuseRadianceTex);
@@ -108,6 +109,12 @@ Shader "Hidden/Caelix/IndirectRadiancePipeline"
             return CaelixCrossResolve(CaelixPixelCoord(input.texcoord));
         }
 
+        float4 ColorResolve(Varyings input) : SV_Target
+        {
+            UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(input);
+            return CaelixColorResolve(CaelixPixelCoord(input.texcoord));
+        }
+
         // Sums the split stochastic targets back into the single combined signal the legacy
         // spatial/temporal chain consumes. The split targets carry hit distance in .a, so the
         // chain's validity flag (alpha) is re-derived from the deterministic target's hit/miss
@@ -187,6 +194,16 @@ Shader "Hidden/Caelix/IndirectRadiancePipeline"
             HLSLPROGRAM
             #pragma vertex Vert
             #pragma fragment CrossResolve
+            ENDHLSL
+        }
+
+        Pass
+        {
+            Name "ColorResolve"
+
+            HLSLPROGRAM
+            #pragma vertex Vert
+            #pragma fragment ColorResolve
             ENDHLSL
         }
     }

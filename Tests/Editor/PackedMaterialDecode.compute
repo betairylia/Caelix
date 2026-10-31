@@ -1,0 +1,23 @@
+#pragma kernel Decode
+#include "../../Runtime/Rendering/Shaders/def/CaelixUtils.hlsl"
+struct VoxelMaterial
+{
+    float3 albedo;
+    float3 emission;
+    float smoothness;
+    float metallic;
+    float IOR;
+    float extinction;
+};
+#include "../../Runtime/Rendering/Shaders/def/CaelixPackedSceneMaterial.hlsl"
+RWStructuredBuffer<float4> Results;
+[numthreads(64, 1, 1)]
+void Decode(uint3 id : SV_DispatchThreadID)
+{
+    uint code = id.x;
+    VoxelMaterial m = GetMaterial_Color(code);
+    Results[code * 4] = float4(m.albedo, m.IOR);
+    Results[code * 4 + 1] = float4(m.emission, m.extinction);
+    Results[code * 4 + 2] = float4(IsOpaque(code), GetFaceBits(code), GetTransparentMaterialId(code), m.smoothness);
+    Results[code * 4 + 3] = float4(m.metallic, 0, 0, 0);
+}

@@ -1,0 +1,35 @@
+activeScene=SampleScene isDirtyBEFORE=False
+material=Packages/ink.irylia.caelix/Runtime/Resources/Caelix_BrickRTTest.mat
+
+===== TEST H (ClearInstances) =====
+H handles=[1,2,3,4] count=4
+H ClearInstances() OK count=0
+H add after clear -> 4 count=1
+H add after clear -> 3 count=2
+
+===== TEST I (free-list ordering, 3 removes then 3 adds) =====
+I handles=[1,2,3,4,5,6,7,8] count=8
+I removed h1=2 count=7
+I removed h6=7 count=6
+I removed h2=3 count=5
+I add#1 -> 3 count=6
+I add#2 -> 7 count=7
+I add#3 -> 2 count=8
+I add#4 (free list empty) -> 9 count=9
+
+===== TEST J (remove highest handle, then add) =====
+J handles=[1,2,3,4] count=4
+J removed h3=4 count=3
+J add -> 4 count=4
+J add -> 5 count=5
+
+===== TEST K (double RemoveInstance of one handle) =====
+K handles=[1,2,3,4,5,6,7,8] count=8
+K remove#1 h3=4 count=7
+K remove#2 h3=4 NO THROW count=7
+K add#1 -> 4 count=8
+K add#2 -> 9 count=9
+K DUPLICATE_AFTER_DOUBLE_REMOVE=False
+
+disposed AS=4/4 buffers=4/4
+activeScene=SampleScene isDirtyAFTER=False

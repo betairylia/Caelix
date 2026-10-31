@@ -10,53 +10,60 @@ using Caelix.Utils;
 namespace Caelix.Simulation
 {
     /// <summary>
-    /// One sector to pack: entity guid, sector position, the sector, and whether every brick goes
-    /// (join / new-to-a-connection) or only the bricks whose dirty flags match
-    /// <see cref="Sector.ReplicationDirtyMask"/> (delta).
+    /// One entity to pack: its guid, its store, and whether every allocated brick goes (join, or an
+    /// entity new to a connection) or only this cycle's change list (delta).
     /// </summary>
-    public struct ReplicationSectorRef
+    public struct ReplicationEntityRef
     {
         public Guid128 Guid;
-        public int3 SectorPos;
-        public SectorHandle Sector;
+        public VoxelEntityData Data;
 
-        /// <summary>Non-zero for a full sector, zero for a delta. A byte because the struct lives in native memory.</summary>
-        public byte FullSector;
+        /// <summary>Non-zero for a full entity, zero for a delta. A byte because the struct lives in native memory.</summary>
+        public byte FullEntity;
     }
 
     /// <summary>
-    /// One finished <see cref="NetMessageType.BrickData"/> message inside a
-    /// <see cref="ReplicationBatch"/>'s byte buffer. <see cref="Length"/> 0 means the sector had
-    /// nothing to send; a caller skips those ranges.
+    /// One finished <see cref="NetMessageType.BrickBatch"/> message inside a
+    /// <see cref="ReplicationBatch"/>'s byte buffer. <see cref="Length"/> 0 means the message
+    /// carries nothing; a caller skips those ranges.
     /// </summary>
     public struct ReplicationRange
     {
         public Guid128 Guid;
-        public int3 SectorPos;
         public int Offset;
         public int Length;
-        public byte FullSector;
     }
 
     /// <summary>
-    /// Phase A of replication: packs BrickData messages for a list of sectors, in parallel over
-    /// sectors, into a byte buffer. Built once per world per tick for the delta and shared by
-    /// every connection; built again on demand for the sectors a connection does not know yet.
-    /// Owned and reused by <see cref="CaelixServer"/>.
+    /// Phase A of replication: packs BrickBatch messages for a list of entities, in parallel over
+    /// BRICKS, into a byte buffer. Built once per world per tick for the delta and shared by every
+    /// connection; built again on demand for the entities a connection does not know yet. Owned and
+    /// reused by <see cref="CaelixServer"/>.
     /// </summary>
     /// <remarks>
     /// <para>
+    /// A message belongs to one entity and carries a run of that entity's records; each record
+    /// names its own brick key and its operation, so nothing here knows how bricks are grouped in
+    /// storage. A full entity contributes every allocated brick; a delta entity contributes its
+    /// change list — a <see cref="ChangeKind.Removed"/> entry becomes a <see cref="BrickOp.Remove"/>
+    /// record, an updated entry whose dirty flags meet
+    /// <see cref="BrickReplication.ReplicationDirtyMask"/> becomes a <see cref="BrickOp.Update"/>.
+    /// Records keep change-list order, so a key removed and recreated in one tick reaches the client
+    /// as Remove then Update.
+    /// </para>
+    /// <para>
     /// The batch packs in CHUNKS, not in one buffer: <see cref="Prepare"/> once, then
     /// <see cref="BuildNextChunk"/> until it returns false, sending the ranges of each chunk before
-    /// the next one is built. A join of a large world hands the batch every sector of the world,
+    /// the next one is built. A join of a large world hands the batch every brick of the world,
     /// which for an 8K world is about 2.9 million bricks of roughly a kilobyte each — near 3 GB.
     /// One buffer for that overflowed the <c>int</c> prefix sum and wrote gigabytes into a 64 KB
-    /// allocation. <see cref="MaxChunkBytes"/> bounds a chunk instead.
+    /// allocation. <see cref="MaxChunkBytes"/> bounds a chunk, and also bounds one message, so a
+    /// chunk is always at least one whole message.
     /// </para>
     /// <para>
     /// Phase B (<see cref="ServerConnection.ReplicateWorld"/>) is the per-connection half: it diffs
-    /// the connection's knowledge, sends the lifecycle messages, and forwards the slices this batch
-    /// produced. Nothing here touches a connection, so the same bytes serve all of them.
+    /// the connection's entity knowledge, sends the lifecycle messages, and forwards the slices this
+    /// batch produced. Nothing here touches a connection, so the same bytes serve all of them.
     /// </para>
     /// </remarks>
     public sealed unsafe class ReplicationBatch : IDisposable
@@ -64,8 +71,37 @@ namespace Caelix.Simulation
         /// <summary>Capacity the byte buffer is shrunk back to once a chunk sequence finished.</summary>
         private const int IdleBytesCapacity = 4 * 1024 * 1024;
 
-        private NativeList<ReplicationSectorRef> sectors;
+        /// <summary>Entry count above which the per-brick lists are released instead of kept.</summary>
+        private const int IdleBrickCapacity = 1 << 20;
+
+        /// <summary>One brick record to pack, resolved against <see cref="entities"/> by index.</summary>
+        private struct BrickWork
+        {
+            public int Entity;
+            public int3 Key;
+            public BrickOp Op;
+        }
+
+        /// <summary>One message: a run of one entity's bricks plus its own envelope.</summary>
+        private struct MessageRange
+        {
+            public Guid128 Guid;
+            public int Entity;
+            public int FirstBrick;
+            public int BrickCount;
+
+            /// <summary>Total bytes, including <see cref="NetHeader"/> and <see cref="BrickBatchHeader"/>.</summary>
+            public int Bytes;
+        }
+
+        /// <summary>Envelope bytes every message pays before its first record.</summary>
+        private static readonly int MessageOverheadBytes =
+            NetHeader.Size + UnsafeUtility.SizeOf<BrickBatchHeader>();
+
+        private NativeList<ReplicationEntityRef> entities;
+        private NativeList<BrickWork> bricks;
         private NativeList<int> sizes;
+        private NativeList<MessageRange> messages;
         private NativeList<int> offsets;
         private NativeList<byte> bytes;
         private NativeList<ReplicationRange> ranges;
@@ -78,18 +114,20 @@ namespace Caelix.Simulation
 
         public ReplicationBatch()
         {
-            sectors = new NativeList<ReplicationSectorRef>(64, Allocator.Persistent);
-            sizes = new NativeList<int>(64, Allocator.Persistent);
-            offsets = new NativeList<int>(64, Allocator.Persistent);
+            entities = new NativeList<ReplicationEntityRef>(64, Allocator.Persistent);
+            bricks = new NativeList<BrickWork>(256, Allocator.Persistent);
+            sizes = new NativeList<int>(256, Allocator.Persistent);
+            messages = new NativeList<MessageRange>(64, Allocator.Persistent);
+            offsets = new NativeList<int>(256, Allocator.Persistent);
             bytes = new NativeList<byte>(64 * 1024, Allocator.Persistent);
             ranges = new NativeList<ReplicationRange>(64, Allocator.Persistent);
         }
 
         /// <summary>
-        /// Upper bound on the bytes one chunk packs. A join of a large world streams through chunks
-        /// of this size instead of one buffer holding the whole world (which overflowed int at
-        /// ~3 GB and froze the Editor). A single sector larger than this still goes alone; 4096
-        /// bricks of Block is about 4.2 MB, far under the default.
+        /// Upper bound on the bytes one chunk packs, and on the bytes one message packs. A join of
+        /// a large world streams through chunks of this size instead of one buffer holding the
+        /// whole world (which overflowed int at ~3 GB and froze the Editor). A single record larger
+        /// than this still goes alone; one brick of Block is about 1 KB, far under the default.
         /// </summary>
         public int MaxChunkBytes { get; set; } = 64 * 1024 * 1024;
 
@@ -102,164 +140,235 @@ namespace Caelix.Simulation
         /// <summary>Number of packed ranges in the CURRENT chunk. Zero until a chunk was built.</summary>
         public int Count => ranges.Length;
 
-        /// <summary>Number of sectors added since the last <see cref="Clear"/>, built or not.</summary>
-        public int SectorCount => sectors.Length;
+        /// <summary>Number of entities added since the last <see cref="Clear"/>, built or not.</summary>
+        public int EntityCount => entities.Length;
 
         public ReplicationRange this[int i] => ranges[i];
 
-        /// <summary>Drops the sectors and the bytes of the previous build. Keeps the capacity.</summary>
+        /// <summary>Drops the entities and the bytes of the previous build. Keeps the capacity.</summary>
         public void Clear()
         {
-            sectors.Clear();
+            entities.Clear();
+            bricks.Clear();
             sizes.Clear();
+            messages.Clear();
             offsets.Clear();
             bytes.Clear();
             ranges.Clear();
             cursor = 0;
         }
 
-        /// <summary>The sector added at <paramref name="i"/>. Only valid before <see cref="Prepare"/>.</summary>
-        internal ReplicationSectorRef GetSector(int i) => sectors[i];
+        /// <summary>The entity added at <paramref name="i"/>. Only valid before <see cref="Prepare"/>.</summary>
+        internal ReplicationEntityRef GetEntity(int i) => entities[i];
 
         /// <summary>
-        /// Drops the sector at <paramref name="i"/>, moving the last one into its place. Order of a
-        /// batch does not matter, so a caller may filter the added sectors before
+        /// Drops the entity at <paramref name="i"/>, moving the last one into its place. Order of a
+        /// batch does not matter, so a caller may filter the added entities before
         /// <see cref="Prepare"/>.
         /// </summary>
-        internal void RemoveSectorAtSwapBack(int i)
+        internal void RemoveEntityAtSwapBack(int i)
         {
-            sectors.RemoveAtSwapBack(i);
+            entities.RemoveAtSwapBack(i);
         }
 
-        public void Add(Guid128 guid, int3 sectorPos, SectorHandle sector, bool fullSector)
+        /// <summary>Queues one entity. <paramref name="fullEntity"/> sends every allocated brick.</summary>
+        public void Add(Guid128 guid, in VoxelEntityData data, bool fullEntity)
         {
-            sectors.Add(new ReplicationSectorRef
+            entities.Add(new ReplicationEntityRef
             {
                 Guid = guid,
-                SectorPos = sectorPos,
-                Sector = sector,
-                FullSector = (byte)(fullSector ? 1 : 0),
+                Data = data,
+                FullEntity = (byte)(fullEntity ? 1 : 0),
             });
         }
 
         /// <summary>
-        /// Adds every sector of every entity whose <c>sectorDirtyFlags</c> intersect
-        /// <see cref="Sector.ReplicationDirtyMask"/>, as a delta. Main-thread walk of the world's
-        /// entity map; the packing itself is the job pair in <see cref="Prepare"/> and
-        /// <see cref="BuildNextChunk"/>.
+        /// Adds every entity of <paramref name="world"/> that has a change list this cycle, as a
+        /// delta. Main-thread walk of the world's entity map; which of those changes actually
+        /// travel is the collect job's decision, and an entity whose changes are all
+        /// non-replicated simply produces no message.
         /// </summary>
-        public void CollectDirtySectors(CaelixWorld world)
+        public void CollectChangedEntities(CaelixWorld world)
         {
             if (world == null)
             {
                 return;
             }
 
-            const ushort dirtyMask = (ushort)Sector.ReplicationDirtyMask;
             foreach (var entityEntry in world.Data.VoxelEntities)
             {
                 VoxelEntityData data = entityEntry.Value;
-                foreach (var sectorEntry in data.sectors)
+                if (data.ChangeCount == 0)
                 {
-                    SectorHandle handle = sectorEntry.Value;
-                    if ((handle.Get().sectorDirtyFlags & dirtyMask) == 0)
-                    {
-                        continue;
-                    }
-
-                    Add(entityEntry.Key, sectorEntry.Key, handle, fullSector: false);
+                    continue;
                 }
+
+                Add(entityEntry.Key, in data, fullEntity: false);
             }
         }
 
         /// <summary>
-        /// Runs the size job over every added sector and rewinds the chunk cursor. Call once, then
-        /// loop <see cref="BuildNextChunk"/>. Safe to call with zero sectors.
+        /// Collects the bricks of every added entity, sizes their records, and cuts them into
+        /// messages. Call once, then loop <see cref="BuildNextChunk"/>. Safe to call with zero
+        /// entities.
         /// </summary>
         public void Prepare(ushort worldId, uint tick, ushort slotMask)
         {
             ranges.Clear();
             bytes.Clear();
+            messages.Clear();
+            bricks.Clear();
+            sizes.Clear();
+            offsets.Clear();
             LastChunkCount = 0;
             cursor = 0;
             buildWorldId = worldId;
             buildTick = tick;
             buildSlotMask = slotMask;
 
-            int count = sectors.Length;
+            if (entities.Length == 0)
+            {
+                return;
+            }
+
+            new CollectBricksJob
+            {
+                Entities = entities.AsArray(),
+                Bricks = bricks,
+            }.Run();
+
+            int count = bricks.Length;
             if (count == 0)
             {
                 return;
             }
 
             sizes.ResizeUninitialized(count);
-
             new SizeJob
             {
-                Sectors = sectors.AsArray(),
+                Entities = entities.AsArray(),
+                Bricks = bricks.AsArray(),
                 Sizes = sizes.AsArray(),
                 SlotMask = slotMask,
-            }.Schedule(count, 1).Complete();
+            }.Schedule(count, 64).Complete();
+
+            // Cut the bricks into messages: a message never spans entities, and never grows past
+            // one chunk, so a chunk always holds at least one whole message.
+            for (int i = 0; i < count; i++)
+            {
+                BrickWork brick = bricks[i];
+                bool startNew = messages.Length == 0;
+                if (!startNew)
+                {
+                    MessageRange open = messages[messages.Length - 1];
+                    startNew = open.Entity != brick.Entity ||
+                               (open.BrickCount > 0 && (long)open.Bytes + sizes[i] > MaxChunkBytes);
+                }
+
+                if (startNew)
+                {
+                    messages.Add(new MessageRange
+                    {
+                        Guid = entities[brick.Entity].Guid,
+                        Entity = brick.Entity,
+                        FirstBrick = i,
+                        BrickCount = 0,
+                        Bytes = MessageOverheadBytes,
+                    });
+                }
+
+                MessageRange message = messages[messages.Length - 1];
+                message.BrickCount++;
+                message.Bytes += sizes[i];
+                messages[messages.Length - 1] = message;
+            }
         }
 
         /// <summary>
-        /// Packs the next run of sectors whose sizes sum to at most <see cref="MaxChunkBytes"/>
-        /// (always at least one sector) into the byte buffer and fills the ranges for them. Returns
-        /// false, with <see cref="Count"/> 0, when every sector was packed. The ranges of a chunk
-        /// are only valid until the next call.
+        /// Packs the next run of messages whose sizes sum to at most <see cref="MaxChunkBytes"/>
+        /// (always at least one message) into the byte buffer and fills the ranges for them.
+        /// Returns false, with <see cref="Count"/> 0, when every message was packed. The ranges of
+        /// a chunk are only valid until the next call.
         /// </summary>
         public bool BuildNextChunk()
         {
             ranges.Clear();
-            if (cursor >= sectors.Length)
+            if (cursor >= messages.Length)
             {
                 bytes.Clear();
-                ShrinkBytes();
+                bricks.Clear();
+                sizes.Clear();
+                offsets.Clear();
+                ShrinkBuffers();
                 return false;
             }
 
             int end = cursor;
-            int total = 0;
-            while (end < sectors.Length && (end == cursor || (long)total + sizes[end] <= MaxChunkBytes))
+            long total = 0;
+            while (end < messages.Length && (end == cursor || total + messages[end].Bytes <= MaxChunkBytes))
             {
-                total += sizes[end];
+                total += messages[end].Bytes;
                 end++;
             }
 
-            int count = end - cursor;
-            offsets.ResizeUninitialized(count);
-
-            int offset = 0;
-            for (int i = 0; i < count; i++)
+            int chunkBricks = 0;
+            for (int m = cursor; m < end; m++)
             {
-                ReplicationSectorRef sectorRef = sectors[cursor + i];
-                int size = sizes[cursor + i];
-                offsets[i] = offset;
-                ranges.Add(new ReplicationRange
-                {
-                    Guid = sectorRef.Guid,
-                    SectorPos = sectorRef.SectorPos,
-                    Offset = offset,
-                    Length = size,
-                    FullSector = sectorRef.FullSector,
-                });
-                offset += size;
+                chunkBricks += messages[m].BrickCount;
             }
 
-            bytes.ResizeUninitialized(total);
-            if (total > 0)
+            offsets.ResizeUninitialized(chunkBricks);
+
+            int offset = 0;
+            int slot = 0;
+            for (int m = cursor; m < end; m++)
+            {
+                MessageRange message = messages[m];
+                ranges.Add(new ReplicationRange
+                {
+                    Guid = message.Guid,
+                    Offset = offset,
+                    Length = message.Bytes,
+                });
+
+                int recordOffset = offset + MessageOverheadBytes;
+                for (int b = 0; b < message.BrickCount; b++)
+                {
+                    offsets[slot++] = recordOffset;
+                    recordOffset += sizes[message.FirstBrick + b];
+                }
+
+                offset += message.Bytes;
+            }
+
+            bytes.ResizeUninitialized((int)total);
+            var basePtr = (byte*)bytes.GetUnsafePtr();
+
+            // Envelopes on the main thread; the records are packed in parallel over bricks.
+            for (int i = 0; i < ranges.Length; i++)
+            {
+                ReplicationRange range = ranges[i];
+                var header = new UnsafeNetWriter(basePtr + range.Offset, MessageOverheadBytes);
+                NetHeader.Write(ref header, NetMessageType.BrickBatch, buildWorldId, buildTick);
+                header.Write(new BrickBatchHeader
+                {
+                    Guid = range.Guid,
+                    BrickCount = messages[cursor + i].BrickCount,
+                });
+            }
+
+            if (chunkBricks > 0)
             {
                 new WriteJob
                 {
-                    Sectors = sectors.AsArray(),
+                    Entities = entities.AsArray(),
+                    Bricks = bricks.AsArray(),
                     Sizes = sizes.AsArray(),
                     Offsets = offsets.AsArray(),
-                    BasePtr = bytes.GetUnsafePtr(),
-                    Start = cursor,
-                    WorldId = buildWorldId,
-                    Tick = buildTick,
+                    BasePtr = basePtr,
+                    First = messages[cursor].FirstBrick,
                     SlotMask = buildSlotMask,
-                }.Schedule(count, 1).Complete();
+                }.Schedule(chunkBricks, 64).Complete();
             }
 
             cursor = end;
@@ -268,15 +377,30 @@ namespace Caelix.Simulation
         }
 
         /// <summary>
-        /// Gives the chunk buffer back once the sequence ended, so a one-off load of a large world
-        /// does not pin <see cref="MaxChunkBytes"/> for the rest of the session.
+        /// Gives the chunk buffer and the per-brick lists back once the sequence ended, so a
+        /// one-off load of a large world does not pin its peak for the rest of the session.
         /// </summary>
-        private void ShrinkBytes()
+        private void ShrinkBuffers()
         {
+            // Every list is empty here, so the shrinks are always legal.
             if (bytes.Capacity > IdleBytesCapacity)
             {
-                // Length is 0 here, so the shrink is always legal.
                 bytes.Capacity = IdleBytesCapacity;
+            }
+
+            if (bricks.Capacity > IdleBrickCapacity)
+            {
+                bricks.Capacity = 256;
+            }
+
+            if (sizes.Capacity > IdleBrickCapacity)
+            {
+                sizes.Capacity = 256;
+            }
+
+            if (offsets.Capacity > IdleBrickCapacity)
+            {
+                offsets.Capacity = 256;
             }
         }
 
@@ -292,127 +416,102 @@ namespace Caelix.Simulation
             if (disposed) return;
             disposed = true;
 
-            if (sectors.IsCreated) sectors.Dispose();
+            if (entities.IsCreated) entities.Dispose();
+            if (bricks.IsCreated) bricks.Dispose();
             if (sizes.IsCreated) sizes.Dispose();
+            if (messages.IsCreated) messages.Dispose();
             if (offsets.IsCreated) offsets.Dispose();
             if (bytes.IsCreated) bytes.Dispose();
             if (ranges.IsCreated) ranges.Dispose();
         }
 
         /// <summary>
-        /// Bricks one sector contributes. Both jobs call this, so the count the size is computed
-        /// from and the count the header carries cannot disagree: nothing writes bricks between the
-        /// two jobs, because both run inside <c>CaelixServer.Replicate</c>, inside the tick.
+        /// Turns every added entity into the flat list of brick records it contributes, in add
+        /// order. Single-threaded: record order inside an entity is the order a client must apply.
         /// </summary>
-        private static int CountBricks(ref Sector sector, byte fullSector)
+        [BurstCompile]
+        private struct CollectBricksJob : IJob
         {
-            if (fullSector != 0)
+            [ReadOnly] public NativeArray<ReplicationEntityRef> Entities;
+            public NativeList<BrickWork> Bricks;
+
+            public void Execute()
             {
-                return sector.NonEmptyBrickCount;
+                for (int e = 0; e < Entities.Length; e++)
+                {
+                    ReplicationEntityRef entity = Entities[e];
+                    if (entity.FullEntity != 0)
+                    {
+                        foreach (int3 key in entity.Data.EnumerateBricks())
+                        {
+                            Bricks.Add(new BrickWork { Entity = e, Key = key, Op = BrickOp.Update });
+                        }
+
+                        continue;
+                    }
+
+                    // The Changes property builds a safety handle; the indexed pair is the
+                    // Burst-safe reader of the same list.
+                    int changes = entity.Data.ChangeCount;
+                    for (int i = 0; i < changes; i++)
+                    {
+                        BrickChange change = entity.Data.GetChange(i);
+                        if (change.Kind == ChangeKind.Removed)
+                        {
+                            Bricks.Add(new BrickWork { Entity = e, Key = change.Key, Op = BrickOp.Remove });
+                        }
+                        else if ((change.DirtyFlags & BrickReplication.ReplicationDirtyMask) != 0)
+                        {
+                            Bricks.Add(new BrickWork { Entity = e, Key = change.Key, Op = BrickOp.Update });
+                        }
+                    }
+                }
             }
-
-            int count = 0;
-            SectorDirtyBrickEnumerator dirty = sector.EnumerateDirtyBricks(Sector.ReplicationDirtyMask);
-            while (dirty.MoveNext())
-            {
-                count++;
-            }
-
-            return count;
-        }
-
-        /// <summary>Bytes one BrickData message takes for <paramref name="brickCount"/> bricks.</summary>
-        private static int MessageBytes(ref Sector sector, int brickCount, ushort slotMask)
-        {
-            if (brickCount == 0)
-            {
-                return 0;
-            }
-
-            // u16 brickIdx + u16 dirtyFlags per brick, then the brick's slot records.
-            return NetHeader.Size
-                   + UnsafeUtility.SizeOf<BrickBatchHeader>()
-                   + brickCount * (2 + 2 + sector.ReplicatedBrickBytes(slotMask));
         }
 
         [BurstCompile]
         private struct SizeJob : IJobParallelFor
         {
-            [ReadOnly] public NativeArray<ReplicationSectorRef> Sectors;
+            [ReadOnly] public NativeArray<ReplicationEntityRef> Entities;
+            [ReadOnly] public NativeArray<BrickWork> Bricks;
             public NativeArray<int> Sizes;
             public ushort SlotMask;
 
             public void Execute(int i)
             {
-                ReplicationSectorRef sectorRef = Sectors[i];
-                ref Sector sector = ref sectorRef.Sector.Get();
-                int count = CountBricks(ref sector, sectorRef.FullSector);
-                Sizes[i] = MessageBytes(ref sector, count, SlotMask);
+                BrickWork brick = Bricks[i];
+                ReplicationEntityRef entity = Entities[brick.Entity];
+                Sizes[i] = entity.Data.ReplicatedRecordBytes(brick.Key, brick.Op, SlotMask);
             }
         }
 
         [BurstCompile]
         private struct WriteJob : IJobParallelFor
         {
-            [ReadOnly] public NativeArray<ReplicationSectorRef> Sectors;
+            [ReadOnly] public NativeArray<ReplicationEntityRef> Entities;
+            [ReadOnly] public NativeArray<BrickWork> Bricks;
             [ReadOnly] public NativeArray<int> Sizes;
+
+            /// <summary>Chunk-relative byte offset of each record, indexed like this job.</summary>
             [ReadOnly] public NativeArray<int> Offsets;
 
             /// <summary>Base of the chunk buffer, already sized. The job never resizes it.</summary>
             [NativeDisableUnsafePtrRestriction] public byte* BasePtr;
 
-            /// <summary>Index of the chunk's first sector. <c>Offsets</c> is chunk-relative, the other two are not.</summary>
-            public int Start;
+            /// <summary>Index of the chunk's first brick. <c>Offsets</c> is chunk-relative, the other two are not.</summary>
+            public int First;
 
-            public ushort WorldId;
-            public uint Tick;
             public ushort SlotMask;
 
             public void Execute(int i)
             {
-                int size = Sizes[Start + i];
-                if (size == 0)
-                {
-                    return;
-                }
-
-                ReplicationSectorRef sectorRef = Sectors[Start + i];
-                ref Sector sector = ref sectorRef.Sector.Get();
-                int count = CountBricks(ref sector, sectorRef.FullSector);
+                int index = First + i;
+                BrickWork brick = Bricks[index];
+                int size = Sizes[index];
+                ReplicationEntityRef entity = Entities[brick.Entity];
 
                 var writer = new UnsafeNetWriter(BasePtr + Offsets[i], size);
-                NetHeader.Write(ref writer, NetMessageType.BrickData, WorldId, Tick);
-                writer.Write(new BrickBatchHeader
-                {
-                    Guid = sectorRef.Guid,
-                    SectorPos = sectorRef.SectorPos,
-                    BrickCount = (ushort)count,
-                });
-
-                if (sectorRef.FullSector != 0)
-                {
-                    SectorNonEmptyBrickEnumerator bricks = sector.EnumerateNonEmptyBricks();
-                    while (bricks.MoveNext())
-                    {
-                        int brickIdx = bricks.Current.BrickAbs;
-                        writer.Write((ushort)brickIdx);
-                        writer.Write(sector.brickDirtyFlags[brickIdx]);
-                        sector.WriteReplicatedBrick(ref writer, brickIdx, SlotMask);
-                    }
-                }
-                else
-                {
-                    SectorDirtyBrickEnumerator bricks = sector.EnumerateDirtyBricks(Sector.ReplicationDirtyMask);
-                    while (bricks.MoveNext())
-                    {
-                        int brickIdx = bricks.Current.BrickIdx;
-                        writer.Write((ushort)brickIdx);
-                        // The MATCHED flags, which is what WriteBrickBatch used to send.
-                        writer.Write((ushort)bricks.Current.Flags);
-                        sector.WriteReplicatedBrick(ref writer, brickIdx, SlotMask);
-                    }
-                }
-
+                entity.Data.WriteReplicatedRecord(ref writer, brick.Key, brick.Op, SlotMask);
                 CheckExactFit(writer.Length, size);
             }
 
@@ -422,7 +521,7 @@ namespace Caelix.Simulation
                 if (written != expected)
                 {
                     throw new InvalidOperationException(
-                        $"ReplicationBatch wrote {written} bytes into a {expected} byte range; the size job and the write job disagree.");
+                        "ReplicationBatch wrote a record of the wrong length; the size job and the write job disagree.");
                 }
             }
         }

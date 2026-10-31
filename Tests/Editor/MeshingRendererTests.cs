@@ -35,15 +35,17 @@ namespace Caelix.Tests
                 client.PrepareRender();
                 renderer.Update();
                 client.EndFrame();
-                Assert.That(renderer.SectorRendererCount, Is.EqualTo(1));
+                Assert.That(renderer.GroupRendererCount, Is.EqualTo(1));
                 client.World.TryGetView(guid, out EntityView view);
                 Assert.That(VertexCount(view), Is.EqualTo(24));
 
-                world.GetEntity(guid).RemoveSectorAt(int3.zero);
+                world.GetEntity(guid).RemoveRegion(int3.zero);
                 server.Step();
                 client.Receive();
-                Assert.That(renderer.SectorRendererCount, Is.Zero, "removal releases resources during Receive");
-                renderer.Update(); // Used to dereference the freed SectorHandle here.
+                // No removal callback any more: the next Update drops the group whose bricks were
+                // removed, after its jobs completed.
+                renderer.Update();
+                Assert.That(renderer.GroupRendererCount, Is.Zero, "the next Update drops the emptied group");
 
                 world.SetBlock(guid, new int3(48), new Block(0x8002));
                 server.Step();
@@ -51,11 +53,11 @@ namespace Caelix.Tests
                 client.PrepareRender();
                 renderer.Update();
                 client.EndFrame();
-                Assert.That(renderer.SectorRendererCount, Is.EqualTo(1));
+                Assert.That(renderer.GroupRendererCount, Is.EqualTo(1));
                 Assert.That(VertexCount(view), Is.EqualTo(24));
 
                 // Removal and recreation can also arrive together in one client frame.
-                world.GetEntity(guid).RemoveSectorAt(int3.zero);
+                world.GetEntity(guid).RemoveRegion(int3.zero);
                 server.Step();
                 world.SetBlock(guid, new int3(64), new Block(0x8003));
                 server.Step();
@@ -67,7 +69,7 @@ namespace Caelix.Tests
 
                 // Changing source releases old renderers even when it happens outside a render tick.
                 renderer.Source = null;
-                Assert.That(renderer.SectorRendererCount, Is.Zero);
+                Assert.That(renderer.GroupRendererCount, Is.Zero);
                 renderer.Source = client.World;
                 renderer.Update();
                 Assert.That(VertexCount(view), Is.EqualTo(24));
@@ -75,7 +77,7 @@ namespace Caelix.Tests
                 server.Step();
                 client.Receive();
                 Assert.That(renderer.Source, Is.Null);
-                Assert.That(renderer.SectorRendererCount, Is.Zero);
+                Assert.That(renderer.GroupRendererCount, Is.Zero);
 
                 world = server.CreateWorld(CaelixWorldConfig.Default());
                 world.CreateEntity(guid, RigidTransform.identity, isStatic: true);
@@ -103,10 +105,15 @@ namespace Caelix.Tests
             return total;
         }
 
+        /// <summary>
+        /// The ray query renderer's world binding: instances follow the geometry through a sector
+        /// removal, a world removal and a replacement world, and a renderer that is bound after the
+        /// world already exists still uploads it.
+        /// </summary>
         [Test]
-        public void RayRenderer_RemovesInstancesAndRebindsAfterWorldReplacement()
+        public void RayQueryRenderer_RemovesInstancesAndRebindsAfterWorldReplacement()
         {
-            if (!SystemInfo.supportsRayTracing) Assert.Ignore("Ray tracing hardware is required.");
+            if (!SystemInfo.supportsInlineRayTracing) Assert.Ignore("Inline ray tracing is required.");
             using var server = new CaelixServer();
             var world = server.CreateWorld(CaelixWorldConfig.Default());
             LocalChannel.CreatePair(out var serverEnd, out var clientEnd);
@@ -115,9 +122,11 @@ namespace Caelix.Tests
             var guid = new Guid128(11u, 22u, 33u, 44u);
             world.CreateEntity(guid, RigidTransform.identity, isStatic: true);
             world.SetBlock(guid, new int3(32), new Block(0x8001));
-            var material = new Material(Shader.Find("Caelix/BrickRTTest"));
-            var go = new GameObject("ray-lifecycle-test");
-            var renderer = go.AddComponent<CaelixRenderer>();
+            var material = new Material(Shader.Find("Caelix/AabbInstance"));
+            var go = new GameObject("ray-query-lifecycle-test");
+            // No Awake in edit mode: the renderer creates its pool, instance table and acceleration
+            // structure lazily in Tick.
+            var renderer = go.AddComponent<Caelix.Rendering.RayQuery.CaelixRayQueryRenderer>();
             renderer.brickMat = material;
             try
             {
@@ -129,10 +138,14 @@ namespace Caelix.Tests
                 renderer.voxelScene.Build();
                 Assert.That(renderer.voxelScene.GetInstanceCount(), Is.EqualTo(1));
                 client.EndFrame();
-                world.GetEntity(guid).RemoveSectorAt(int3.zero);
+                world.GetEntity(guid).RemoveRegion(int3.zero);
                 server.Step();
                 client.Receive();
+                client.PrepareRender();
+                renderer.Tick();
+                renderer.voxelScene.Build();
                 Assert.That(renderer.voxelScene.GetInstanceCount(), Is.Zero);
+                client.EndFrame();
 
                 world.SetBlock(guid, new int3(48), new Block(0x8002));
                 server.Step();
@@ -141,6 +154,7 @@ namespace Caelix.Tests
                 renderer.Tick();
                 renderer.voxelScene.Build();
                 Assert.That(renderer.voxelScene.GetInstanceCount(), Is.EqualTo(1));
+                client.EndFrame();
                 server.RemoveWorld(world);
                 server.Step();
                 client.Receive();
@@ -158,6 +172,7 @@ namespace Caelix.Tests
                 renderer.voxelScene.Build();
                 Assert.That(renderer.voxelScene.GetInstanceCount(), Is.EqualTo(1));
                 // Disabling and re-enabling must also upload a quiet, already-synchronized world.
+                // (OnDisable/OnEnable may not run in edit mode; SetSource raises the same flag.)
                 renderer.enabled = false;
                 renderer.enabled = true;
                 renderer.SetSource(client.World);
@@ -172,44 +187,54 @@ namespace Caelix.Tests
             {
                 Object.DestroyImmediate(go);
                 Object.DestroyImmediate(material);
-                Caelix.Rendering.SectorRenderer.sectorMaterial = null;
             }
         }
 
-        [TestCase(DirtyFlags.BlockBrickAdded)]
-        [TestCase(DirtyFlags.BlockBrickRemoved)]
-        [TestCase(DirtyFlags.GeometryWithLocalNeighbor)]
-        public void RendererRequireUpdateFlagsInvalidateChunk(DirtyFlags flags)
+        [TestCase(BrickUpdateFlags.BlockBrickAdded)]
+        [TestCase(BrickUpdateFlags.BlockBrickRemoved)]
+        [TestCase(BrickUpdateFlags.GeometryWithLocalNeighbor)]
+        public void RendererRequireUpdateFlagsInvalidateChunk(BrickUpdateFlags flags)
         {
-            Assert.That(SectorMeshRenderer.RequiresRemesh((ushort)flags), Is.True);
+            Assert.That(GroupMeshRenderer.RequiresRemesh((ushort)flags), Is.True);
         }
 
-        [TestCase(DirtyFlags.None)]
-        [TestCase(DirtyFlags.GeneralAutomata)]
-        [TestCase(DirtyFlags.Geometry)]
-        public void NonRendererRequireUpdateFlagsDoNotInvalidateChunk(DirtyFlags flags)
+        [TestCase(BrickUpdateFlags.None)]
+        [TestCase(BrickUpdateFlags.Automata0)]
+        [TestCase(BrickUpdateFlags.Geometry)]
+        public void NonRendererRequireUpdateFlagsDoNotInvalidateChunk(BrickUpdateFlags flags)
         {
-            Assert.That(SectorMeshRenderer.RequiresRemesh((ushort)flags), Is.False);
+            Assert.That(GroupMeshRenderer.RequiresRemesh((ushort)flags), Is.False);
         }
 
         [Test]
-        public void GeneratedMeshCarriesExactBlockIdForShaderLookup()
+        public unsafe void GeneratedMeshCarriesExactBlockIdForShaderLookup()
         {
             const ushort blockId = ushort.MaxValue;
-            using var scope = new SectorTestScope();
+            using var scope = new EntityDataTestScope();
             using var vertices = new NativeList<VoxelVertex>(24, Allocator.TempJob);
             using var indices = new NativeList<int>(36, Allocator.TempJob);
 
-            scope.Set(0, 0, 0, blockId);
+            scope.Data.SetBlock(int3.zero, new Block(blockId));
+            Assert.That(scope.Data.TryBindBrick(SectorSlotId.Block, int3.zero, out Block* blocks), Is.True);
 
-            new MeshGenerationJob
+            var bricks = new NativeArray<System.IntPtr>(1, Allocator.TempJob);
+            try
             {
-                sector = scope.Sector,
-                chunkMin = int3.zero,
-                chunkSize = new int3(1),
-                vertices = vertices,
-                indices = indices
-            }.Execute();
+                bricks[0] = (System.IntPtr)blocks;
+
+                new MeshGenerationJob
+                {
+                    bricks = bricks,
+                    bricksPerAxis = 1,
+                    chunkSize = new int3(1),
+                    vertices = vertices,
+                    indices = indices
+                }.Execute();
+            }
+            finally
+            {
+                bricks.Dispose();
+            }
 
             Assert.That(vertices.Length, Is.EqualTo(24));
             Assert.That(indices.Length, Is.EqualTo(36));

@@ -1,6 +1,7 @@
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
+using Caelix.Rendering.RayQuery;
 
 /// <summary>
 /// URP renderer feature for Caelix budget mode: a fixed, small ray budget per pixel instead of a
@@ -21,7 +22,7 @@ using UnityEngine.Rendering.Universal;
 /// <para>
 /// The stages hand off through <see cref="CaelixFrameResources"/>:
 /// <list type="number">
-/// <item><see cref="CaelixBudgetGBufferPass"/> — DXR trace producing the G-buffer and raw AO/shadow;</item>
+/// <item><see cref="CaelixBudgetGBufferPass"/> — the trace producing the G-buffer and raw AO/shadow;</item>
 /// <item><see cref="CaelixBudgetDenoisePass"/> — spatial filter, temporal accumulation, deferred shade;</item>
 /// <item><see cref="CaelixPresentPass"/> — reused unchanged: debug view selection and copy to the camera target.</item>
 /// </list>
@@ -35,8 +36,8 @@ using UnityEngine.Rendering.Universal;
 /// </remarks>
 public class CaelixBudgetRendererFeature : ScriptableRendererFeature
 {
-    /// <summary>Budget mode ray tracing shader (CaelixBudget.raytrace).</summary>
-    [SerializeField] private RayTracingShader tracer;
+    /// <summary>Budget mode inline ray query kernel (CaelixBudgetRQ.compute).</summary>
+    [SerializeField] private ComputeShader rayQueryTracer;
 
     /// <summary>Denoise + deferred shade shader (CaelixBudgetShade.shader).</summary>
     [SerializeField] private Shader budgetShadeShader;
@@ -72,8 +73,8 @@ public class CaelixBudgetRendererFeature : ScriptableRendererFeature
     [SerializeField] private bool enableTemporalAccumulation = true;
     [SerializeField, Range(0.0f, 1.0f)] private float temporalCurrentFrameMinWeight = 0.0f;
     [SerializeField] private bool temporalDepthRejection = true;
-    [SerializeField, Min(0.0f)] private float temporalDepthTolerance = 0.05f;
-    [SerializeField, Min(0.0f)] private float temporalRelativeDepthTolerance = 0.01f;
+    [SerializeField, Min(0.0f)] private float temporalDepthTolerance = 0.1f;
+    [SerializeField, Min(0.0f)] private float temporalRelativeDepthTolerance = 0.005f;
     [SerializeField] private bool temporalNormalRejection = true;
     [SerializeField, Range(-1.0f, 1.0f)] private float temporalNormalThreshold = 0.85f;
     [SerializeField] private bool temporalBilinearHistory = true;
@@ -93,7 +94,7 @@ public class CaelixBudgetRendererFeature : ScriptableRendererFeature
     private Material flipMaterial;
 
     /// <summary>Cached scene renderer. Resolved lazily because the feature can be created before the scene loads.</summary>
-    private CaelixRenderer caelixXRenderer;
+    private CaelixRayQueryRenderer rayQueryRenderer;
 
     public override void Create()
     {
@@ -119,12 +120,12 @@ public class CaelixBudgetRendererFeature : ScriptableRendererFeature
 
     public override void AddRenderPasses(ScriptableRenderer renderer, ref RenderingData renderingData)
     {
-        if (gbufferPass == null || !TryResolveCaelixRenderer())
+        if (gbufferPass == null || !TryResolveRayQueryRenderer())
         {
             return;
         }
 
-        gbufferPass.ConfigureSettings(caelixXRenderer, tracer, blueNoiseTexture, BuildTraceSettings());
+        gbufferPass.ConfigureSettings(rayQueryRenderer, rayQueryTracer, blueNoiseTexture, BuildTraceSettings());
         denoisePass.ConfigureSettings(
             enableSpatialFilter, aTrous, BuildTemporalSettings(), budgetShading, resolveDeltaCheckerboard);
         presentPass.ConfigureSettings(debugView);
@@ -173,16 +174,16 @@ public class CaelixBudgetRendererFeature : ScriptableRendererFeature
         };
     }
 
-    private bool TryResolveCaelixRenderer()
+    private bool TryResolveRayQueryRenderer()
     {
-        // Deliberately not CaelixRenderer.instance: MonoSingleton spawns a temporary GameObject
-        // when none exists, which would litter the scene from a renderer feature.
-        if (caelixXRenderer == null)
+        // Deliberately not CaelixRayQueryRenderer.instance: MonoSingleton spawns a temporary
+        // GameObject when none exists, which would litter the scene from a renderer feature.
+        if (rayQueryRenderer == null)
         {
-            caelixXRenderer = FindFirstObjectByType<CaelixRenderer>();
+            rayQueryRenderer = FindFirstObjectByType<CaelixRayQueryRenderer>();
         }
 
-        return caelixXRenderer != null;
+        return rayQueryRenderer != null;
     }
 
     private void CreateMaterials()

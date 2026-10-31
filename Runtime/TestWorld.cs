@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using Unity.Burst;
 using Unity.Collections;
 using Unity.Jobs;
@@ -15,24 +15,19 @@ namespace Caelix
     public class TestWorld : VoxelEntity
     {
         /// <summary>
-        /// Burst-compiled job that fills a sector with procedurally generated voxel data.
+        /// Burst-compiled job that fills a region with procedurally generated voxel data.
         /// Uses layered Simplex noise to create organic terrain shapes.
         /// </summary>
         [BurstCompile]
-        struct FillWorldSectorJob : IJob
+        struct FillRegionJob : IJob
         {
             /// <summary>
-            /// Position of the sector being generated in sector coordinates.
+            /// The region to fill with generated voxel data. Positions are entity-local.
             /// </summary>
-            public int3 sectorPos;
+            public VoxelRegion region;
 
             /// <summary>
-            /// The sector to fill with generated voxel data.
-            /// </summary>
-            public SectorHandle sector;
-
-            /// <summary>
-            /// Executes the job, filling the sector with noise-based voxel data.
+            /// Executes the job, filling the region with noise-based voxel data.
             /// </summary>
             /// <remarks>
             /// Uses two octaves of Simplex noise at different scales to create terrain.
@@ -40,27 +35,17 @@ namespace Caelix
             /// </remarks>
             public void Execute()
             {
-                for (int x = 0; x < Sector.SIZE_IN_BRICKS * Sector.SIZE_IN_BLOCKS; x++)
+                int3 origin = region.Origin;
+                for (int x = 0; x < VoxelRegion.SizeInBlocks; x++)
                 {
-                    for (int y = 0; y < Sector.SIZE_IN_BRICKS * Sector.SIZE_IN_BLOCKS; y++)
+                    for (int y = 0; y < VoxelRegion.SizeInBlocks; y++)
                     {
-                        for (int z = 0; z < Sector.SIZE_IN_BRICKS * Sector.SIZE_IN_BLOCKS; z++)
+                        for (int z = 0; z < VoxelRegion.SizeInBlocks; z++)
                         {
-                            int wx = x + sectorPos.x * Sector.SECTOR_SIZE_IN_BLOCKS;
-                            int wy = y + sectorPos.y * Sector.SECTOR_SIZE_IN_BLOCKS;
-                            int wz = z + sectorPos.z * Sector.SECTOR_SIZE_IN_BLOCKS;
-
-                            // if (wy > (math.sin(wx) + math.cos(wz)))
-                            // if((wx & wy & wz) == 0 && wy < (600 + 200 * math.sin(wx / 100.0)))
-                            // if(wy < (600 + 200 * math.sin(wx / 100.0) + 100 * math.cos(wz / 150.0)))
-                            // if(wy < Sector.SECTOR_SIZE_IN_BLOCKS)
-                            // {
-                            //     sector.SetBlock(x, y, z, new Block(1));
-                            // }
-                            // else
-                            // {
-                            //     sector.SetBlock(x, y, z, Block.Empty);
-                            // }
+                            int3 p = origin + new int3(x, y, z);
+                            int wx = p.x;
+                            int wy = p.y;
+                            int wz = p.z;
 
                             // var n = Unity.Mathematics.noise.snoise(
                             //     new float3(wx / 32.0f, wy / 32.0f, wz / 32.0f));
@@ -71,9 +56,7 @@ namespace Caelix
                             // float n = (float)(600 + 200 * math.sin(wx / 100.0) + 100 * math.cos(wz / 150.0)) - wy;
                             if (n > 0)
                             {
-                                // sector.SetBlock(x, y, z, new Block(1));
-                                // sector.SetBlock(x, y, z, new Block(n, wy / 512.0f, 0.5f, ((wx & wy & wz) == 0) ? 1.0f : 0.0f));
-                                sector.SetBlock(x, y, z, new Block(n, wy / 512.0f, 0.5f, 0f));
+                                region.SetBlock(p, new Block(n, wy / 512.0f, 0.5f, 0f));
                             }
                         }
                     }
@@ -82,25 +65,26 @@ namespace Caelix
         }
 
         /// <summary>
-        /// Number of sectors to generate in each dimension.
+        /// Number of regions to generate in each dimension. Serialized field name kept: scene data
+        /// depends on it.
         /// </summary>
         public int3 numSectors;
 
         /// <summary>
-        /// Initializes the test world by generating all sectors with procedural terrain.
+        /// Initializes the test world by generating all regions with procedural terrain.
         /// Can be called from the context menu in the Unity Editor.
         /// </summary>
         /// <remarks>
-        /// Generates sectors in parallel using Unity Jobs for performance.
+        /// Generates regions in parallel using Unity Jobs for performance.
         /// Logs total brick count and memory usage when complete.
         /// </remarks>
         [ContextMenu("Initialize")]
         public void Initialize()
         {
             // Dispose();
-            
+
             NativeList<JobHandle> fillWorldJobs = new NativeList<JobHandle>(Allocator.Temp);
-            
+
             for (int i = 0; i < numSectors.x; i++)
             {
                 for (int j = 0; j < numSectors.z; j++)
@@ -108,31 +92,27 @@ namespace Caelix
                     for (int k = 0; k < numSectors.y; k++)
                     {
                         var secPos = new int3(i, k, j);
-                        if (!Sectors.ContainsKey(secPos))
+                        EnsureRegion(secPos);
+                        if (!TryOpenRegion(secPos, out VoxelRegion region))
                         {
-                            AddEmptySectorAt(secPos);
+                            continue;
                         }
 
-                        var job = new FillWorldSectorJob()
+                        var job = new FillRegionJob()
                         {
-                            sectorPos = secPos,
-                            sector = Sectors[secPos]
+                            region = region
                         };
 
                         fillWorldJobs.Add(job.Schedule());
                     }
                 }
             }
-            
+
             JobHandle.CompleteAll(fillWorldJobs);
             fillWorldJobs.Dispose();
             Debug.Log("Done!");
 
-            int totalBricks = 0;
-            foreach (var kvp in Sectors)
-            {
-                totalBricks += kvp.Value.NonEmptyBrickCount;
-            }
+            int totalBricks = AllocatedBrickCount;
             Debug.Log($"Total: {totalBricks} Bricks ({totalBricks * 2 / 1024} MiB)");
         }
 
@@ -150,15 +130,15 @@ namespace Caelix
         [FormerlySerializedAs("Tick")] public bool CorruptionTick = false;
 
         /// <summary>
-        /// Burst-compiled job that toggles blocks in a sector for testing dynamic voxel updates.
+        /// Burst-compiled job that toggles blocks in a region for testing dynamic voxel updates.
         /// </summary>
         [BurstCompile]
         struct TestUpdate : IJob
         {
             /// <summary>
-            /// The sector to modify.
+            /// The region to modify.
             /// </summary>
-            public SectorHandle sector;
+            public VoxelRegion region;
 
             /// <summary>
             /// Frame counter used to determine which blocks to toggle.
@@ -166,19 +146,27 @@ namespace Caelix
             public int p;
 
             /// <summary>
-            /// Toggles a horizontal slice of blocks in the sector.
+            /// Toggles a horizontal slice of blocks in the region.
             /// </summary>
             public void Execute()
             {
-                const int Zs = Sector.SECTOR_SIZE_IN_BLOCKS;
-                for (int x = 0; x < Sector.SECTOR_SIZE_IN_BLOCKS; x++)
+                const int Zs = VoxelRegion.SizeInBlocks;
+                int3 origin = region.Origin;
+                for (int x = 0; x < VoxelRegion.SizeInBlocks; x++)
                 {
                     for (int i = 0; i < Zs; i++)
                     {
-                        int y = p % Sector.SECTOR_SIZE_IN_BLOCKS;
-                        int z = ((p / Sector.SECTOR_SIZE_IN_BLOCKS) % (Sector.SECTOR_SIZE_IN_BLOCKS / Zs)) * Zs + i;
-                        sector.SetBlock(
-                            x, y, z, new Block((ushort)(sector.GetBlock(x, y, z).isEmpty ? 1 : 0)));
+                        int z = ((p / VoxelRegion.SizeInBlocks) % (VoxelRegion.SizeInBlocks / Zs)) * Zs + i;
+                        
+                        int Ys = 4;
+                        int y_start = p % (VoxelRegion.SizeInBlocks / Ys);
+                        
+                        for (int y = y_start * Ys; y < (y_start + 1) * Ys; y++)
+                        {
+                            int3 pos = origin + new int3(x, y, z);
+                            region.SetBlock(
+                                pos, new Block((ushort)(region.GetBlock(pos).isEmpty ? new Block(0.5f, 1.0f, 0.8f, 0.0f).data : 0)), BrickUpdateFlags.None);
+                        }
                     }
                 }
             }
@@ -192,20 +180,32 @@ namespace Caelix
             if (CorruptionTick)
             {
                 NativeList<JobHandle> jobs = new NativeList<JobHandle>(Allocator.Temp);
+                NativeArray<int3> regionPositions = GetRegionPositions(Allocator.Temp);
 
-                foreach (var kvp in Sectors)
+                foreach (int3 regionPos in regionPositions)
                 {
+                    if (math.any(regionPos >= numSectors) || math.any(regionPos < 0))
+                    {
+                        continue;
+                    }
+
+                    if (!TryOpenRegion(regionPos, out VoxelRegion region))
+                    {
+                        continue;
+                    }
+
                     int p = Time.frameCount;
 
                     jobs.Add(new TestUpdate()
                     {
                         p = p,
-                        sector = kvp.Value
+                        region = region
                     }.Schedule());
                 }
 
                 JobHandle.CompleteAll(jobs);
                 jobs.Dispose();
+                regionPositions.Dispose();
             }
         }
     }

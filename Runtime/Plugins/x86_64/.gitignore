@@ -1,0 +1,6 @@
+# Native plugin binaries are build products of Caelix-Renderer (CMake copies them here when
+# CAELIX_UNITY_PLUGIN_DIR points at this folder). Only the .dll.meta files (preload + platform
+# settings) are tracked.
+*.dll
+*.pdb
+*.pdb.meta

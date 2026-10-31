@@ -1,0 +1,134 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2d33c44..fd86ef8 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -70,3 +70,8 @@ add_subdirectory(test)
+ 
+ 
+ 
++
++add_library(obj2voxel-shared SHARED src/obj2voxel.cpp src/io.cpp src/voxelization.cpp)
++set_target_properties(obj2voxel-shared PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
++target_include_directories(obj2voxel-shared PRIVATE include voxelio/include)
++target_link_libraries(obj2voxel-shared PRIVATE voxelio Threads::Threads)
+diff --git a/src/io.cpp b/src/io.cpp
+index 4d233a8..8b327bc 100644
+--- a/src/io.cpp
++++ b/src/io.cpp
+@@ -275,6 +275,7 @@ bool ObjTriangleStream::next(VisualTriangle &triangle) noexcept
+ 
+     const int materialIndex = shape.mesh.material_ids[faceIndex];
+     const tinyobj::material_t *material = materialIndex < 0 ? nullptr : &materials[static_cast<usize>(materialIndex)];
++    triangle.opacity = material == nullptr ? 1.f : material->dissolve;
+ 
+     if (material == nullptr) {
+         if (hasTexCoords && defaultTexture != nullptr) {
+diff --git a/src/main.cpp b/src/main.cpp
+index 5fbf368..4a5c475 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "3rd_party/args.hpp"
+ #include "constants.hpp"
++#include "voxelization.hpp"
+ 
+ #include "voxelio/filetype.hpp"
+ #include "voxelio/log.hpp"
+@@ -310,6 +311,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char **argv)
+     auto permutationArg = args::ValueFlag<std::string>(vgroup, "permutation", PERMUTATION_ARG, {'p', "perm"}, "xyz");
+     auto ssArg = args::Flag(vgroup, "supersample", SS_DESCR, {'u', "super"});
+     auto threadsArg = args::ValueFlag<unsigned>(vgroup, "threads", THREADS_DESCR, {'j', "threads"}, threadCount);
++    auto alphaArg = args::ValueFlag<float>(vgroup, "cutoff", "Discard samples below this alpha (0..1; default 0.5).", {"alpha-cutoff"}, 0.5f);
+ 
+     bool complete = parser.ParseCLI(argc, argv);
+     complete &= parser.Matched();
+@@ -361,6 +363,11 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char **argv)
+     }
+ 
+     int unitTransform[9];
++    if (!(alphaArg.Get() >= 0.f && alphaArg.Get() <= 1.f)) {
++        std::cerr << "alpha-cutoff must be in [0, 1]\n";
++        return 1;
++    }
++    obj2voxel::alphaCutoff = alphaArg.Get();
+     parsePermutation(permutationArg.Get(), unitTransform);
+ 
+     mainImpl(std::move(inFileArg.Get()),
+diff --git a/src/triangle.hpp b/src/triangle.hpp
+index 2cdab75..a880a06 100644
+--- a/src/triangle.hpp
++++ b/src/triangle.hpp
+@@ -169,6 +169,7 @@ struct obj2voxel_texture {
+ /// A textured triangle that also has material information.
+ struct obj2voxel_triangle : public obj2voxel::TexturedTriangle {
+     obj2voxel::TriangleType type;
++    float opacity = 1.f;
+     union {
+         const obj2voxel_texture *texture;
+         obj2voxel::Vec3f color;
+@@ -178,6 +179,15 @@ struct obj2voxel_triangle : public obj2voxel::TexturedTriangle {
+ 
+     obj2voxel_triangle(obj2voxel::TriangleType type) : type{type}, texture{nullptr} {}
+ 
++    float alphaAt_f(obj2voxel::Vec2f uv) const
++    {
++        if (type == obj2voxel::TriangleType::TEXTURED) {
++            VXIO_DEBUG_ASSERT_NOTNULL(texture);
++            return opacity * texture->image->getPixel({uv.x(), 1 - uv.y()}).af();
++        }
++        return opacity;
++    }
++
+     obj2voxel::Vec3f colorAt_f(obj2voxel::Vec2f uv) const
+     {
+         VXIO_DEBUG_ASSERT_NE(type, obj2voxel::TriangleType::NONE);
+diff --git a/src/voxelization.cpp b/src/voxelization.cpp
+index 488673e..4573dd3 100644
+--- a/src/voxelization.cpp
++++ b/src/voxelization.cpp
+@@ -6,6 +6,8 @@
+ 
+ namespace obj2voxel {
+ 
++float alphaCutoff = 0.5f;
++
+ void (*globalTriangleDebugCallback)(Triangle) = [](auto) {};
+ 
+ namespace {
+@@ -413,7 +415,10 @@ void forEachSubdividedTriangle(std::vector<TexturedTriangle> &buffer, Action act
+ 
+     WeightedUv result{};
+     for (const TexturedTriangle &t : *postSplitBuffer) {
+-        const float weight = static_cast<float>(inputTriangle.area());
++        const float weight = static_cast<float>(t.area());
++        // Clipping can leave zero-area slivers. Mixing zero with zero creates
++        // NaN UVs which later clamp to an unrelated texture texel.
++        if (!(weight > 0.f) || !std::isfinite(weight)) continue;
+         const Vec2f uv = t.textureCenter();
+ 
+         result = mix(result, {weight, uv});
+@@ -513,6 +518,9 @@ void Voxelizer::voxelizeTriangleToUvBuffer(const VisualTriangle &inputTriangle,
+ void Voxelizer::moveUvBufferIntoVoxels(const VisualTriangle &inputTriangle) noexcept
+ {
+     for (auto &[index, weightedUv] : uvBuffer) {
++        if (inputTriangle.alphaAt_f(weightedUv.value) < alphaCutoff) {
++            continue;
++        }
+         Vec3u32 pos = uvBuffer.posOf(index);
+         Vec3f colorVec = inputTriangle.colorAt_f(weightedUv.value);
+         WeightedColor color = {weightedUv.weight, colorVec};
+diff --git a/src/voxelization.hpp b/src/voxelization.hpp
+index b3d200e..b05b090 100644
+--- a/src/voxelization.hpp
++++ b/src/voxelization.hpp
+@@ -20,6 +20,9 @@ using namespace voxelio;
+ /// A function called on debug builds which can be used to dump triangles to an STL file and such.
+ extern void (*globalTriangleDebugCallback)(Triangle);
+ 
++// Set before starting workers. Alpha masking removes occupancy before color merging.
++extern float alphaCutoff;
++
+ /// An enum which describes the strategy for coloring in voxels from triangles.
+ enum class ColorStrategy : obj2voxel_enum_t {
+     /// For the maximum strategy, the triangle with the greatest area is chosen as the color.

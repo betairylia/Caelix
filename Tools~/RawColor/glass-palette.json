@@ -1,0 +1,1589 @@
+{
+  "notes": "Stable shared presets. Extinction is per Caelix voxel distance. Select nearest absorption at export after converting source distances to voxel units. IDs 0 and 133..255 reserved.",
+  "entries": [
+    {
+      "id": 1,
+      "name": "clear-glass",
+      "tint": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "ior": 1.55,
+      "extinction": 0.0,
+      "smoothness": 1.0
+    },
+    {
+      "id": 2,
+      "name": "frosted-clear",
+      "tint": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "ior": 1.55,
+      "extinction": 0.0,
+      "smoothness": 0.6
+    },
+    {
+      "id": 3,
+      "name": "water",
+      "tint": [
+        0.96,
+        0.985,
+        1.0
+      ],
+      "ior": 1.33,
+      "extinction": 0.00025,
+      "smoothness": 1.0
+    },
+    {
+      "id": 4,
+      "name": "ice",
+      "tint": [
+        0.92,
+        0.98,
+        1.0
+      ],
+      "ior": 1.31,
+      "extinction": 0.0005,
+      "smoothness": 0.9
+    },
+    {
+      "id": 5,
+      "name": "green-0",
+      "tint": [
+        0.65,
+        0.95,
+        0.72
+      ],
+      "ior": 1.55,
+      "extinction": 0.00025,
+      "smoothness": 1.0
+    },
+    {
+      "id": 6,
+      "name": "green-0-frosted",
+      "tint": [
+        0.65,
+        0.95,
+        0.72
+      ],
+      "ior": 1.55,
+      "extinction": 0.00025,
+      "smoothness": 0.6
+    },
+    {
+      "id": 7,
+      "name": "green-1",
+      "tint": [
+        0.65,
+        0.95,
+        0.72
+      ],
+      "ior": 1.55,
+      "extinction": 0.0005,
+      "smoothness": 1.0
+    },
+    {
+      "id": 8,
+      "name": "green-1-frosted",
+      "tint": [
+        0.65,
+        0.95,
+        0.72
+      ],
+      "ior": 1.55,
+      "extinction": 0.0005,
+      "smoothness": 0.6
+    },
+    {
+      "id": 9,
+      "name": "green-2",
+      "tint": [
+        0.65,
+        0.95,
+        0.72
+      ],
+      "ior": 1.55,
+      "extinction": 0.001,
+      "smoothness": 1.0
+    },
+    {
+      "id": 10,
+      "name": "green-2-frosted",
+      "tint": [
+        0.65,
+        0.95,
+        0.72
+      ],
+      "ior": 1.55,
+      "extinction": 0.001,
+      "smoothness": 0.6
+    },
+    {
+      "id": 11,
+      "name": "green-3",
+      "tint": [
+        0.65,
+        0.95,
+        0.72
+      ],
+      "ior": 1.55,
+      "extinction": 0.002,
+      "smoothness": 1.0
+    },
+    {
+      "id": 12,
+      "name": "green-3-frosted",
+      "tint": [
+        0.65,
+        0.95,
+        0.72
+      ],
+      "ior": 1.55,
+      "extinction": 0.002,
+      "smoothness": 0.6
+    },
+    {
+      "id": 13,
+      "name": "green-4",
+      "tint": [
+        0.65,
+        0.95,
+        0.72
+      ],
+      "ior": 1.55,
+      "extinction": 0.004,
+      "smoothness": 1.0
+    },
+    {
+      "id": 14,
+      "name": "green-4-frosted",
+      "tint": [
+        0.65,
+        0.95,
+        0.72
+      ],
+      "ior": 1.55,
+      "extinction": 0.004,
+      "smoothness": 0.6
+    },
+    {
+      "id": 15,
+      "name": "green-5",
+      "tint": [
+        0.65,
+        0.95,
+        0.72
+      ],
+      "ior": 1.55,
+      "extinction": 0.008,
+      "smoothness": 1.0
+    },
+    {
+      "id": 16,
+      "name": "green-5-frosted",
+      "tint": [
+        0.65,
+        0.95,
+        0.72
+      ],
+      "ior": 1.55,
+      "extinction": 0.008,
+      "smoothness": 0.6
+    },
+    {
+      "id": 17,
+      "name": "green-6",
+      "tint": [
+        0.65,
+        0.95,
+        0.72
+      ],
+      "ior": 1.55,
+      "extinction": 0.016,
+      "smoothness": 1.0
+    },
+    {
+      "id": 18,
+      "name": "green-6-frosted",
+      "tint": [
+        0.65,
+        0.95,
+        0.72
+      ],
+      "ior": 1.55,
+      "extinction": 0.016,
+      "smoothness": 0.6
+    },
+    {
+      "id": 19,
+      "name": "green-7",
+      "tint": [
+        0.65,
+        0.95,
+        0.72
+      ],
+      "ior": 1.55,
+      "extinction": 0.032,
+      "smoothness": 1.0
+    },
+    {
+      "id": 20,
+      "name": "green-7-frosted",
+      "tint": [
+        0.65,
+        0.95,
+        0.72
+      ],
+      "ior": 1.55,
+      "extinction": 0.032,
+      "smoothness": 0.6
+    },
+    {
+      "id": 21,
+      "name": "amber-0",
+      "tint": [
+        0.98,
+        0.72,
+        0.32
+      ],
+      "ior": 1.55,
+      "extinction": 0.00025,
+      "smoothness": 1.0
+    },
+    {
+      "id": 22,
+      "name": "amber-0-frosted",
+      "tint": [
+        0.98,
+        0.72,
+        0.32
+      ],
+      "ior": 1.55,
+      "extinction": 0.00025,
+      "smoothness": 0.6
+    },
+    {
+      "id": 23,
+      "name": "amber-1",
+      "tint": [
+        0.98,
+        0.72,
+        0.32
+      ],
+      "ior": 1.55,
+      "extinction": 0.0005,
+      "smoothness": 1.0
+    },
+    {
+      "id": 24,
+      "name": "amber-1-frosted",
+      "tint": [
+        0.98,
+        0.72,
+        0.32
+      ],
+      "ior": 1.55,
+      "extinction": 0.0005,
+      "smoothness": 0.6
+    },
+    {
+      "id": 25,
+      "name": "amber-2",
+      "tint": [
+        0.98,
+        0.72,
+        0.32
+      ],
+      "ior": 1.55,
+      "extinction": 0.001,
+      "smoothness": 1.0
+    },
+    {
+      "id": 26,
+      "name": "amber-2-frosted",
+      "tint": [
+        0.98,
+        0.72,
+        0.32
+      ],
+      "ior": 1.55,
+      "extinction": 0.001,
+      "smoothness": 0.6
+    },
+    {
+      "id": 27,
+      "name": "amber-3",
+      "tint": [
+        0.98,
+        0.72,
+        0.32
+      ],
+      "ior": 1.55,
+      "extinction": 0.002,
+      "smoothness": 1.0
+    },
+    {
+      "id": 28,
+      "name": "amber-3-frosted",
+      "tint": [
+        0.98,
+        0.72,
+        0.32
+      ],
+      "ior": 1.55,
+      "extinction": 0.002,
+      "smoothness": 0.6
+    },
+    {
+      "id": 29,
+      "name": "amber-4",
+      "tint": [
+        0.98,
+        0.72,
+        0.32
+      ],
+      "ior": 1.55,
+      "extinction": 0.004,
+      "smoothness": 1.0
+    },
+    {
+      "id": 30,
+      "name": "amber-4-frosted",
+      "tint": [
+        0.98,
+        0.72,
+        0.32
+      ],
+      "ior": 1.55,
+      "extinction": 0.004,
+      "smoothness": 0.6
+    },
+    {
+      "id": 31,
+      "name": "amber-5",
+      "tint": [
+        0.98,
+        0.72,
+        0.32
+      ],
+      "ior": 1.55,
+      "extinction": 0.008,
+      "smoothness": 1.0
+    },
+    {
+      "id": 32,
+      "name": "amber-5-frosted",
+      "tint": [
+        0.98,
+        0.72,
+        0.32
+      ],
+      "ior": 1.55,
+      "extinction": 0.008,
+      "smoothness": 0.6
+    },
+    {
+      "id": 33,
+      "name": "amber-6",
+      "tint": [
+        0.98,
+        0.72,
+        0.32
+      ],
+      "ior": 1.55,
+      "extinction": 0.016,
+      "smoothness": 1.0
+    },
+    {
+      "id": 34,
+      "name": "amber-6-frosted",
+      "tint": [
+        0.98,
+        0.72,
+        0.32
+      ],
+      "ior": 1.55,
+      "extinction": 0.016,
+      "smoothness": 0.6
+    },
+    {
+      "id": 35,
+      "name": "amber-7",
+      "tint": [
+        0.98,
+        0.72,
+        0.32
+      ],
+      "ior": 1.55,
+      "extinction": 0.032,
+      "smoothness": 1.0
+    },
+    {
+      "id": 36,
+      "name": "amber-7-frosted",
+      "tint": [
+        0.98,
+        0.72,
+        0.32
+      ],
+      "ior": 1.55,
+      "extinction": 0.032,
+      "smoothness": 0.6
+    },
+    {
+      "id": 37,
+      "name": "blue-0",
+      "tint": [
+        0.45,
+        0.7,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.00025,
+      "smoothness": 1.0
+    },
+    {
+      "id": 38,
+      "name": "blue-0-frosted",
+      "tint": [
+        0.45,
+        0.7,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.00025,
+      "smoothness": 0.6
+    },
+    {
+      "id": 39,
+      "name": "blue-1",
+      "tint": [
+        0.45,
+        0.7,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.0005,
+      "smoothness": 1.0
+    },
+    {
+      "id": 40,
+      "name": "blue-1-frosted",
+      "tint": [
+        0.45,
+        0.7,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.0005,
+      "smoothness": 0.6
+    },
+    {
+      "id": 41,
+      "name": "blue-2",
+      "tint": [
+        0.45,
+        0.7,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.001,
+      "smoothness": 1.0
+    },
+    {
+      "id": 42,
+      "name": "blue-2-frosted",
+      "tint": [
+        0.45,
+        0.7,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.001,
+      "smoothness": 0.6
+    },
+    {
+      "id": 43,
+      "name": "blue-3",
+      "tint": [
+        0.45,
+        0.7,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.002,
+      "smoothness": 1.0
+    },
+    {
+      "id": 44,
+      "name": "blue-3-frosted",
+      "tint": [
+        0.45,
+        0.7,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.002,
+      "smoothness": 0.6
+    },
+    {
+      "id": 45,
+      "name": "blue-4",
+      "tint": [
+        0.45,
+        0.7,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.004,
+      "smoothness": 1.0
+    },
+    {
+      "id": 46,
+      "name": "blue-4-frosted",
+      "tint": [
+        0.45,
+        0.7,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.004,
+      "smoothness": 0.6
+    },
+    {
+      "id": 47,
+      "name": "blue-5",
+      "tint": [
+        0.45,
+        0.7,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.008,
+      "smoothness": 1.0
+    },
+    {
+      "id": 48,
+      "name": "blue-5-frosted",
+      "tint": [
+        0.45,
+        0.7,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.008,
+      "smoothness": 0.6
+    },
+    {
+      "id": 49,
+      "name": "blue-6",
+      "tint": [
+        0.45,
+        0.7,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.016,
+      "smoothness": 1.0
+    },
+    {
+      "id": 50,
+      "name": "blue-6-frosted",
+      "tint": [
+        0.45,
+        0.7,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.016,
+      "smoothness": 0.6
+    },
+    {
+      "id": 51,
+      "name": "blue-7",
+      "tint": [
+        0.45,
+        0.7,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.032,
+      "smoothness": 1.0
+    },
+    {
+      "id": 52,
+      "name": "blue-7-frosted",
+      "tint": [
+        0.45,
+        0.7,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.032,
+      "smoothness": 0.6
+    },
+    {
+      "id": 53,
+      "name": "smoke-0",
+      "tint": [
+        0.65,
+        0.65,
+        0.65
+      ],
+      "ior": 1.55,
+      "extinction": 0.00025,
+      "smoothness": 1.0
+    },
+    {
+      "id": 54,
+      "name": "smoke-0-frosted",
+      "tint": [
+        0.65,
+        0.65,
+        0.65
+      ],
+      "ior": 1.55,
+      "extinction": 0.00025,
+      "smoothness": 0.6
+    },
+    {
+      "id": 55,
+      "name": "smoke-1",
+      "tint": [
+        0.65,
+        0.65,
+        0.65
+      ],
+      "ior": 1.55,
+      "extinction": 0.0005,
+      "smoothness": 1.0
+    },
+    {
+      "id": 56,
+      "name": "smoke-1-frosted",
+      "tint": [
+        0.65,
+        0.65,
+        0.65
+      ],
+      "ior": 1.55,
+      "extinction": 0.0005,
+      "smoothness": 0.6
+    },
+    {
+      "id": 57,
+      "name": "smoke-2",
+      "tint": [
+        0.65,
+        0.65,
+        0.65
+      ],
+      "ior": 1.55,
+      "extinction": 0.001,
+      "smoothness": 1.0
+    },
+    {
+      "id": 58,
+      "name": "smoke-2-frosted",
+      "tint": [
+        0.65,
+        0.65,
+        0.65
+      ],
+      "ior": 1.55,
+      "extinction": 0.001,
+      "smoothness": 0.6
+    },
+    {
+      "id": 59,
+      "name": "smoke-3",
+      "tint": [
+        0.65,
+        0.65,
+        0.65
+      ],
+      "ior": 1.55,
+      "extinction": 0.002,
+      "smoothness": 1.0
+    },
+    {
+      "id": 60,
+      "name": "smoke-3-frosted",
+      "tint": [
+        0.65,
+        0.65,
+        0.65
+      ],
+      "ior": 1.55,
+      "extinction": 0.002,
+      "smoothness": 0.6
+    },
+    {
+      "id": 61,
+      "name": "smoke-4",
+      "tint": [
+        0.65,
+        0.65,
+        0.65
+      ],
+      "ior": 1.55,
+      "extinction": 0.004,
+      "smoothness": 1.0
+    },
+    {
+      "id": 62,
+      "name": "smoke-4-frosted",
+      "tint": [
+        0.65,
+        0.65,
+        0.65
+      ],
+      "ior": 1.55,
+      "extinction": 0.004,
+      "smoothness": 0.6
+    },
+    {
+      "id": 63,
+      "name": "smoke-5",
+      "tint": [
+        0.65,
+        0.65,
+        0.65
+      ],
+      "ior": 1.55,
+      "extinction": 0.008,
+      "smoothness": 1.0
+    },
+    {
+      "id": 64,
+      "name": "smoke-5-frosted",
+      "tint": [
+        0.65,
+        0.65,
+        0.65
+      ],
+      "ior": 1.55,
+      "extinction": 0.008,
+      "smoothness": 0.6
+    },
+    {
+      "id": 65,
+      "name": "smoke-6",
+      "tint": [
+        0.65,
+        0.65,
+        0.65
+      ],
+      "ior": 1.55,
+      "extinction": 0.016,
+      "smoothness": 1.0
+    },
+    {
+      "id": 66,
+      "name": "smoke-6-frosted",
+      "tint": [
+        0.65,
+        0.65,
+        0.65
+      ],
+      "ior": 1.55,
+      "extinction": 0.016,
+      "smoothness": 0.6
+    },
+    {
+      "id": 67,
+      "name": "smoke-7",
+      "tint": [
+        0.65,
+        0.65,
+        0.65
+      ],
+      "ior": 1.55,
+      "extinction": 0.032,
+      "smoothness": 1.0
+    },
+    {
+      "id": 68,
+      "name": "smoke-7-frosted",
+      "tint": [
+        0.65,
+        0.65,
+        0.65
+      ],
+      "ior": 1.55,
+      "extinction": 0.032,
+      "smoothness": 0.6
+    },
+    {
+      "id": 69,
+      "name": "brown-0",
+      "tint": [
+        0.78,
+        0.48,
+        0.25
+      ],
+      "ior": 1.55,
+      "extinction": 0.00025,
+      "smoothness": 1.0
+    },
+    {
+      "id": 70,
+      "name": "brown-0-frosted",
+      "tint": [
+        0.78,
+        0.48,
+        0.25
+      ],
+      "ior": 1.55,
+      "extinction": 0.00025,
+      "smoothness": 0.6
+    },
+    {
+      "id": 71,
+      "name": "brown-1",
+      "tint": [
+        0.78,
+        0.48,
+        0.25
+      ],
+      "ior": 1.55,
+      "extinction": 0.0005,
+      "smoothness": 1.0
+    },
+    {
+      "id": 72,
+      "name": "brown-1-frosted",
+      "tint": [
+        0.78,
+        0.48,
+        0.25
+      ],
+      "ior": 1.55,
+      "extinction": 0.0005,
+      "smoothness": 0.6
+    },
+    {
+      "id": 73,
+      "name": "brown-2",
+      "tint": [
+        0.78,
+        0.48,
+        0.25
+      ],
+      "ior": 1.55,
+      "extinction": 0.001,
+      "smoothness": 1.0
+    },
+    {
+      "id": 74,
+      "name": "brown-2-frosted",
+      "tint": [
+        0.78,
+        0.48,
+        0.25
+      ],
+      "ior": 1.55,
+      "extinction": 0.001,
+      "smoothness": 0.6
+    },
+    {
+      "id": 75,
+      "name": "brown-3",
+      "tint": [
+        0.78,
+        0.48,
+        0.25
+      ],
+      "ior": 1.55,
+      "extinction": 0.002,
+      "smoothness": 1.0
+    },
+    {
+      "id": 76,
+      "name": "brown-3-frosted",
+      "tint": [
+        0.78,
+        0.48,
+        0.25
+      ],
+      "ior": 1.55,
+      "extinction": 0.002,
+      "smoothness": 0.6
+    },
+    {
+      "id": 77,
+      "name": "brown-4",
+      "tint": [
+        0.78,
+        0.48,
+        0.25
+      ],
+      "ior": 1.55,
+      "extinction": 0.004,
+      "smoothness": 1.0
+    },
+    {
+      "id": 78,
+      "name": "brown-4-frosted",
+      "tint": [
+        0.78,
+        0.48,
+        0.25
+      ],
+      "ior": 1.55,
+      "extinction": 0.004,
+      "smoothness": 0.6
+    },
+    {
+      "id": 79,
+      "name": "brown-5",
+      "tint": [
+        0.78,
+        0.48,
+        0.25
+      ],
+      "ior": 1.55,
+      "extinction": 0.008,
+      "smoothness": 1.0
+    },
+    {
+      "id": 80,
+      "name": "brown-5-frosted",
+      "tint": [
+        0.78,
+        0.48,
+        0.25
+      ],
+      "ior": 1.55,
+      "extinction": 0.008,
+      "smoothness": 0.6
+    },
+    {
+      "id": 81,
+      "name": "brown-6",
+      "tint": [
+        0.78,
+        0.48,
+        0.25
+      ],
+      "ior": 1.55,
+      "extinction": 0.016,
+      "smoothness": 1.0
+    },
+    {
+      "id": 82,
+      "name": "brown-6-frosted",
+      "tint": [
+        0.78,
+        0.48,
+        0.25
+      ],
+      "ior": 1.55,
+      "extinction": 0.016,
+      "smoothness": 0.6
+    },
+    {
+      "id": 83,
+      "name": "brown-7",
+      "tint": [
+        0.78,
+        0.48,
+        0.25
+      ],
+      "ior": 1.55,
+      "extinction": 0.032,
+      "smoothness": 1.0
+    },
+    {
+      "id": 84,
+      "name": "brown-7-frosted",
+      "tint": [
+        0.78,
+        0.48,
+        0.25
+      ],
+      "ior": 1.55,
+      "extinction": 0.032,
+      "smoothness": 0.6
+    },
+    {
+      "id": 85,
+      "name": "rose-0",
+      "tint": [
+        0.98,
+        0.52,
+        0.66
+      ],
+      "ior": 1.55,
+      "extinction": 0.00025,
+      "smoothness": 1.0
+    },
+    {
+      "id": 86,
+      "name": "rose-0-frosted",
+      "tint": [
+        0.98,
+        0.52,
+        0.66
+      ],
+      "ior": 1.55,
+      "extinction": 0.00025,
+      "smoothness": 0.6
+    },
+    {
+      "id": 87,
+      "name": "rose-1",
+      "tint": [
+        0.98,
+        0.52,
+        0.66
+      ],
+      "ior": 1.55,
+      "extinction": 0.0005,
+      "smoothness": 1.0
+    },
+    {
+      "id": 88,
+      "name": "rose-1-frosted",
+      "tint": [
+        0.98,
+        0.52,
+        0.66
+      ],
+      "ior": 1.55,
+      "extinction": 0.0005,
+      "smoothness": 0.6
+    },
+    {
+      "id": 89,
+      "name": "rose-2",
+      "tint": [
+        0.98,
+        0.52,
+        0.66
+      ],
+      "ior": 1.55,
+      "extinction": 0.001,
+      "smoothness": 1.0
+    },
+    {
+      "id": 90,
+      "name": "rose-2-frosted",
+      "tint": [
+        0.98,
+        0.52,
+        0.66
+      ],
+      "ior": 1.55,
+      "extinction": 0.001,
+      "smoothness": 0.6
+    },
+    {
+      "id": 91,
+      "name": "rose-3",
+      "tint": [
+        0.98,
+        0.52,
+        0.66
+      ],
+      "ior": 1.55,
+      "extinction": 0.002,
+      "smoothness": 1.0
+    },
+    {
+      "id": 92,
+      "name": "rose-3-frosted",
+      "tint": [
+        0.98,
+        0.52,
+        0.66
+      ],
+      "ior": 1.55,
+      "extinction": 0.002,
+      "smoothness": 0.6
+    },
+    {
+      "id": 93,
+      "name": "rose-4",
+      "tint": [
+        0.98,
+        0.52,
+        0.66
+      ],
+      "ior": 1.55,
+      "extinction": 0.004,
+      "smoothness": 1.0
+    },
+    {
+      "id": 94,
+      "name": "rose-4-frosted",
+      "tint": [
+        0.98,
+        0.52,
+        0.66
+      ],
+      "ior": 1.55,
+      "extinction": 0.004,
+      "smoothness": 0.6
+    },
+    {
+      "id": 95,
+      "name": "rose-5",
+      "tint": [
+        0.98,
+        0.52,
+        0.66
+      ],
+      "ior": 1.55,
+      "extinction": 0.008,
+      "smoothness": 1.0
+    },
+    {
+      "id": 96,
+      "name": "rose-5-frosted",
+      "tint": [
+        0.98,
+        0.52,
+        0.66
+      ],
+      "ior": 1.55,
+      "extinction": 0.008,
+      "smoothness": 0.6
+    },
+    {
+      "id": 97,
+      "name": "rose-6",
+      "tint": [
+        0.98,
+        0.52,
+        0.66
+      ],
+      "ior": 1.55,
+      "extinction": 0.016,
+      "smoothness": 1.0
+    },
+    {
+      "id": 98,
+      "name": "rose-6-frosted",
+      "tint": [
+        0.98,
+        0.52,
+        0.66
+      ],
+      "ior": 1.55,
+      "extinction": 0.016,
+      "smoothness": 0.6
+    },
+    {
+      "id": 99,
+      "name": "rose-7",
+      "tint": [
+        0.98,
+        0.52,
+        0.66
+      ],
+      "ior": 1.55,
+      "extinction": 0.032,
+      "smoothness": 1.0
+    },
+    {
+      "id": 100,
+      "name": "rose-7-frosted",
+      "tint": [
+        0.98,
+        0.52,
+        0.66
+      ],
+      "ior": 1.55,
+      "extinction": 0.032,
+      "smoothness": 0.6
+    },
+    {
+      "id": 101,
+      "name": "cyan-0",
+      "tint": [
+        0.55,
+        0.95,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.00025,
+      "smoothness": 1.0
+    },
+    {
+      "id": 102,
+      "name": "cyan-0-frosted",
+      "tint": [
+        0.55,
+        0.95,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.00025,
+      "smoothness": 0.6
+    },
+    {
+      "id": 103,
+      "name": "cyan-1",
+      "tint": [
+        0.55,
+        0.95,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.0005,
+      "smoothness": 1.0
+    },
+    {
+      "id": 104,
+      "name": "cyan-1-frosted",
+      "tint": [
+        0.55,
+        0.95,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.0005,
+      "smoothness": 0.6
+    },
+    {
+      "id": 105,
+      "name": "cyan-2",
+      "tint": [
+        0.55,
+        0.95,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.001,
+      "smoothness": 1.0
+    },
+    {
+      "id": 106,
+      "name": "cyan-2-frosted",
+      "tint": [
+        0.55,
+        0.95,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.001,
+      "smoothness": 0.6
+    },
+    {
+      "id": 107,
+      "name": "cyan-3",
+      "tint": [
+        0.55,
+        0.95,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.002,
+      "smoothness": 1.0
+    },
+    {
+      "id": 108,
+      "name": "cyan-3-frosted",
+      "tint": [
+        0.55,
+        0.95,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.002,
+      "smoothness": 0.6
+    },
+    {
+      "id": 109,
+      "name": "cyan-4",
+      "tint": [
+        0.55,
+        0.95,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.004,
+      "smoothness": 1.0
+    },
+    {
+      "id": 110,
+      "name": "cyan-4-frosted",
+      "tint": [
+        0.55,
+        0.95,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.004,
+      "smoothness": 0.6
+    },
+    {
+      "id": 111,
+      "name": "cyan-5",
+      "tint": [
+        0.55,
+        0.95,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.008,
+      "smoothness": 1.0
+    },
+    {
+      "id": 112,
+      "name": "cyan-5-frosted",
+      "tint": [
+        0.55,
+        0.95,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.008,
+      "smoothness": 0.6
+    },
+    {
+      "id": 113,
+      "name": "cyan-6",
+      "tint": [
+        0.55,
+        0.95,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.016,
+      "smoothness": 1.0
+    },
+    {
+      "id": 114,
+      "name": "cyan-6-frosted",
+      "tint": [
+        0.55,
+        0.95,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.016,
+      "smoothness": 0.6
+    },
+    {
+      "id": 115,
+      "name": "cyan-7",
+      "tint": [
+        0.55,
+        0.95,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.032,
+      "smoothness": 1.0
+    },
+    {
+      "id": 116,
+      "name": "cyan-7-frosted",
+      "tint": [
+        0.55,
+        0.95,
+        0.98
+      ],
+      "ior": 1.55,
+      "extinction": 0.032,
+      "smoothness": 0.6
+    },
+    {
+      "id": 117,
+      "name": "wine-0",
+      "tint": [
+        0.8,
+        0.12,
+        0.18
+      ],
+      "ior": 1.55,
+      "extinction": 0.00025,
+      "smoothness": 1.0
+    },
+    {
+      "id": 118,
+      "name": "wine-0-frosted",
+      "tint": [
+        0.8,
+        0.12,
+        0.18
+      ],
+      "ior": 1.55,
+      "extinction": 0.00025,
+      "smoothness": 0.6
+    },
+    {
+      "id": 119,
+      "name": "wine-1",
+      "tint": [
+        0.8,
+        0.12,
+        0.18
+      ],
+      "ior": 1.55,
+      "extinction": 0.0005,
+      "smoothness": 1.0
+    },
+    {
+      "id": 120,
+      "name": "wine-1-frosted",
+      "tint": [
+        0.8,
+        0.12,
+        0.18
+      ],
+      "ior": 1.55,
+      "extinction": 0.0005,
+      "smoothness": 0.6
+    },
+    {
+      "id": 121,
+      "name": "wine-2",
+      "tint": [
+        0.8,
+        0.12,
+        0.18
+      ],
+      "ior": 1.55,
+      "extinction": 0.001,
+      "smoothness": 1.0
+    },
+    {
+      "id": 122,
+      "name": "wine-2-frosted",
+      "tint": [
+        0.8,
+        0.12,
+        0.18
+      ],
+      "ior": 1.55,
+      "extinction": 0.001,
+      "smoothness": 0.6
+    },
+    {
+      "id": 123,
+      "name": "wine-3",
+      "tint": [
+        0.8,
+        0.12,
+        0.18
+      ],
+      "ior": 1.55,
+      "extinction": 0.002,
+      "smoothness": 1.0
+    },
+    {
+      "id": 124,
+      "name": "wine-3-frosted",
+      "tint": [
+        0.8,
+        0.12,
+        0.18
+      ],
+      "ior": 1.55,
+      "extinction": 0.002,
+      "smoothness": 0.6
+    },
+    {
+      "id": 125,
+      "name": "wine-4",
+      "tint": [
+        0.8,
+        0.12,
+        0.18
+      ],
+      "ior": 1.55,
+      "extinction": 0.004,
+      "smoothness": 1.0
+    },
+    {
+      "id": 126,
+      "name": "wine-4-frosted",
+      "tint": [
+        0.8,
+        0.12,
+        0.18
+      ],
+      "ior": 1.55,
+      "extinction": 0.004,
+      "smoothness": 0.6
+    },
+    {
+      "id": 127,
+      "name": "wine-5",
+      "tint": [
+        0.8,
+        0.12,
+        0.18
+      ],
+      "ior": 1.55,
+      "extinction": 0.008,
+      "smoothness": 1.0
+    },
+    {
+      "id": 128,
+      "name": "wine-5-frosted",
+      "tint": [
+        0.8,
+        0.12,
+        0.18
+      ],
+      "ior": 1.55,
+      "extinction": 0.008,
+      "smoothness": 0.6
+    },
+    {
+      "id": 129,
+      "name": "wine-6",
+      "tint": [
+        0.8,
+        0.12,
+        0.18
+      ],
+      "ior": 1.55,
+      "extinction": 0.016,
+      "smoothness": 1.0
+    },
+    {
+      "id": 130,
+      "name": "wine-6-frosted",
+      "tint": [
+        0.8,
+        0.12,
+        0.18
+      ],
+      "ior": 1.55,
+      "extinction": 0.016,
+      "smoothness": 0.6
+    },
+    {
+      "id": 131,
+      "name": "wine-7",
+      "tint": [
+        0.8,
+        0.12,
+        0.18
+      ],
+      "ior": 1.55,
+      "extinction": 0.032,
+      "smoothness": 1.0
+    },
+    {
+      "id": 132,
+      "name": "wine-7-frosted",
+      "tint": [
+        0.8,
+        0.12,
+        0.18
+      ],
+      "ior": 1.55,
+      "extinction": 0.032,
+      "smoothness": 0.6
+    }
+  ]
+}

@@ -37,10 +37,10 @@ public struct CaelixATrousFilterSettings
     [Tooltip("Jitter the sparse taps of iterations with step width > 1 by a per-pixel/per-frame hash. Breaks the structured checkerboard / grid-dot patterns the a-trous hole pattern leaves in heavy noise; the stochastic residue is removed by temporal accumulation.")]
     public bool jitterTaps;
     [Min(0.0f)] public float normalPower;
-    [Tooltip("Multiplier on the screen-space depth gradient (slope) term of the depth weight. ~1 is a good start; larger accepts more depth variation.")]
-    [Min(0.0001f)] public float depthSigma;
-    [Tooltip("Depth tolerance floor as a fraction of the center depth. Covers depth quantization on surfaces facing the camera.")]
-    [Min(0.0f)] public float relativeDepthSigma;
+    [Tooltip("Absolute plane-distance tolerance in world units: how far a tap's depth may sit off the center surface's plane before it is rejected. Roughly a quarter voxel is a good start.")]
+    [Min(0.0f)] public float depthTolerance;
+    [Tooltip("Plane-distance tolerance as a fraction of the center depth, taken whenever it exceeds the absolute one. Covers depth quantization far from the camera.")]
+    [Min(0.0f)] public float relativeDepthTolerance;
     [Tooltip("Multiplier on the local luminance std-dev for the radiance edge-stopping weight (SVGF-style). ~4 is a good start; larger blurs more across lighting edges.")]
     [Min(0.0001f)] public float radianceSigma;
 
@@ -50,10 +50,26 @@ public struct CaelixATrousFilterSettings
         useFaceHash = false,
         jitterTaps = true,
         normalPower = 64.0f,
-        depthSigma = 1.0f,
-        relativeDepthSigma = 0.01f,
+        depthTolerance = 0.2f,
+        relativeDepthTolerance = 0.005f,
         radianceSigma = 4.0f
     };
+
+    /// <summary>
+    /// Clamps user-authored values into ranges the shader can handle. Budget mode passes this
+    /// struct on its own, so the clamping lives here rather than only in the owning settings block.
+    /// </summary>
+    public CaelixATrousFilterSettings Validated()
+    {
+        CaelixATrousFilterSettings v = this;
+        v.iterations = Mathf.Clamp(v.iterations, 1, MaxIterations);
+        v.normalPower = Mathf.Max(0.0f, v.normalPower);
+        // The shader divides by the tolerance, so it must never reach zero.
+        v.depthTolerance = Mathf.Max(0.0001f, v.depthTolerance);
+        v.relativeDepthTolerance = Mathf.Max(0.0f, v.relativeDepthTolerance);
+        v.radianceSigma = Mathf.Max(0.0001f, v.radianceSigma);
+        return v;
+    }
 }
 
 [Serializable]
@@ -83,12 +99,7 @@ public struct CaelixIndirectDenoisingSettings
             v.separable15Tap.radius, 1, CaelixSeparable15TapFilterSettings.MaxRadius);
         v.separable15Tap.distanceSigma = Mathf.Max(0.0001f, v.separable15Tap.distanceSigma);
 
-        v.aTrous.iterations = Mathf.Clamp(
-            v.aTrous.iterations, 1, CaelixATrousFilterSettings.MaxIterations);
-        v.aTrous.normalPower = Mathf.Max(0.0f, v.aTrous.normalPower);
-        v.aTrous.depthSigma = Mathf.Max(0.0001f, v.aTrous.depthSigma);
-        v.aTrous.relativeDepthSigma = Mathf.Max(0.0f, v.aTrous.relativeDepthSigma);
-        v.aTrous.radianceSigma = Mathf.Max(0.0001f, v.aTrous.radianceSigma);
+        v.aTrous = v.aTrous.Validated();
 
         return v;
     }

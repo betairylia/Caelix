@@ -7,6 +7,7 @@ using Unity.Mathematics;
 using Unity.Profiling;
 using UnityEngine;
 using Caelix.IO;
+using Caelix.Net;
 using Caelix.Tick;
 using Caelix.Utils;
 using Stopwatch = System.Diagnostics.Stopwatch;
@@ -30,7 +31,7 @@ namespace Caelix.Simulation
         public bool doAlienPropagation;
 
         /// <summary>Flags a moving (non-static) entity's bricks hand to their alien neighbors.</summary>
-        public DirtyFlags alienMotionDirtyMask;
+        public BrickUpdateFlags alienMotionDirtyMask;
 
         /// <summary>Query every allocated brick of every non-static entity, not only the dirty ones.</summary>
         public bool alienIncludeMovingBricks;
@@ -48,9 +49,9 @@ namespace Caelix.Simulation
                 worldId = worldId,
                 name = name,
                 physics = PhysicsWorldSettings.Default,
-                replicatedSlotMask = Sector.DefaultReplicatedSlotMask,
+                replicatedSlotMask = BrickReplication.DefaultReplicatedSlotMask,
                 doAlienPropagation = false,
-                alienMotionDirtyMask = DirtyFlags.GeneralAutomata,
+                alienMotionDirtyMask = BrickUpdateFlags.Automata0,
                 alienIncludeMovingBricks = true,
                 dragTimeoutSeconds = 0.5f,
             };
@@ -80,12 +81,12 @@ namespace Caelix.Simulation
         #region ProfilerMarkers
 
         private static readonly ProfilerMarker s_PrepareTickMarker = new("Prepare Tick");
-        private static readonly ProfilerMarker s_ActivateSectorSnapshotsMarker = new("Activate Sector Snapshots");
+        private static readonly ProfilerMarker s_BeginAutomataWritesMarker = new("Begin automata writes");
         private static readonly ProfilerMarker s_CollectRequireUpdateBricksMarker = new("Collect RequireUpdate Bricks");
         private static readonly ProfilerMarker s_BuildAlienReadContextMarker = new("Build Alien Read Context");
         private static readonly ProfilerMarker s_AutomataStageScheduleMarker = new("Automata Stage Schedule");
         private static readonly ProfilerMarker s_WorkDispatchMarker = new("Work Dispatch");
-        private static readonly ProfilerMarker s_ApplySectorSnapshotsMarker = new("Apply Sector Snapshots");
+        private static readonly ProfilerMarker s_EndAutomataWritesMarker = new("End automata writes");
         private static readonly ProfilerMarker s_DirtyPropagationMarker = new("Dirty Propagation");
         private static readonly ProfilerMarker s_ClearRequireUpdatesMarker = new("Clear Require Updates");
         private static readonly ProfilerMarker s_PropagateDirtyFlagsMarker = new("Propagate Dirty Flags");
@@ -102,7 +103,22 @@ namespace Caelix.Simulation
         public struct AutomataStageInputs
         {
             public NativeHashMap<Guid128, VoxelEntityData> VoxelEntities;
-            public NativeList<BrickInfo> BricksRequiredUpdate;
+
+            /// <summary>
+            /// Every brick with a simulation bit (<see cref="BrickUpdateFlags.AutomataMask"/>) pending,
+            /// including flagged positions that hold no brick yet. Each hook selects its own records by
+            /// testing <see cref="RequiredBrick.Flags"/> against its channel (and
+            /// <see cref="RequiredBrick.IsAllocated"/> if it cannot work on empty positions) at the top
+            /// of its job. Bricks with geometry-only work are not in the list.
+            /// </summary>
+            public NativeList<RequiredBrick> BricksRequiredUpdate;
+
+            /// <summary>
+            /// <c>BricksRequiredUpdate.Length</c>, read by the world before the stage runs. Test this
+            /// to skip an empty tick: once an earlier hook has scheduled a job over the list, reading
+            /// its length on the main thread is a safety violation.
+            /// </summary>
+            public int BricksRequiredUpdateCount;
             public AutomataReadContext ReadContext;
         }
 
@@ -159,6 +175,7 @@ namespace Caelix.Simulation
 
         private AutomataStageInputs automataTickBuf;
         private NativeList<AlienEntityView> alienEntityViews;
+        private NativeList<int> alienCandidateIndices;
         private bool disposed;
         private long nextEntityInstanceId;
         private readonly Dictionary<Guid128, long> entityInstances = new();
@@ -170,15 +187,16 @@ namespace Caelix.Simulation
             Config = config;
             if (Config.replicatedSlotMask == 0)
             {
-                Config.replicatedSlotMask = Sector.DefaultReplicatedSlotMask;
+                Config.replicatedSlotMask = BrickReplication.DefaultReplicatedSlotMask;
             }
 
             Data.VoxelEntities = new NativeHashMap<Guid128, VoxelEntityData>(1, Allocator.Persistent);
             Data.VoxelBodies = new NativeHashMap<Guid128, VoxelBodyData>(1, Allocator.Persistent);
             Data.nDynamicBodies = 0;
 
-            automataTickBuf.BricksRequiredUpdate = new NativeList<BrickInfo>(Allocator.Persistent);
+            automataTickBuf.BricksRequiredUpdate = new NativeList<RequiredBrick>(Allocator.Persistent);
             alienEntityViews = new NativeList<AlienEntityView>(Allocator.Persistent);
+            alienCandidateIndices = new NativeList<int>(Allocator.Persistent);
 
             Physics = new VoxelPhysicsWorld(config.physics);
             AutomataStage = new TickStage<AutomataStageInputs>();
@@ -201,6 +219,7 @@ namespace Caelix.Simulation
             Data.VoxelBodies.Dispose();
             automataTickBuf.BricksRequiredUpdate.Dispose();
             alienEntityViews.Dispose();
+            alienCandidateIndices.Dispose();
             AutomataStage.Dispose();
             Physics.Dispose();
         }
@@ -229,8 +248,8 @@ namespace Caelix.Simulation
         }
 
         /// <summary>
-        /// Writes scalar fields (transform, flags) back. The sector maps inside the record are
-        /// shared storage, so writes through a copy are already visible; only scalars need this.
+        /// Writes scalar fields (transform, flags) back. The storage inside the record is shared,
+        /// so writes through a copy are already visible; only scalars need this.
         /// </summary>
         public void SetEntity(Guid128 guid, in VoxelEntityData data)
         {
@@ -242,7 +261,7 @@ namespace Caelix.Simulation
             Data.VoxelEntities[guid] = data;
         }
 
-        /// <summary>Creates an entity with empty sector storage. Returns false if the guid is taken.</summary>
+        /// <summary>Creates an entity with no storage. Returns false if the guid is taken.</summary>
         public bool CreateEntity(
             Guid128 guid,
             RigidTransform transform,
@@ -274,7 +293,7 @@ namespace Caelix.Simulation
             return true;
         }
 
-        /// <summary>Removes an entity and its body, disposing all sector storage.</summary>
+        /// <summary>Removes an entity and its body, disposing all of its storage.</summary>
         public bool RemoveEntity(Guid128 guid)
         {
             if (!Data.VoxelEntities.TryGetValue(guid, out VoxelEntityData data))
@@ -410,7 +429,7 @@ namespace Caelix.Simulation
             return Data.VoxelEntities.TryGetValue(guid, out VoxelEntityData data) ? data.GetSlot<T>(slotId, position) : default;
         }
 
-        /// <summary>Writes one block. Sector storage is shared, so no write-back is needed.</summary>
+        /// <summary>Writes one block. Storage is shared, so no write-back is needed.</summary>
         public bool SetBlock(Guid128 guid, int3 position, Block block)
         {
             if (!Data.VoxelEntities.TryGetValue(guid, out VoxelEntityData data))
@@ -632,15 +651,16 @@ namespace Caelix.Simulation
             //  DON'T add/remove entities, toggle isStatic, move transforms
             /////////////////////////////////////////////////////////////////////////
 
-            using (s_ActivateSectorSnapshotsMarker.Auto())
+            // Only simulation bits schedule automata work. A sector or brick with geometry-only
+            // work gets no snapshot copy and no record; each hook picks its own channel out of
+            // the list inside its job.
+            const BrickUpdateFlags automataMask = BrickUpdateFlags.AutomataMask;
+
+            using (s_BeginAutomataWritesMarker.Auto())
             {
-                foreach (var kvp in entities)
+                for (int i = 0; i < entityKeys.Length; i++)
                 {
-                    foreach (var sector in kvp.Value.sectors)
-                    {
-                        if (sector.Value.Get().sectorRequireUpdateFlags > 0)
-                            sector.Value.ActivateSnapshot();
-                    }
+                    entities[entityKeys[i]].BeginAutomataWrites(automataMask);
                 }
             }
 
@@ -648,18 +668,39 @@ namespace Caelix.Simulation
             {
                 automataTickBuf.VoxelEntities = entities;
                 automataTickBuf.BricksRequiredUpdate.Clear();
-                BrickCollector.Collect(ref Data.VoxelEntities, ref automataTickBuf.BricksRequiredUpdate);
+                for (int i = 0; i < entityKeys.Length; i++)
+                {
+                    entities[entityKeys[i]].CollectRequiredBricks(
+                        entityKeys[i], automataMask, includeEmpty: true,
+                        automataTickBuf.BricksRequiredUpdate);
+                }
+
+                // Read once here: a hook must not touch the list's length after an earlier hook
+                // scheduled a job over it.
+                automataTickBuf.BricksRequiredUpdateCount = automataTickBuf.BricksRequiredUpdate.Length;
             }
 
             using (s_BuildAlienReadContextMarker.Auto())
             {
                 BuildAlienReadContext();
+                alienCandidateIndices.Clear();
+                if (automataTickBuf.BricksRequiredUpdateCount > 0 && !BlockEncoding.PackedSceneColor)
+                {
+                    Physics.PrepareSpatialQueries(ref Data);
+                    Physics.CollectAutomataCandidates(automataTickBuf.BricksRequiredUpdate,
+                        alienEntityViews.AsArray(), alienCandidateIndices);
+                }
+                automataTickBuf.ReadContext.AlienQuery.CandidateIndices = alienCandidateIndices.AsArray();
             }
 
             JobHandle tickHandle;
             using (s_AutomataStageScheduleMarker.Auto())
             {
-                tickHandle = AutomataStage.Schedule(automataTickBuf, default);
+                // Packed colors are material payloads, not gameplay block IDs.
+                // Keep snapshot, dirty and replication work running normally.
+                tickHandle = BlockEncoding.PackedSceneColor
+                    ? default
+                    : AutomataStage.Schedule(automataTickBuf, default);
             }
 
             using (s_WorkDispatchMarker.Auto())
@@ -667,14 +708,14 @@ namespace Caelix.Simulation
                 tickHandle.Complete();
             }
 
-            using (s_ApplySectorSnapshotsMarker.Auto())
+            using (s_EndAutomataWritesMarker.Auto())
             {
-                foreach (var kvp in entities)
+                // The snapshot swap exchanges whole slot tables, so every brick pointer bound
+                // before it names the wrong buffer now. EndAutomataWrites declares the storage
+                // mutated itself; the epoch is what a consumer asserts on.
+                for (int i = 0; i < entityKeys.Length; i++)
                 {
-                    foreach (var sector in kvp.Value.sectors)
-                    {
-                        sector.Value.ApplySnapshot();
-                    }
+                    entities[entityKeys[i]].EndAutomataWrites();
                 }
             }
 
@@ -700,11 +741,11 @@ namespace Caelix.Simulation
                     for (int i = 0; i < entityKeys.Length; i++)
                     {
                         VoxelEntityData e = entities[entityKeys[i]];
-                        handle = JobHandle.CombineDependencies(handle, e.PropagateDirtyFlags(DirtyFlags.All, true));
+                        handle = JobHandle.CombineDependencies(handle, e.PropagateDirtyFlags(BrickUpdateFlags.All, true));
 
-                        // INVARIANT (load-bearing): the propagation phase may only ADD sectors to an
-                        // entity's map — it must never free or relocate an existing Sector* — because
-                        // the read-only views handed to the jobs above still point at them.
+                        // INVARIANT (load-bearing): the propagation phase may only ADD storage to an
+                        // entity — it must never free or relocate what already exists — because the
+                        // read-only views handed to the jobs above still point at it.
                         entities[entityKeys[i]] = e;
                     }
 
@@ -771,7 +812,7 @@ namespace Caelix.Simulation
                 {
                     var request = BrickOverlapQueryBuilder.Build(ref Data, new BrickOverlapQuerySettings
                     {
-                        FlagsToPropagate = DirtyFlags.All,
+                        FlagsToPropagate = BrickUpdateFlags.All,
                         MotionDirtyMask = Config.alienMotionDirtyMask,
                         IncludeMovingBodies = Config.alienIncludeMovingBricks
                     });
@@ -794,6 +835,13 @@ namespace Caelix.Simulation
                 }
 
                 alienElapsedTicks = Stopwatch.GetTimestamp() - alienStartTicks;
+            }
+
+            // The change list is complete only here: alien propagation is the last stage that can
+            // mark a brick, so every consumer of this tick's changes reads after this point.
+            for (int i = 0; i < entityKeys.Length; i++)
+            {
+                entities[entityKeys[i]].BuildChangeList();
             }
 
             entityKeys.Dispose();
@@ -822,6 +870,7 @@ namespace Caelix.Simulation
                 {
                     VoxelEntityData e = Data.VoxelEntities[keys[i]];
                     e.ClearDirtyFlags();
+                    e.ClearChanges();
                     Data.VoxelEntities[keys[i]] = e;
                 }
             }
@@ -846,22 +895,10 @@ namespace Caelix.Simulation
                 float3 worldAabbMin = entity.transform.pos;
                 float3 worldAabbMax = entity.transform.pos;
 
-                if (entity.sectors.Count > 0)
+                if (entity.TryGetStorageBounds(out int3 minBlock, out int3 maxBlockExclusive))
                 {
-                    NativeArray<int3> sectorKeys = entity.sectors.GetKeyArray(Allocator.Temp);
-                    int3 minSector = sectorKeys[0];
-                    int3 maxSector = sectorKeys[0];
-
-                    for (int k = 1; k < sectorKeys.Length; k++)
-                    {
-                        minSector = math.min(minSector, sectorKeys[k]);
-                        maxSector = math.max(maxSector, sectorKeys[k]);
-                    }
-
-                    sectorKeys.Dispose();
-
-                    float3 localMin = minSector * Sector.SECTOR_SIZE_IN_BLOCKS;
-                    float3 localMax = (maxSector + 1) * Sector.SECTOR_SIZE_IN_BLOCKS;
+                    float3 localMin = minBlock;
+                    float3 localMax = maxBlockExclusive;
                     for (int mask = 0; mask < 8; mask++)
                     {
                         float3 localCorner = new float3(
@@ -879,7 +916,7 @@ namespace Caelix.Simulation
                     EntityId = kvp.Key,
                     LocalToWorld = entity.transform,
                     WorldToLocal = worldToLocal,
-                    Sectors = entity.sectors,
+                    Data = entity,
                     WorldAabbMin = worldAabbMin,
                     WorldAabbMax = worldAabbMax
                 });
@@ -890,7 +927,8 @@ namespace Caelix.Simulation
                 AlienQuery = new AlienOccupancyQuery
                 {
                     EntitiesInDeterministicOrder = alienEntityViews.AsArray()
-                }
+                },
+                Entities = Data.VoxelEntities
             };
         }
 
@@ -900,6 +938,16 @@ namespace Caelix.Simulation
 
         /// <summary>Saves every entity of this world (except those excluded from save) to a <c>.cxw</c> file.</summary>
         public void Save(string path)
+        {
+            Save(path, WorldRecord.None);
+        }
+
+        /// <summary>
+        /// Saves every entity of this world (except those excluded from save) plus the given
+        /// world-level record (player pose) to a <c>.cxw</c> file. The world does not track a
+        /// player pose itself; the game supplies it.
+        /// </summary>
+        public void Save(string path, in WorldRecord world)
         {
             var records = new List<EntitySaveRecord>(Data.VoxelEntities.Count);
             foreach (var kvp in Data.VoxelEntities)
@@ -916,16 +964,17 @@ namespace Caelix.Simulation
                 records.Add(new EntitySaveRecord(kvp.Key, kvp.Value, hasBody, linearVelocity, angularVelocity));
             }
 
-            WorldSaver.Save(path, records);
+            WorldSaver.Save(path, records, in world);
         }
 
         /// <summary>
         /// Loads every entity stored in a <c>.cxw</c> file into this world. An entity whose guid
-        /// already exists is replaced.
+        /// already exists is replaced. Returns the file's world-level record (player pose); the
+        /// world does not apply it, the game does.
         /// </summary>
-        public void Load(string path)
+        public WorldRecord Load(string path)
         {
-            WorldLoader.Load(path, this);
+            return WorldLoader.Load(path, this);
         }
 
         bool IWorldLoadTarget.TryCreateEntity(in EntityRecord record, out VoxelEntityData data)

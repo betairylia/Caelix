@@ -10,14 +10,15 @@ namespace Caelix.Simulation
 {
     /// <summary>
     /// One connected client and what it already knows about each world. Replication is a diff
-    /// between that knowledge and the world: new entities and sectors go out in full, known
-    /// sectors send their dirty bricks, transforms and flags go out when they changed.
+    /// between that knowledge and the world: a new entity goes out with every allocated brick, a
+    /// known entity receives the shared per-tick delta, and transforms and flags go out when they
+    /// changed. Knowledge is per ENTITY; brick residency is the client's own, derived from the
+    /// records it received.
     /// </summary>
     public sealed class ServerConnection
     {
         private sealed class EntityKnown
         {
-            public readonly Dictionary<int3, long> Sectors = new();
             public long InstanceId;
             public RigidTransform Transform;
             public bool IsStatic;
@@ -38,16 +39,15 @@ namespace Caelix.Simulation
 
         private readonly Dictionary<ushort, WorldKnown> worlds = new();
         private readonly List<Guid128> guidScratch = new();
-        private readonly List<int3> sectorScratch = new();
         private readonly List<ushort> worldScratch = new();
 
         /// <summary>
-        /// Sectors this connection received in full during the current <see cref="ReplicateWorld"/>
-        /// call. Their shared-delta slices are redundant and are skipped. Cleared at the start of
+        /// Entities this connection received in full during the current <see cref="ReplicateWorld"/>
+        /// call. Their shared-delta messages are redundant and are skipped. Cleared at the start of
         /// <see cref="ReplicateWorld"/> and read afterwards, in the same <c>CaelixServer.Replicate</c>
         /// call, by <see cref="ReceivedFullThisTick"/> and <see cref="SendDelta"/>. Reused across ticks.
         /// </summary>
-        private readonly HashSet<(Guid128 Guid, int3 SectorPos)> sentFullThisTick = new();
+        private readonly HashSet<Guid128> sentFullThisTick = new();
 
         public int Id { get; }
         public INetChannel Channel { get; }
@@ -145,11 +145,18 @@ namespace Caelix.Simulation
         }
 
         /// <summary>
-        /// Phase B of replication: the per-connection diff. Sends despawns, spawns, state,
-        /// transforms and sector adds and removes, then packs the sectors this connection has not
+        /// Phase B of replication: the per-connection diff. Sends despawns, spawns, state and
+        /// transforms, then packs every allocated brick of the entities this connection has not
         /// seen into <paramref name="full"/> and streams them chunk by chunk. Runs before phase A;
         /// the shared delta follows through <see cref="SendDelta"/>.
         /// </summary>
+        /// <remarks>
+        /// There is no per-sector diff any more. A known entity is served entirely by the shared
+        /// delta, which is derived from that entity's change list, so a sector attached, filled or
+        /// removed between steps reaches the client as Remove records for the old bricks followed
+        /// by Update records for the new ones. A new entity is served entirely by the catch-up
+        /// batch and never by a delta message.
+        /// </remarks>
         internal unsafe void ReplicateWorld(CaelixWorld world, NetMessageWriter writer, ReplicationBatch full)
         {
             using var _ = s_ReplicateWorldMarker.Auto();
@@ -191,7 +198,7 @@ namespace Caelix.Simulation
                 Send(NetDelivery.Reliable, writer);
             }
 
-            // Spawns, state, transforms, sectors.
+            // Spawns, state, transforms, catch-up.
             foreach (var kvp in entities)
             {
                 Guid128 guid = kvp.Key;
@@ -222,6 +229,11 @@ namespace Caelix.Simulation
                         HasBody = (byte)(hasBody ? 1 : 0),
                     });
                     Send(NetDelivery.Reliable, writer);
+
+                    // Every brick of an entity new to this connection. Its shared-delta message,
+                    // if the tick produced one, would be a redundant subset.
+                    full.Add(guid, in data, fullEntity: true);
+                    sentFullThisTick.Add(guid);
                 }
                 else
                 {
@@ -257,54 +269,12 @@ namespace Caelix.Simulation
                         Send(NetDelivery.Reliable, writer);
                     }
                 }
-
-                // Sector removals.
-                sectorScratch.Clear();
-                foreach (var sectorKnown in entityKnown.Sectors)
-                {
-                    int3 sectorPos = sectorKnown.Key;
-                    if (!data.sectors.TryGetValue(sectorPos, out SectorHandle current) ||
-                        current.InstanceId != sectorKnown.Value)
-                    {
-                        sectorScratch.Add(sectorPos);
-                    }
-                }
-
-                for (int i = 0; i < sectorScratch.Count; i++)
-                {
-                    entityKnown.Sectors.Remove(sectorScratch[i]);
-                    writer.Reset();
-                    NetHeader.Write(writer, NetMessageType.SectorRemove, worldId, tick);
-                    writer.Write(new SectorMessage { Guid = guid, SectorPos = sectorScratch[i] });
-                    Send(NetDelivery.Reliable, writer);
-                }
-
-                // Sector adds. An entity that is new to this connection has every sector new, so it
-                // is served entirely by the catch-up batch and never by a shared delta slice.
-                foreach (var sectorEntry in data.sectors)
-                {
-                    int3 sectorPos = sectorEntry.Key;
-                    if (entityKnown.Sectors.ContainsKey(sectorPos))
-                    {
-                        continue;
-                    }
-
-                    entityKnown.Sectors.Add(sectorPos, sectorEntry.Value.InstanceId);
-
-                    writer.Reset();
-                    NetHeader.Write(writer, NetMessageType.SectorAdd, worldId, tick);
-                    writer.Write(new SectorMessage { Guid = guid, SectorPos = sectorPos });
-                    Send(NetDelivery.Reliable, writer);
-
-                    full.Add(guid, sectorPos, sectorEntry.Value, fullSector: true);
-                    sentFullThisTick.Add((guid, sectorPos));
-                }
             }
 
-            // Catch-up: the sectors this connection did not know. SectorAdd for each already went
-            // out above, in the same order the batch packs them. A join of a large world is far too
-            // much to hold in one buffer, so the batch streams it: build a chunk, send it, repeat.
-            if (full.SectorCount > 0)
+            // Catch-up: the entities this connection did not know, every allocated brick of each.
+            // A join of a large world is far too much to hold in one buffer, so the batch streams
+            // it: build a chunk, send it, repeat.
+            if (full.EntityCount > 0)
             {
                 using (s_ReplicationFullBuildMarker.Auto())
                 {
@@ -336,18 +306,16 @@ namespace Caelix.Simulation
         }
 
         /// <summary>
-        /// Forwards the ranges of the shared delta's CURRENT chunk. A delta range can only name a
-        /// sector this connection already knows, because a sector new to it got its SectorAdd in
-        /// <see cref="ReplicateWorld"/> earlier this tick and is in <c>sentFullThisTick</c>. A range
-        /// for a known sector holds exactly the bricks the old per-connection WriteBrickBatch
-        /// produced.
+        /// Forwards the ranges of the shared delta's CURRENT chunk, minus the entities this
+        /// connection already received in full earlier this tick — for those the delta is a subset
+        /// of what already went out.
         /// </summary>
         internal void SendDelta(ReplicationBatch delta)
         {
             for (int i = 0; i < delta.Count; i++)
             {
                 ReplicationRange range = delta[i];
-                if (range.Length == 0 || sentFullThisTick.Contains((range.Guid, range.SectorPos)))
+                if (range.Length == 0 || sentFullThisTick.Contains(range.Guid))
                 {
                     continue;
                 }
@@ -357,11 +325,11 @@ namespace Caelix.Simulation
         }
 
         /// <summary>
-        /// Whether this connection received that sector in full during this tick's
-        /// <see cref="ReplicateWorld"/>. The server drops a delta sector no connection still needs.
+        /// Whether this connection received that entity in full during this tick's
+        /// <see cref="ReplicateWorld"/>. The server drops a delta entity no connection still needs.
         /// </summary>
-        internal bool ReceivedFullThisTick(Guid128 guid, int3 sectorPos)
-            => sentFullThisTick.Contains((guid, sectorPos));
+        internal bool ReceivedFullThisTick(Guid128 guid)
+            => sentFullThisTick.Contains(guid);
 
         private static bool TransformEquals(in RigidTransform a, in RigidTransform b)
         {

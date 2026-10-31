@@ -104,3 +104,41 @@ public struct CaelixTemporalRadianceSettings
         return v;
     }
 }
+
+/// <summary>
+/// TAA-style resolve of the final composited colour against its own reprojected history.
+/// </summary>
+/// <remarks>
+/// The primary rays are jittered by one global sub-pixel offset per frame, which by itself only
+/// moves the aliasing around. This pass is what turns that into anti-aliasing: it accumulates the
+/// jittered samples over the Halton cycle, clipping the history to the current neighbourhood so
+/// disocclusions and moving content do not ghost.
+/// </remarks>
+[Serializable]
+public struct CaelixColorResolveSettings
+{
+    public bool enabled;
+    /// <summary>Weight of the current frame. Lower converges smoother but reacts more slowly.</summary>
+    [Range(0.02f, 1.0f)] public float blend;
+    /// <summary>
+    /// Half-width of the neighbourhood clipping box, in local standard deviations. Lower rejects
+    /// more history (less ghosting, more aliasing); higher keeps more.
+    /// </summary>
+    [Range(0.5f, 3.0f)] public float clipScale;
+
+    public static CaelixColorResolveSettings Default => new CaelixColorResolveSettings
+    {
+        enabled = true,
+        blend = 0.1f,
+        clipScale = 1.25f
+    };
+
+    /// <summary>Clamps user-authored values into ranges the shader can handle.</summary>
+    public CaelixColorResolveSettings Validated()
+    {
+        CaelixColorResolveSettings v = this;
+        v.blend = Mathf.Clamp(v.blend, 0.02f, 1.0f);
+        v.clipScale = Mathf.Clamp(v.clipScale, 0.5f, 3.0f);
+        return v;
+    }
+}

@@ -1,0 +1,17 @@
+diff --git a/include/voxelio/image.hpp b/include/voxelio/image.hpp
+index 00656cd..9ec487b 100644
+--- a/include/voxelio/image.hpp
++++ b/include/voxelio/image.hpp
+@@ -158,8 +158,10 @@ public:
+ 
+     Vec2size uvToXy(Vec2f uv) const
+     {
+-        usize x = static_cast<usize>(uvFunction(uv.x()) * float(w - 1));
+-        usize y = static_cast<usize>(uvFunction(uv.y()) * float(h - 1));
++        usize x = static_cast<usize>(uvFunction(uv.x()) * float(w));
++        usize y = static_cast<usize>(uvFunction(uv.y()) * float(h));
++        if (x >= w) x = w - 1;
++        if (y >= h) y = h - 1;
+         return {x, y};
+     }
+ 

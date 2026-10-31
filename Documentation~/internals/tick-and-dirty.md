@@ -2,6 +2,8 @@
 
 Status: Current implementation. Checked against Caelix `253d632` and Core
 `e5ead50` on 2026-09-06.
+Automata collection and commit order rechecked against Caelix `3d013d8` and
+Core `881efac3` on 2026-09-16 (source only).
 
 A tick consumes scheduled voxel work, commits changes, runs physics, and publishes
 replication. Dirty propagation schedules affected bricks for further work.
@@ -32,17 +34,19 @@ then processes each world in this order:
 ```text
 TickSimulate
   fix the entity/body set for this tick
-  activate snapshots for sectors with required work
-  collect required brick positions and build the read context
+  begin automata writes on every entity with work on an automata channel
+  collect the bricks with automata-channel work (geometry-only bricks are skipped) and build the read context
+  prepare the physics BVH and bind alien entity candidates per required brick
   run automata hooks and complete their jobs
-  apply snapshots
+  end automata writes (commits the pending buffers)
   clear consumed requireUpdate flags
   propagate local dirty flags (may add neighboring sectors)
   refresh Block occupancy masks and body properties
   apply forces and simulate physics
+  synchronize collision poses before the post-physics overlap query
   propagate alien influence using the stepped poses, if enabled
 Replicate
-  publish entity/sector state and changed bricks; drain world events
+  publish entity state and changed bricks; drain world events
 EndTick
   clear raw dirty flags and advance the world tick index
 ```
@@ -50,20 +54,35 @@ EndTick
 Worlds share the server's clock. The current loop completes simulation,
 replication, and end-of-tick work for one world before moving to the next world.
 
+The pre-voxel query expands source brick bounds by one voxel and stores candidate
+entity indices in reusable buffers. It shares the physics BVH with the post-physics
+query, while each stage produces its own results. All entities participating in
+alien reads must have bodies. Mass, occupancy, collision data and forces are still
+prepared after snapshot commits. See the
+[shared BVH contract](SERVER_CLIENT_ARCHITECTURE.md#automata-and-the-shared-physics-bvh)
+for stage lifetimes and ordering.
+
 Local propagation runs before physics. Cross-entity (alien) propagation runs after
 physics, using the overlap graph at the stepped poses. Alien propagation marks
-existing target bricks and must not allocate target sectors or bricks. During
-local propagation, existing sector pointers must stay valid until its jobs finish.
+existing target bricks with `MarkRequired` and must not allocate storage. During
+local propagation, existing storage pointers must stay valid until its jobs finish.
 
 ## How to schedule and consume changes
 
 1. Make a change through a world/sector setter at the appropriate boundary.
    Do not replace it with raw slot-memory writes that skip dirty bookkeeping.
-2. Let the world run its propagation phases. Block writes generate the configured
-   Block-change flags; other slot writes generate GeneralAutomata work.
-3. In the next automata stage, consume `BricksRequiredUpdate` and read through
-   `AutomataReadContext`. Keep writes within the owning work region.
-4. Let the stage complete and apply its snapshots. Do not clear flags inside a hook.
+2. Let the world run its propagation phases. Every Block write raises the engine's
+   geometry bits. The simulation bits (`Automata0`..`Automata11`) come from the
+   writer's explicit mask, or, for a setter called without one, from the
+   application's `AutomataDefaults` tables (Block: previous and replacement id;
+   other slots: one default per slot). `AutomataBrick.SetDirty(mask)` raises
+   simulation bits without a write.
+3. In the next stage, each hook filters the shared `NativeList<RequiredBrick>`
+   by `RequiredBrick.Flags`. Open access with `ctx.OpenBrick(brick)` and a reader
+   with `ctx.CreateReader(brick, access)`. Keys use entity-local brick units;
+   reader/writer positions use entity-local block units. Write inside the work brick.
+4. Let the stage complete; `EndAutomataWrites` commits the pending buffers. Do not
+   clear flags inside a hook.
 
 For a newly written entity with no prior required flags, the first server step
 propagates its initial dirty state. Its automata work becomes available on the
@@ -77,6 +96,12 @@ have already been prepared. Local rules normally communicate through the
 is handled by physics and alien propagation rather than that local propagation limit.
 
 ## Clock and pause behavior
+
+When `BlockEncoding.PackedSceneColor` is compiled on, `CaelixWorld` skips all
+registered automata hooks. Packed scene materials do not represent gameplay block
+IDs. The automata write phase, dirty propagation, physics and replication still run, so
+loading scenes and applying edits continue to update the client. This is owned by
+the engine world and applies to Titania hooks too; it is not a runtime setting.
 
 `CaelixHost.FixedUpdate` pushes settings and calls `Server.Tick()`. `Tick()` honors
 `Frozen` after the first tick. Its initial frozen tick publishes initial state but
@@ -100,8 +125,14 @@ Several server ticks can arrive before one client frame.
 - [World tick](../../Runtime/Simulation/CaelixWorld.cs): `TickSimulate`, `EndTick`
 - [Server driver](../../Runtime/Simulation/CaelixServer.cs): `Tick`, `Step`, `ProcessQueries`
 - [Host frame](../../Runtime/Client/CaelixHost.cs): `FixedUpdate`, `Update`
-- [Brick collection](../../Runtime/Simulation/Utils/CollectBrickJob.cs)
+- [Brick collection](https://github.com/betairylia/Caelix-Core/blob/main/Runtime/VoxelEntityData.Bricks.cs)
 - [Core enumerators and current collector limitation](https://github.com/betairylia/Caelix-Core/blob/main/Documentation~/reference/enumerators.md)
 - [Replication tests](../../Tests/Editor/ReplicationTests.cs), [Core propagation scenarios](https://github.com/betairylia/Caelix-Core/blob/main/Tests/Editor/DirtyPropagationScenarioTests.cs)
+- [Automata candidate and stage-order tests](../../Tests/Editor/AutomataEntityQueryTests.cs)
 
-These phases were reviewed from source. Unity tests were not rerun for this page.
+The original phase review was source-only. The shared-BVH changes were validated
+in Titania's connected Unity 6000.5.6f1 Editor on 2026-09-13: compilation passed and
+all six `AutomataEntityQueryTests` cases passed. The full EditMode suite passed
+433 of 434 tests; the unchanged `PackedMaterialShaderTests` emission expectation
+does not include the shader's `0.1` exposure multiplier. Play Mode and profiling
+remain manual validation.

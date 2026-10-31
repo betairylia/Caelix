@@ -1,0 +1,165 @@
+// GPU-side maintenance of the brick record pool.
+//
+// Brick records used to be kept in a host copy per sector (1096 bytes a brick, several GB on a
+// large world) purely so that they could be re-uploaded whenever a buffer was replaced or a range
+// moved. These three kernels remove that copy: records are moved between GPU buffers directly, and
+// the render-data job only ever stages the bricks it actually rewrote.
+//
+//  * CaelixCopyBrickRanges - many ranges from one page buffer into another (a page that grew).
+//  * CaelixMoveBrickRanges - the same, source and destination in one buffer (a range that moved).
+//  * CaelixScatterBricks   - a packed staging list into the slots it names inside one range.
+//
+// Loaded by Caelix.Rendering.CaelixBrickGpuOps through Resources.Load, hence the Resources folder.
+
+#pragma kernel CaelixCopyBrickRanges
+#pragma kernel CaelixMoveBrickRanges
+#pragma kernel CaelixScatterBricks
+
+// Words in one brick record. Must equal BrickRecordLayout.BRICK_DATA_LENGTH.
+#define CAELIX_BRICK_WORDS 274
+#define CAELIX_BRICK_BYTES (CAELIX_BRICK_WORDS * 4)
+
+// Copy: the page the records come from. Unused by the other two kernels.
+ByteAddressBuffer _CaelixSrc;
+
+// The page being written. Also the source of CaelixMoveBrickRanges.
+RWByteAddressBuffer _CaelixDst;
+
+// One entry per range: x = first source brick, y = first destination brick, z = bricks in the
+// range, w = the number of bricks in every preceding entry (a prefix sum of z). Sorted by w
+// ascending, which is what lets a thread find its range with a binary search.
+StructuredBuffer<uint4> _CaelixRanges;
+uint _CaelixRangeCount;
+
+// Copy / move: the sum of every range's z. Scatter: the number of staged records.
+uint _CaelixBrickCount;
+
+// Added to the dispatch thread id, so one logical dispatch can be split into several that each
+// stay under the 65535 thread group limit.
+uint _CaelixThreadBase;
+
+// Scatter: one frame's staged records back to back, record i at word i * CAELIX_BRICK_WORDS.
+// Every sector of the frame writes its own region of this buffer before any of these dispatches
+// runs, which is what keeps the driver from staging a whole copy of it per sector.
+ByteAddressBuffer _CaelixStaging;
+
+// Scatter: one entry per staged record — x = its index in _CaelixStaging, y = the brick it belongs
+// in, absolute inside the destination buffer. Entries are grouped by destination, and one dispatch
+// covers one destination's group.
+StructuredBuffer<uint2> _CaelixPairs;
+
+// Scatter: first entry of this dispatch's group inside _CaelixPairs.
+uint _CaelixPairBase;
+
+// A record is 274 words: 68 four-word blocks and a two-word tail. Raw buffer loads and stores need
+// only four-byte alignment, so a record never has to start on a 16-byte boundary.
+#define CAELIX_COPY_RECORD(srcBuffer, srcByteBase, dstByteBase)                                     \
+    {                                                                                               \
+        [loop]                                                                                      \
+        for (uint w = 0; w + 4 <= CAELIX_BRICK_WORDS; w += 4)                                       \
+        {                                                                                           \
+            _CaelixDst.Store4((dstByteBase) + w * 4, srcBuffer.Load4((srcByteBase) + w * 4));       \
+        }                                                                                           \
+                                                                                                    \
+        uint tail = (CAELIX_BRICK_WORDS - 2) * 4;                                                   \
+        _CaelixDst.Store2((dstByteBase) + tail, srcBuffer.Load2((srcByteBase) + tail));             \
+    }
+
+/// Finds the range brick <paramref name="b"/> belongs to and the bricks it maps.
+/// Returns false for a thread that falls past the last range, which the padding of the final
+/// thread group can do.
+bool CaelixResolveRangeBrick(uint b, out uint srcBrick, out uint dstBrick)
+{
+    srcBrick = 0;
+    dstBrick = 0;
+
+    if (_CaelixRangeCount == 0)
+    {
+        return false;
+    }
+
+    // Last entry whose cumulative start is at or before b.
+    uint lo = 0;
+    uint hi = _CaelixRangeCount - 1;
+
+    [loop]
+    while (lo < hi)
+    {
+        uint mid = (lo + hi + 1) >> 1;
+        if (_CaelixRanges[mid].w <= b)
+        {
+            lo = mid;
+        }
+        else
+        {
+            hi = mid - 1;
+        }
+    }
+
+    uint4 range = _CaelixRanges[lo];
+    if (b < range.w)
+    {
+        return false;
+    }
+
+    uint local = b - range.w;
+    if (local >= range.z)
+    {
+        return false;
+    }
+
+    srcBrick = range.x + local;
+    dstBrick = range.y + local;
+    return true;
+}
+
+[numthreads(64, 1, 1)]
+void CaelixCopyBrickRanges(uint3 id : SV_DispatchThreadID)
+{
+    uint b = id.x + _CaelixThreadBase;
+    if (b >= _CaelixBrickCount)
+    {
+        return;
+    }
+
+    uint srcBrick, dstBrick;
+    if (!CaelixResolveRangeBrick(b, srcBrick, dstBrick))
+    {
+        return;
+    }
+
+    CAELIX_COPY_RECORD(_CaelixSrc, srcBrick * CAELIX_BRICK_BYTES, dstBrick * CAELIX_BRICK_BYTES)
+}
+
+[numthreads(64, 1, 1)]
+void CaelixMoveBrickRanges(uint3 id : SV_DispatchThreadID)
+{
+    uint b = id.x + _CaelixThreadBase;
+    if (b >= _CaelixBrickCount)
+    {
+        return;
+    }
+
+    uint srcBrick, dstBrick;
+    if (!CaelixResolveRangeBrick(b, srcBrick, dstBrick))
+    {
+        return;
+    }
+
+    // Reads and writes the same buffer: the caller guarantees that the source and destination
+    // ranges of one dispatch do not overlap.
+    CAELIX_COPY_RECORD(_CaelixDst, srcBrick * CAELIX_BRICK_BYTES, dstBrick * CAELIX_BRICK_BYTES)
+}
+
+[numthreads(64, 1, 1)]
+void CaelixScatterBricks(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x + _CaelixThreadBase;
+    if (i >= _CaelixBrickCount)
+    {
+        return;
+    }
+
+    uint2 pair = _CaelixPairs[_CaelixPairBase + i];
+    CAELIX_COPY_RECORD(_CaelixStaging, pair.x * CAELIX_BRICK_BYTES, pair.y * CAELIX_BRICK_BYTES)
+}

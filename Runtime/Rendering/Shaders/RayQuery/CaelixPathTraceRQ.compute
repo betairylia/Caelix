@@ -1,0 +1,63 @@
+// The Caelix path tracer. The path-tracing body itself lives in CaelixPathTraceCommon.hlsl; this
+// file supplies the dispatch: one compute thread per pixel, TraceRayInline against the hardware
+// RTAS, and the brick DDA run inline on every procedural candidate.
+
+#include "UnityRayQuery.cginc"
+
+#pragma target 5.0
+#pragma kernel CaelixPathTraceKernel
+#pragma kernel CaelixBakeMaterialsAlbedo
+#pragma kernel CaelixBakeMaterialsEmission
+#pragma kernel CaelixBakeMaterialsScalars
+#pragma use_dxc
+// Int64 is required by the brick DDA, which loads the 64-bit micro-occupancy word in one go. If a
+// future editor reports Int64 as an unknown feature here, drop it from this line rather than
+// changing the DDA.
+#pragma require inlineraytracing Int64
+// Render group shape. Exactly one keyword is enabled per dispatch by
+// CaelixRayQueryDispatch.SetGroupKeyword; the default variant decodes 16x16x16 bricks.
+#pragma multi_compile _ CAELIX_GROUP_3_3_3 CAELIX_GROUP_5_5_5 CAELIX_GROUP_4_7_4
+// GI resampling mode (CaelixGiRendererFeature): writes the GI key/surface targets and leaves the
+// diffuse lobe of opaque primaries to CaelixGiRQ.compute. Set every frame by CaelixGBufferPass.
+#pragma multi_compile _ CAELIX_GI_MODE
+
+#include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+#include "Packages/com.unity.render-pipelines.core/ShaderLibrary/Packing.hlsl"
+#include "Assets/Caelix/VoxelMaterials.hlsl"
+
+#include "CaelixMaterialTable.hlsl"
+
+#include "../RayPayload.hlsl"
+#include "../Utils/Utils.hlsl"
+
+#define CAELIX_INLINE_RAY_QUERY 1
+
+// Per-thread launch index, assigned at kernel entry; everything that used DispatchRaysIndex reads it.
+static uint2 _CaelixLaunchIndex;
+uint2 g_LaunchDim;
+#define CAELIX_LAUNCH_INDEX _CaelixLaunchIndex
+#define CAELIX_LAUNCH_DIM g_LaunchDim
+
+#include "../Utils/BlueNoise.hlsl"
+#include "../def/CaelixRayPayloadUtils.hlsl"
+#include "../def/CaelixUtils.hlsl"
+
+RaytracingAccelerationStructure g_AccelStruct;
+
+#include "CaelixRayQueryTrace.hlsl"
+
+#define CAELIX_TRACE_RAY(ray, payload) CaelixRayQueryTrace(ray, payload)
+
+#include "../PathTrace_full/CaelixPathTraceCommon.hlsl"
+
+[numthreads(8, 8, 1)]
+void CaelixPathTraceKernel(uint3 id : SV_DispatchThreadID)
+{
+    if (any(id.xy >= g_LaunchDim))
+    {
+        return;
+    }
+
+    _CaelixLaunchIndex = id.xy;
+    CaelixPathTraceMain();
+}

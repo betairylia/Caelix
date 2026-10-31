@@ -69,6 +69,14 @@ Rejected alternatives, and why:
   backlog cap, kept for a loop that has no fixed step of its own, such as a
   headless server; it calls `Tick()` too and drops the accumulator when the
   freeze stops it. Nothing calls it yet.
+- External drivers can set `CaelixHost.ManualDrive = true` to suppress its automatic
+  fixed-step and client-frame pumps. Call `Step(count)` to advance simulation, then
+  `PumpClientFrame()` to receive replication and prepare/render the client once.
+  Explicit steps contribute to `LastTickTimings.ServerTicks` and server elapsed
+  time; pumping consumes that accumulator once. World sub-buckets still describe
+  only the last tick. `ClientPendingBytes`, `ClientPeakPendingBytes`, and
+  `ClientReceivedBytes` expose the existing LocalChannel counters without exposing
+  a mutable channel. Titania's benchmark runner uses this path.
 - A connection receives every world by default. `ServerConnection.SubscribedWorlds`
   restricts it to a subset.
 - An entity lives in exactly one world. The wire address of an entity is
@@ -93,6 +101,31 @@ Rejected alternatives, and why:
   running world each frame. Debug views draw from data.
 - PhysX is gone: no `Rigidbody`, no `UnityPhysicsCollider`, no
   `TemporaryCharacterCollider`, no `VoxelBody.physicsEnabled`.
+
+### Automata and the shared physics BVH
+
+After the topology boundary, entity/body membership, staticness and transforms stay
+fixed until physics. When simulation bricks require work, `PrepareSpatialQueries`
+refreshes collider storage views and body mappings, then builds the existing physics
+BVH from current poses and storage bounds. Every entity participating in alien reads
+must have a body. This preparation does not compute mass or apply forces.
+
+`CollectAutomataCandidates` queries each source entity's aggregate required-brick
+bounds, then narrows the returned entities per brick. Each source brick expands by
+one voxel in local space before its bounds are transformed. No target brick keys are
+enumerated. Reusable candidate indices and `RequiredBrick.AlienCandidateRange`
+preserve the existing alien-view priority independently of BVH traversal order.
+`AutomataReader` resolves blocks and metadata local-first through that range, using
+a `BrickCursor` within the read phase. Recreate readers after snapshot commits or
+storage mutation.
+
+After automata commits snapshots, normal dirty propagation, occupancy, collision
+data, mass properties and forces are prepared. Physics refreshes collider storage
+views again and rebuilds the static tree only if its bounds changed since spatial
+preparation; ordinary WireWorld state changes preserve these bounds. The dynamic
+tree is prepared for motion. Post-physics alien propagation keeps its own overlap
+results and synchronizes the collision world with the resulting poses before
+querying, including when simulation-time synchronization was disabled.
 
 ## 4. Authoring without a bake step
 
@@ -163,69 +196,94 @@ the renderer is what makes it possible.
 - **Replicated slot mask.** `CaelixWorldConfig.replicatedSlotMask`, one bit
   per slot id, default Block only. Sent in the handshake. Delta records carry
   slot id, stride, and raw bytes, so the client never needs the C# type of a
-  slot.
-- **Delta detection.** The Block slot is the only writer that sets the
-  `Geometry` dirty bit, so a brick with `Geometry`, `BlockBrickAdded`, or
-  `BlockBrickRemoved` set at the end of the tick is a Block delta. Capture
-  happens after alien propagation and before `ClearDirtyFlags`. For more
-  replicated slots later, add one dirty bit `SlotReplicate` that any write to
-  a masked slot sets.
-- **Two phases, phase B first.** Phase A, `ReplicationBatch`, packs BrickData
-  messages for a list of sectors, in parallel over sectors, with a size job, an
-  exclusive prefix sum, and a write job over `UnsafeNetWriter`. It is built
-  once per world per tick from the world's dirty sectors and every connection
-  sends the same bytes. `CollectDirtySectors` walks the entity map and picks
-  the sectors whose `sectorDirtyFlags` meet the replication mask; the packing
-  walks `SectorDirtyBrickEnumerator`, the one legitimate reader of the raw
-  write-side dirty flags, because it runs inside the tick before
-  `ClearDirtyFlags`. Phase B runs first, so phase A can pack only what is left.
+  slot. Both ends must use the same fixed
+  [application-wide slot definitions](https://github.com/betairylia/Caelix-Core/blob/main/Documentation~/internals/voxel-storage.md#application-wide-slot-definitions).
+  A record's stride describes that definition; it cannot redefine a slot after
+  storage removal or recreation. The app-level definition contract is documented;
+  a frozen registry and comprehensive schema validation are not implemented yet.
+- **Everything is a keyed brick record.** One message kind, `BrickBatch`, per
+  entity. Every record carries its own brick key and an explicit operation,
+  `Update` or `Remove`, so nothing outside Caelix-Core names a sector. There is
+  no `SectorAdd`, no `SectorRemove`, and no per-sector message.
+- **Delta detection is the change list.** `VoxelEntityData.Changes`, published
+  after alien propagation and cleared by `EndTick`, is what replication reads.
+  A `Removed` entry becomes a `Remove` record; an `Updated` entry whose
+  `DirtyFlags` meet `BrickReplication.ReplicationDirtyMask` (`Geometry`,
+  `BlockBrickAdded`, `BlockBrickRemoved` — the Block slot is the only writer that
+  sets `Geometry`) becomes an `Update` record. Records keep change-list order, so
+  a key removed and recreated in one tick reaches the client as Remove then
+  Update. `SlotReplicate`, a bit set by writes to other replicated slots, is a
+  possible later extension; it is not an existing `BrickUpdateFlags` member.
+  `VoxelEntityData.AddSectorAt` marks every allocated brick of an attached
+  storage unit `BlockBrickAdded | Geometry | GeometryWithLocalNeighbor`, because
+  a generator or importer that hands over pre-filled storage would otherwise
+  announce nothing.
+  This dirty gate selects delta work. It does not prove that a record has any
+  payload under the configured slot mask. Full uploads enumerate allocated
+  bricks regardless of dirty flags, because a new client also needs unchanged
+  data. Slot presence and current dirtiness are separate facts; the current
+  codec can emit a zero-slot Update when no selected slot exists.
+- **Two phases, phase B first.** Phase A, `ReplicationBatch`, packs BrickBatch
+  messages for a list of entities, in parallel over BRICKS: a collect job flattens
+  each entity into brick records, a size job runs over them, and a write job fills
+  each record through `UnsafeNetWriter` at its own offset. It is built once per
+  world per tick from the world's changed entities and every connection sends the
+  same bytes. `CollectChangedEntities` walks the entity map and adds every entity
+  with a non-empty change list. Phase B runs first, so phase A can pack only what
+  is left.
 - **Phase B** is `ServerConnection.ReplicateWorld`, one call per connection,
-  and it runs before phase A. It diffs the connection's knowledge, sends the
-  lifecycle messages, then packs whatever that connection still has to catch up
-  on into a second batch and streams it. It records which sectors it sent in
-  full this tick. A connection that is new to an entity has all of its sectors
-  new, so it is served entirely by the catch-up batch; a shared delta slice can
-  only name a sector the connection already knows, because a new one got its
-  `SectorAdd` in phase B earlier in the same tick.
+  and it runs before phase A. It diffs the connection's ENTITY knowledge, sends
+  the lifecycle messages, then packs every allocated brick of whatever that
+  connection still has to catch up on into a second batch and streams it. It
+  records which entities it sent in full this tick. An entity new to a connection
+  is served entirely by the catch-up batch and never by a shared delta message.
 - **Phase A packs only what somebody still needs, in chunks.** After phase B,
-  the server drops every collected delta sector that each connected, subscribed
+  the server drops every collected delta entity that each connected, subscribed
   connection already received in full; on the tick a world is loaded that is
-  all of them. Both batches then stream: `Prepare` sizes every sector once,
-  `BuildNextChunk` packs the next run of sectors that fits in
-  `ReplicationBatch.MaxChunkBytes` (64 MB by default, `CaelixServer.
+  all of them. Both batches then stream: `Prepare` sizes every record once and
+  cuts the records into messages, `BuildNextChunk` packs the next run of messages
+  that fits in `ReplicationBatch.MaxChunkBytes` (64 MB by default, `CaelixServer.
   ReplicationChunkBytes`), and every connection forwards that chunk with
-  `SendDelta` before the next one is built. One buffer for the whole batch does
-  not work: an 8K world is about 2.9 million bricks of roughly a kilobyte each,
-  near 3 GB, so the `int` prefix sum overflowed negative, the resize was a
-  no-op, and the write job wrote gigabytes into a 64 KB allocation.
-- **Topology.** Per connection, the server diffs the known entity set and the
-  known sector set of each entity against the world every tick. It also compares
-  world object identity, entity creation identity, and sector attachment identity.
-  Reusing an ID or coordinate between ticks therefore produces remove then add,
-  followed by full contents. `ForgetWorld` and a changed replicated slot mask also
-  force a world reset. Identity is server bookkeeping; the local ordered channel
-  carries the existing lifecycle messages, with no new wire format.
-- **Renderer lifetime.** `WorldRemoving`, `ViewDespawning`, and `SectorRemoving`
-  run while the corresponding storage is still alive. Mesh and ray renderers
-  unsubscribe, complete their jobs, and release cached resources before disposal.
-  `VoxelEntityData.RemoveSectorAt` marks the facing bricks of every surviving
-  neighbour sector dirty with `GeometryWithLocalNeighbor` and no direction mask,
-  so the flag reaches only those bricks and creates no sector; the server's next
-  propagation turns it into the require-update the physics slot refresh reads,
-  and the client's `PrepareRender` does the same for the renderers. A fresh
-  renderer uploads a quiet replica in full, including after disable/re-enable.
-  Authored components rebind to their replacement entity and world.
+  `SendDelta` before the next one is built. A message never spans entities and
+  never grows past one chunk, so a chunk always holds at least one whole message.
+  One buffer for the whole batch does not work: an 8K world is about 2.9 million
+  bricks of roughly a kilobyte each, near 3 GB, so the `int` prefix sum overflowed
+  negative, the resize was a no-op, and the write job wrote gigabytes into a
+  64 KB allocation.
+- **Topology.** Per connection, the server diffs the known entity set against the
+  world every tick. It also compares world object identity and entity creation
+  identity. Reusing an ID between ticks therefore produces remove then add,
+  followed by full contents. Storage residency below the entity is NOT diffed per
+  connection any more: it rides on the change list, and a client's residency is
+  the set of keys it received. `ForgetWorld` and a changed replicated slot mask
+  also force a world reset. Identity is server bookkeeping; the local ordered
+  channel carries the existing lifecycle messages, with no new wire format.
+- **Empty storage is not replicated.** A server region that holds no brick — a
+  neighbour that propagation created, or an explicit `EnsureRegion` — has no
+  record to send, so the client never learns about it. A replica matches the
+  server's ALLOCATED BRICKS, not its region set.
+- **Renderer lifetime.** `WorldRemoving` and `ViewDespawning` run while the
+  corresponding storage is still alive. Mesh and ray renderers unsubscribe,
+  complete their jobs, and release cached resources before disposal. There is no
+  `SectorRemoving`: both renderers learn about a removal from the change list, and
+  drop a render group that holds no allocated brick after its jobs completed.
+  `VoxelEntityData.RemoveRegion`
+  marks the facing bricks of every surviving neighbour region dirty with
+  `GeometryWithLocalNeighbor` and no direction mask, so the flag reaches only
+  those bricks and creates no sector; the server's next propagation turns it into
+  the require-update the physics slot refresh reads, and the client's
+  `PrepareRender` does the same for the renderers. A fresh renderer uploads a
+  quiet replica in full, including after disable/re-enable. Authored components
+  rebind to their replacement entity and world.
 - **Transforms and flags.** Sent per entity when changed.
 - **Never replicate** `PhysicsInfo`. It is derived, and the serializer already
   discards it.
-- **Client apply.** `Sector.ApplyReplicatedBrickBatch` validates the whole
-  message, then copies each raw brick, marks
-  `Geometry | GeometryWithLocalNeighbor | BlockBrickAdded` as needed, and
-  widens the block AABB to the brick bounds. The client frame is three calls
-  plus the renderers: `Receive` (clear require-update, then apply every pending
-  message), `PrepareRender` (propagate the render flags `Geometry`,
-  `GeometryWithLocalNeighbor`, `BlockBrickAdded`, `BlockBrickRemoved`), the
-  renderers, then `EndFrame` (clear dirty). None of those four bits is in
+- **Client apply.** `BrickBatchApplier` (Caelix-Core) is the only apply path.
+  The client frame is three calls plus the renderers: `Receive` (clear
+  require-update, then apply every pending message), `PrepareRender` (propagate
+  the render flags `Geometry`, `GeometryWithLocalNeighbor`, `BlockBrickAdded`,
+  `BlockBrickRemoved`), the renderers, then `EndFrame` (clear dirty and clear the
+  change list). None of those four bits is in
   `DirtyPropagationSettings.DirtyFlagsCanAllocateLocalBricks`, so the client
   never grows phantom sectors.
 - **Frozen server.** Replication runs inside the tick. Freeze is a server-level
@@ -256,9 +314,7 @@ world-scoped message never carries it.
 | S to C | EntityDespawn | guid |
 | S to C | EntityState | guid, isStatic, isProtected, hasBody |
 | S to C | EntityTransform | guid, transform (rotation, position) |
-| S to C | SectorAdd | guid, sector position |
-| S to C | SectorRemove | guid, sector position |
-| S to C | BrickData | guid, sector position, brick count; then per brick: brick index, dirty flags, slot records |
+| S to C | BrickBatch | guid, brick count; then per record: `int3 key`, `u8 op`, and for an Update the slot records |
 | S to C | Event | registered type id, blittable payload |
 | S to C | QueryReply | request id, guid, position, found; then slot records for one voxel |
 | S to C | TypedQueryReply | request id, registered reply type id, reply struct, trailing payload |
@@ -266,31 +322,54 @@ world-scoped message never carries it.
 | C to S | Query | request id, guid, position, slot mask |
 | C to S | TypedQuery | request id, registered request type id, request struct, trailing payload |
 
-`BrickData` is one message per sector per tick: a new sector sends every
-allocated brick, a known sector sends only the bricks whose dirty flags meet
-the replication mask. The client ignores the per-brick dirty flags; they are
-informational.
+A `BrickBatch` message belongs to one entity and carries a run of its records.
+A record is `int3 key, u8 op`; an `Update` record then carries the brick's slot
+records (`u8 slotCount`, then per slot `u8 slotId, u16 stride,
+byte[stride * 512]`, a zero count when the brick is not allocated), and a
+`Remove` record ends after the op byte, at 13 bytes. `BrickCount` is an `int`,
+because a batch is bounded by bytes rather than by 65535 records. An entity new
+to a connection sends every allocated brick; a known entity sends its change
+list.
 
-`CaelixClient.Receive` groups consecutive brick messages by sector. A Burst job
-applies different sectors in parallel, while each sector's messages retain their
-receive order. A single sector uses the same job with `Run()`. The main thread
-resolves worlds, views and sector handles; jobs own sector allocation, slot copies,
-dirty flags and brick bounds. Allocated-brick lists refresh once per flush when
-allocation changed, so existing-brick deltas skip that scan.
+`CaelixClient.Receive` resolves the world and the view, then hands the payload to
+`BrickBatchApplier` — nothing on the Caelix side sees a sector. The applier runs
+four passes per flush. Pass 1 is one Burst job: it validates every message and
+chains its records into per-storage-unit work items, in wire order. Pass 2 runs
+on the main thread and creates the storage the records need. Pass 3 is a parallel
+Burst job over work items; each owns its unit exclusively, applies Updates and
+Removes in order, and refreshes the allocated-brick list whenever allocation
+changed. Pass 4, back on the main thread, publishes one `Removed` change entry
+per freed brick, frees a unit that ended up empty (which marks the surviving
+cross-unit boundary), and advances the storage epoch. Removals are published
+before the frame's `BuildChangeList`, so a consumer that applies entries in list
+order sees Remove before the Update that recreated the same key.
 
-The channel transfers ownership of received arrays. `BrickReceiveBatch` pins those
-arrays until its jobs complete, without staging another payload copy. It flushes
-at 64 MiB or 1,024 messages; a single oversized message runs alone. These limits
+A freed brick index keeps `BlockBrickRemoved | GeometryWithLocalNeighbor` dirty
+with every direction set. Propagation reads the flag arrays by index and never
+asks whether the brick still exists, so the 26 neighbours are re-rendered.
+
+`LocalChannel` copies sends into pooled buffers and transfers their ownership through
+`ReceivedMessage`. Its logical `Length` is separate from array capacity. The pool
+retains at most two arrays per size bucket up to 64 MiB; larger messages remain valid
+but are not retained for reuse. Legacy `INetChannel` implementations still work through
+an adapter, and legacy array receives return independent, exactly sized arrays.
+
+`BrickReceiveBatch` pins received buffers until its jobs complete, then releases the
+pins before returning the leases. It flushes at 64 MiB of actual array capacity or
+1,024 messages; a single oversized message runs alone. These limits
 bound retained apply input, not the channel inbox. Every non-brick message, creation
 of an unknown world (which raises a callback), and the end of `Receive` completes
 pending writes before observation or storage replacement. No apply job survives
 `Receive`. Consumers still complete their own previous-frame jobs before receiving.
 
-The native decoder checks brick indices, slot IDs, strides and payload bounds before
-changing any bricks in a message. Conflicting strides include records earlier in
-the same message. Invalid messages return an error for main-thread logging; later
-messages still apply. Zero-slot records remain no-ops. This is framing validation,
-not a remote transport or queue backpressure policy.
+The native decoder checks the operation byte, slot IDs, strides and payload bounds
+before changing any brick in a message. Conflicting strides include records earlier
+in the same message and in earlier messages of the same flush. An invalid message
+changes no brick and creates no storage; it returns an error for main-thread
+logging, and earlier and later messages still apply. Zero-slot records remain
+no-ops, so they never create a storage unit either. A `Remove` for a key whose
+storage does not exist is a no-op. This is framing validation, not a remote
+transport or queue backpressure policy.
 
 `ClientReceivePerformanceTests` provides opt-in initial-sync and queued-delta
 receive timings. Run with Burst enabled and `--burst-force-sync-compilation`; the
@@ -387,9 +466,9 @@ with `LocalChannel` alone it would have one implementation and no test of fit.
 
 | Assembly | Repo | Contents | References |
 |---|---|---|---|
-| `Caelix.Core` | Core | `VoxelEntityData`, `Sector`, serializer, dirty propagation, neighborhood reader, tick primitives, `BrickInfo`, `Caelix.Net` codec, channel, registries | Burst, Collections, Mathematics |
+| `Caelix.Core` | Core | `VoxelEntityData` (the brick-key facade: `BrickKey`, `VoxelRegion`, `AutomataBrick`, `RequiredBrick`, `BrickChange`), the sector backend, serializer, dirty propagation, neighborhood reader, tick primitives, `Caelix.Net` codec, channel, registries | Burst, Collections, Mathematics |
 | `Caelix.Physics` | Physics | `VoxelBodyData`, `VoxelPhysicsWorld`, `PhysicsWorldConfig` (scene settings holder), setup jobs, force commands | Core, low-level fork, Entities, Numerics |
-| `Caelix.Simulation` | Caelix | `CaelixWorld`, `CaelixServer`, `ServerConnection`, replication, engine net types, brick collector | Core, Physics, low-level fork, Entities, Numerics |
+| `Caelix.Simulation` | Caelix | `CaelixWorld`, `CaelixServer`, `ServerConnection`, replication, engine net types | Core, Physics, low-level fork, Entities, Numerics |
 | `Caelix` | Caelix | `VoxelEntity`, `VoxelBody`, `CaelixHost`, `CaelixClient`, `ClientWorld`, renderers, raycast, importers, authoring | Simulation, URP |
 | `Caelix.Transport.Utp` | Caelix | Unity Transport channel | Core, com.unity.transport. Later |
 

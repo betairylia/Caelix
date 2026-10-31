@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using Unity.Collections;
 using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.SceneManagement;
@@ -69,10 +68,10 @@ namespace Caelix.Authoring
         /// Whether the working entity can accept generated voxels right now.
         /// </summary>
         /// <remarks>
-        /// <see cref="VoxelEntity"/> allocates its native storage in Awake and releases it in
-        /// OnDisable, so the component can be alive while its sectors are gone — a destroyed or
+        /// <see cref="VoxelEntity"/> registers its entity with the server in OnEnable and removes it
+        /// in OnDisable, so the component can be alive while its storage is gone — a destroyed or
         /// disabled entity, an undo in Play Mode, or a rebuild scheduled before Awake ran. Writing
-        /// then reaches a disposed UnsafeHashMap and throws a NullReferenceException from inside
+        /// then reaches disposed native memory and throws a NullReferenceException from inside
         /// Unity.Collections, which is why every entry point checks this first.
         /// </remarks>
         public bool CanWriteVoxels
@@ -80,7 +79,7 @@ namespace Caelix.Authoring
             get
             {
                 VoxelEntity entity = OwnedEntity;
-                return entity != null && entity.Sectors.IsCreated;
+                return entity != null && entity.HasServerData;
             }
         }
 
@@ -222,7 +221,7 @@ namespace Caelix.Authoring
                 return false;
             }
 
-            if (!bakeTarget.Sectors.IsCreated)
+            if (!bakeTarget.HasServerData)
             {
                 error = "The Bake Target entity has no voxel storage. Make sure it is active and enabled.";
                 return false;
@@ -267,48 +266,38 @@ namespace Caelix.Authoring
             }
         }
 
+        /// <remarks>
+        /// <see cref="VoxelEntity.SetBlock"/> writes into the storage the enumerator is walking.
+        /// That is safe here for the same reason it was before the facade: clearing a voxel never
+        /// removes a brick, so the set of allocated bricks does not change under the enumerator.
+        /// </remarks>
         private static unsafe void ClearBlocks(VoxelEntity entity)
         {
-            if (entity == null || !entity.Sectors.IsCreated)
+            if (entity == null || !entity.HasServerData)
             {
                 return;
             }
 
-            NativeArray<int3> sectorPositions = entity.Sectors.GetKeyArray(Allocator.Temp);
-            try
+            VoxelEntityData data = entity.ServerData;
+            foreach (int3 key in data.EnumerateBricks())
             {
-                for (int sectorIndex = 0; sectorIndex < sectorPositions.Length; sectorIndex++)
+                if (!data.TryBindBrick(SectorSlotId.Block, key, out Block* blocks))
                 {
-                    int3 sectorPosition = sectorPositions[sectorIndex];
-                    if (!entity.Sectors.TryGetValue(sectorPosition, out SectorHandle handle))
+                    continue;
+                }
+
+                int3 origin = BrickKey.ToBlockOrigin(key);
+                for (int z = 0; z < BrickKey.BlocksPerAxis; z++)
+                for (int y = 0; y < BrickKey.BlocksPerAxis; y++)
+                for (int x = 0; x < BrickKey.BlocksPerAxis; x++)
+                {
+                    if (blocks[BrickKey.ToBlockIdx(x, y, z)].isEmpty)
                     {
                         continue;
                     }
 
-                    ref Sector sector = ref handle.Get();
-                    foreach (SectorNonEmptyBrickEnumerator.BrickRef brickRef in sector.EnumerateNonEmptyBricks())
-                    {
-                        int3 brickPosition = Sector.ToBrickPos((short)brickRef.BrickAbs);
-                        int3 localOrigin = brickPosition * Sector.SIZE_IN_BLOCKS;
-                        int3 globalOrigin = sectorPosition * Sector.SECTOR_SIZE_IN_BLOCKS + localOrigin;
-
-                        for (int z = 0; z < Sector.SIZE_IN_BLOCKS; z++)
-                        for (int y = 0; y < Sector.SIZE_IN_BLOCKS; y++)
-                        for (int x = 0; x < Sector.SIZE_IN_BLOCKS; x++)
-                        {
-                            if (sector.GetBlock(localOrigin.x + x, localOrigin.y + y, localOrigin.z + z).isEmpty)
-                            {
-                                continue;
-                            }
-
-                            entity.SetBlock(globalOrigin + new int3(x, y, z), Block.Empty);
-                        }
-                    }
+                    entity.SetBlock(origin + new int3(x, y, z), Block.Empty);
                 }
-            }
-            finally
-            {
-                sectorPositions.Dispose();
             }
         }
 
@@ -319,58 +308,43 @@ namespace Caelix.Authoring
         {
             int copied = 0;
             if (source == null || destination == null ||
-                !source.Sectors.IsCreated || !destination.Sectors.IsCreated)
+                !source.HasServerData || !destination.HasServerData)
             {
                 return 0;
             }
 
-            NativeArray<int3> sectorPositions = source.Sectors.GetKeyArray(Allocator.Temp);
-            try
+            VoxelEntityData data = source.ServerData;
+            foreach (int3 key in data.EnumerateBricks())
             {
-                for (int sectorIndex = 0; sectorIndex < sectorPositions.Length; sectorIndex++)
+                if (!data.TryBindBrick(SectorSlotId.Block, key, out Block* blocks))
                 {
-                    int3 sectorPosition = sectorPositions[sectorIndex];
-                    if (!source.Sectors.TryGetValue(sectorPosition, out SectorHandle handle))
+                    continue;
+                }
+
+                int3 origin = BrickKey.ToBlockOrigin(key);
+                for (int z = 0; z < BrickKey.BlocksPerAxis; z++)
+                for (int y = 0; y < BrickKey.BlocksPerAxis; y++)
+                for (int x = 0; x < BrickKey.BlocksPerAxis; x++)
+                {
+                    Block block = blocks[BrickKey.ToBlockIdx(x, y, z)];
+                    if (block.isEmpty)
                     {
                         continue;
                     }
 
-                    ref Sector sector = ref handle.Get();
-                    foreach (SectorNonEmptyBrickEnumerator.BrickRef brickRef in sector.EnumerateNonEmptyBricks())
+                    int3 sourcePosition = origin + new int3(x, y, z);
+                    int3 destinationPosition = sourcePosition;
+                    if (sourceToDestination.HasValue)
                     {
-                        int3 brickPosition = Sector.ToBrickPos((short)brickRef.BrickAbs);
-                        int3 localOrigin = brickPosition * Sector.SIZE_IN_BLOCKS;
-                        int3 globalOrigin = sectorPosition * Sector.SECTOR_SIZE_IN_BLOCKS + localOrigin;
-
-                        for (int z = 0; z < Sector.SIZE_IN_BLOCKS; z++)
-                        for (int y = 0; y < Sector.SIZE_IN_BLOCKS; y++)
-                        for (int x = 0; x < Sector.SIZE_IN_BLOCKS; x++)
-                        {
-                            Block block = sector.GetBlock(localOrigin.x + x, localOrigin.y + y, localOrigin.z + z);
-                            if (block.isEmpty)
-                            {
-                                continue;
-                            }
-
-                            int3 sourcePosition = globalOrigin + new int3(x, y, z);
-                            int3 destinationPosition = sourcePosition;
-                            if (sourceToDestination.HasValue)
-                            {
-                                Vector3 mapped = sourceToDestination.Value.MultiplyPoint3x4(
-                                    new Vector3(sourcePosition.x, sourcePosition.y, sourcePosition.z));
-                                Vector3Int rounded = Vector3Int.RoundToInt(mapped);
-                                destinationPosition = new int3(rounded.x, rounded.y, rounded.z);
-                            }
-
-                            destination.SetBlock(destinationPosition, block);
-                            copied++;
-                        }
+                        Vector3 mapped = sourceToDestination.Value.MultiplyPoint3x4(
+                            new Vector3(sourcePosition.x, sourcePosition.y, sourcePosition.z));
+                        Vector3Int rounded = Vector3Int.RoundToInt(mapped);
+                        destinationPosition = new int3(rounded.x, rounded.y, rounded.z);
                     }
+
+                    destination.SetBlock(destinationPosition, block);
+                    copied++;
                 }
-            }
-            finally
-            {
-                sectorPositions.Dispose();
             }
 
             return copied;

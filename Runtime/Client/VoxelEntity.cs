@@ -1,4 +1,5 @@
 using System;
+using Unity.Collections;
 using Unity.Jobs;
 using Unity.Mathematics;
 using UnityEngine;
@@ -310,15 +311,50 @@ namespace Caelix
             return serverWorld.GetEntity(guid);
         }
 
-        /// <summary>The server entity's sectors. Not created when this process does not run the server.</summary>
-        public SharedHashMap<int3, SectorHandle> Sectors =>
-            HasServerData ? serverWorld.GetEntity(guid).sectors : default;
+        /// <summary>
+        /// The server entity's storage, as the brick-key facade. <c>default</c> (no regions, no
+        /// bricks) when this process does not run the server.
+        /// </summary>
+        public VoxelEntityData ServerData => HasServerData ? serverWorld.GetEntity(guid) : default;
 
-        public void AddEmptySectorAt(int3 pos) => RequireServerData().AddEmptySectorAt(pos);
+        /// <summary>True when the server entity holds a region at <paramref name="regionPos"/>.</summary>
+        public bool HasRegion(int3 regionPos) => HasServerData && serverWorld.GetEntity(guid).HasRegion(regionPos);
 
-        public void AddSectorAt(int3 pos, SectorHandle sector) => RequireServerData().AddSectorAt(pos, sector);
+        /// <summary>Number of regions the server entity holds. Zero without server data.</summary>
+        public int RegionCount => HasServerData ? serverWorld.GetEntity(guid).RegionCount : 0;
 
-        public bool RemoveSectorAt(int3 pos) => RequireServerData().RemoveSectorAt(pos);
+        /// <summary>Allocated bricks across every region of the server entity. Zero without server data.</summary>
+        public int AllocatedBrickCount => HasServerData ? serverWorld.GetEntity(guid).AllocatedBrickCount : 0;
+
+        /// <summary>
+        /// The positions of every region the server entity holds. The caller owns the array; it is
+        /// empty without server data.
+        /// </summary>
+        public NativeArray<int3> GetRegionPositions(Allocator allocator) =>
+            HasServerData
+                ? serverWorld.GetEntity(guid).GetRegionPositions(allocator)
+                : new NativeArray<int3>(0, allocator);
+
+        /// <summary>Makes the region at <paramref name="regionPos"/> exist, empty, when it does not yet.</summary>
+        public void EnsureRegion(int3 regionPos) => RequireServerData().EnsureRegion(regionPos);
+
+        /// <summary>Takes ownership of a DETACHED region a generator filled. See <see cref="VoxelRegion"/>.</summary>
+        public void AttachRegion(ref VoxelRegion region) => RequireServerData().AttachRegion(ref region);
+
+        /// <summary>Frees the region at <paramref name="regionPos"/> and everything in it.</summary>
+        public bool RemoveRegion(int3 regionPos) => RequireServerData().RemoveRegion(regionPos);
+
+        /// <summary>Opens an ATTACHED view over one region of the server entity for in-place access.</summary>
+        public bool TryOpenRegion(int3 regionPos, out VoxelRegion region)
+        {
+            if (!HasServerData)
+            {
+                region = default;
+                return false;
+            }
+
+            return serverWorld.GetEntity(guid).TryOpenRegion(regionPos, out region);
+        }
 
         /// <summary>Reads a block: from the server in host mode, otherwise from the replica.</summary>
         public Block GetBlock(int3 pos)
@@ -356,8 +392,24 @@ namespace Caelix
             RequireServerData().SetSlot(slotId, pos, value);
         }
 
+        /// <summary>
+        /// Writes a block raising exactly <paramref name="simulationFlags"/> instead of the
+        /// <see cref="AutomataDefaults"/> rules. Host mode only: a client command carries no mask.
+        /// </summary>
+        public void SetBlock(int3 pos, Block b, BrickUpdateFlags simulationFlags)
+        {
+            RequireServerData().SetBlock(pos, b, simulationFlags);
+        }
+
+        /// <summary>Explicit-mask slot write into server data. Host mode only.</summary>
+        public void SetSlot<T>(SectorSlotId slotId, int3 pos, T value, BrickUpdateFlags simulationFlags)
+            where T : unmanaged, IEquatable<T>
+        {
+            RequireServerData().SetSlot(slotId, pos, value, simulationFlags);
+        }
+
         /// <summary>Host authoring helper. Runtime propagation is driven by the server tick.</summary>
-        public JobHandle PropagateDirtyFlags(DirtyFlags flags = DirtyFlags.All, bool async = false)
+        public JobHandle PropagateDirtyFlags(BrickUpdateFlags flags = BrickUpdateFlags.All, bool async = false)
         {
             return RequireServerData().PropagateDirtyFlags(flags, async);
         }

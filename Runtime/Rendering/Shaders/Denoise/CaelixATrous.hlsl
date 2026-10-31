@@ -9,6 +9,12 @@
 //   .rgb = the quantity being filtered   .a = validity (<= 0.001 means "no data, pass through")
 //
 // Geometry guides (_NormalTex, _CurrentDepthHistoryTex) come from CaelixDenoiseCommon.hlsl.
+//
+// The depth weight is an exact PLANE PREDICTION, not a depth difference: the centre pixel's normal
+// defines a plane, every tap ray is intersected with it, and the tap is compared against the depth
+// it would have had ON that plane. A flat surface therefore gets weight 1 in every direction and at
+// every angle -- no anisotropic smearing along the depth gradient, no band where a grazing plane
+// self-rejects -- and only a genuine depth step (a different surface) is rejected.
 
 #include "CaelixDenoiseCommon.hlsl"
 
@@ -21,8 +27,8 @@ int _ATrousUseFaceHash;
 int _ATrousJitterTaps;
 int _ATrousFrameIndex;
 float _ATrousNormalPower;
-float _ATrousDepthSigma;
-float _ATrousRelativeDepthSigma;
+float _ATrousDepthTolerance;
+float _ATrousRelativeDepthTolerance;
 float _ATrousRadianceSigma;
 
 float CaelixATrousKernel(int offset)
@@ -57,22 +63,14 @@ float4 CaelixATrousFilter(uint2 centerCoord)
 
     int stepWidth = max(_ATrousStepWidth, 1);
 
-    // Screen-space depth gradient (world units per pixel) makes the depth weight
-    // slope-aware: surfaces seen at an angle tolerate the depth change their own
-    // slope produces instead of rejecting their whole neighborhood. The smaller
-    // one-sided difference is used so a silhouette on one side does not inflate
-    // the gradient and let taps leak across the edge.
-    float depthRight = LOAD_TEXTURE2D(_CurrentDepthHistoryTex, CaelixClampCoord(int2(centerCoord) + int2(1, 0))).r;
-    float depthLeft = LOAD_TEXTURE2D(_CurrentDepthHistoryTex, CaelixClampCoord(int2(centerCoord) - int2(1, 0))).r;
-    float depthUp = LOAD_TEXTURE2D(_CurrentDepthHistoryTex, CaelixClampCoord(int2(centerCoord) + int2(0, 1))).r;
-    float depthDown = LOAD_TEXTURE2D(_CurrentDepthHistoryTex, CaelixClampCoord(int2(centerCoord) - int2(0, 1))).r;
-    float2 depthGradient;
-    depthGradient.x = abs(depthRight - centerDepth) < abs(centerDepth - depthLeft)
-        ? depthRight - centerDepth
-        : centerDepth - depthLeft;
-    depthGradient.y = abs(depthUp - centerDepth) < abs(centerDepth - depthDown)
-        ? depthUp - centerDepth
-        : centerDepth - depthDown;
+    // The centre surface as a plane, in view space. A view ray r hits the plane
+    // through the centre point at the parameter that makes dot(n, t*r) constant,
+    // so a tap's predicted depth is centerDepth * (n.r_center) / (n.r_tap) --
+    // exact for any plane under any perspective, with no finite differences and
+    // no dependence on the tap direction.
+    float3 centerNormalView = mul((float3x3)_CaelixWorldToCamera, centerNormal);
+    float centerNdotR = dot(centerNormalView, CaelixViewRay(float2(centerCoord) + 0.5f + _CaelixJitter.xy));
+    float depthTolerance = max(_ATrousDepthTolerance, _ATrousRelativeDepthTolerance * abs(centerDepth));
 
     // The first iteration (step 1) skips the luminance weight entirely: at raw
     // 1spp the luminance channel IS the noise (no real edge information), and an
@@ -171,9 +169,13 @@ float4 CaelixATrousFilter(uint2 centerCoord)
             float normalWeight = pow(saturate(dot(centerNormal, sampleNormal)), _ATrousNormalPower);
 
             float sampleDepth = LOAD_TEXTURE2D(_CurrentDepthHistoryTex, sampleCoord).r;
-            float depthDenom = _ATrousDepthSigma * abs(dot(depthGradient, float2(sampleOffset)))
-                + max(_ATrousRelativeDepthSigma * abs(centerDepth), 0.001f);
-            float depthWeight = exp(-abs(sampleDepth - centerDepth) / depthDenom);
+            float sampleNdotR = dot(centerNormalView, CaelixViewRay(float2(sampleCoord) + 0.5f + _CaelixJitter.xy));
+            float depthWeight = 0.0f;
+            if (sampleNdotR * centerNdotR > 1e-6f)              // tap ray must hit the centre's plane on the same side
+            {
+                float predictedDepth = centerDepth * centerNdotR / sampleNdotR;   // exact for a plane, any perspective
+                depthWeight = exp(-abs(sampleDepth - predictedDepth) / depthTolerance);
+            }
 
             float radianceWeight = 1.0f;
             if (useLuminanceWeight)

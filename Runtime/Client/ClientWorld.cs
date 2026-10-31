@@ -10,11 +10,18 @@ using Unity.Jobs;
 namespace Caelix.Client
 {
     /// <summary>
-    /// The client's render replica of one server world. Applies replication messages into
+    /// The client's render replica of one server world. Applies the entity lifecycle messages into
     /// <see cref="EntityView"/> data, binds scene-authored components to their views, spawns view
     /// objects for entities the scene does not have, and runs the Geometry-only dirty propagation
     /// the renderers need. No automata, no physics.
     /// </summary>
+    /// <remarks>
+    /// Brick residency is not tracked here: a <see cref="NetMessageType.BrickBatch"/> message goes
+    /// straight to <see cref="BrickBatchApplier"/> through the view's store, and that decides what
+    /// storage to allocate and free. Consumers learn about removals from the change list, in list
+    /// order, not from an event. The only thing this class remembers about a batch is that the view
+    /// got one, which is what selects the views the render propagation has to visit.
+    /// </remarks>
     public sealed class ClientWorld : IDisposable
     {
         private readonly Dictionary<Guid128, EntityView> views = new();
@@ -37,14 +44,11 @@ namespace Caelix.Client
         /// <summary>Raised before a view's data is disposed. Renderers release their resources here.</summary>
         public event Action<EntityView> ViewDespawning;
 
-        /// <summary>Raised while the sector is still alive. Consumers must release jobs and handles here.</summary>
-        public event Action<EntityView, int3> SectorRemoving;
-
         internal ClientWorld(CaelixClient owner, ushort id, ushort replicatedSlotMask)
         {
             Owner = owner;
             Id = id;
-            ReplicatedSlotMask = replicatedSlotMask == 0 ? Sector.DefaultReplicatedSlotMask : replicatedSlotMask;
+            ReplicatedSlotMask = replicatedSlotMask == 0 ? BrickReplication.DefaultReplicatedSlotMask : replicatedSlotMask;
         }
 
         public bool TryGetView(Guid128 guid, out EntityView view) => views.TryGetValue(guid, out view);
@@ -219,51 +223,6 @@ namespace Caelix.Client
             t.hasChanged = false;
         }
 
-        internal void OnSectorAdd(in SectorMessage message)
-        {
-            if (!views.TryGetValue(message.Guid, out EntityView view))
-            {
-                return;
-            }
-
-            if (view.Data.sectors.ContainsKey(message.SectorPos))
-            {
-                return;
-            }
-
-            view.Data.AddEmptySectorAt(message.SectorPos);
-        }
-
-        internal void OnSectorRemove(in SectorMessage message)
-        {
-            if (!views.TryGetValue(message.Guid, out EntityView view))
-            {
-                return;
-            }
-
-            if (!view.Data.sectors.ContainsKey(message.SectorPos)) return;
-            SectorRemoving?.Invoke(view, message.SectorPos);
-            view.Data.RemoveSectorAt(message.SectorPos);
-        }
-
-        internal bool TryResolveBrickBatch(in BrickBatchHeader header, out SectorHandle handle)
-        {
-            handle = default;
-            if (!views.TryGetValue(header.Guid, out EntityView view))
-            {
-                // Unknown entity: the whole message is dropped; nothing reads the payload after this.
-                return false;
-            }
-
-            if (!view.Data.sectors.TryGetValue(header.SectorPos, out handle))
-            {
-                view.Data.AddEmptySectorAt(header.SectorPos);
-                handle = view.Data.sectors[header.SectorPos];
-            }
-
-            return true;
-        }
-
         #endregion
 
         private static void DestroyViewObject(GameObject go)
@@ -287,20 +246,20 @@ namespace Caelix.Client
 
         /// <summary>
         /// Converts this frame's applied bricks into require-update flags for the renderers.
-        /// Only Geometry bits propagate, so no sector is ever allocated here.
+        /// Only Geometry bits propagate, so no storage is ever allocated here.
         /// </summary>
         public void PropagateForRender()
         {
-            const DirtyFlags renderFlags =
-                DirtyFlags.Geometry | DirtyFlags.GeometryWithLocalNeighbor |
-                DirtyFlags.BlockBrickAdded | DirtyFlags.BlockBrickRemoved;
+            const BrickUpdateFlags renderFlags =
+                BrickUpdateFlags.Geometry | BrickUpdateFlags.GeometryWithLocalNeighbor |
+                BrickUpdateFlags.BlockBrickAdded | BrickUpdateFlags.BlockBrickRemoved;
 
             JobHandle dirtyPropagationHandle = default;
 
             for (int i = 0; i < viewList.Count; i++)
             {
                 EntityView view = viewList[i];
-                if (view.Data.entityDirtyFlags == 0 && !AnySectorDirty(view.Data))
+                if (view.Data.entityDirtyFlags == 0 && !view.BricksAppliedThisFrame)
                 {
                     continue;
                 }
@@ -312,6 +271,14 @@ namespace Caelix.Client
             }
             
             dirtyPropagationHandle.Complete();
+
+            // Propagation is final here, so this is where the frame's change list is published.
+            // Every view, not only the dirty ones: a clean entity's build walks no storage and the
+            // guard that catches a double build has to see every view exactly once.
+            for (int i = 0; i < viewList.Count; i++)
+            {
+                viewList[i].Data.BuildChangeList();
+            }
         }
 
         /// <summary>Ends the dirty lifetime of this frame's applied bricks. Call after the renderers ran.</summary>
@@ -321,18 +288,17 @@ namespace Caelix.Client
             {
                 EntityView view = viewList[i];
                 view.Data.ClearDirtyFlags();
+                view.Data.ClearChanges();
+                view.BricksAppliedThisFrame = false;
             }
         }
 
-        private static bool AnySectorDirty(in VoxelEntityData data)
-        {
-            foreach (var kvp in data.sectors)
-            {
-                if (kvp.Value.Get().sectorDirtyFlags != 0) return true;
-            }
-
-            return false;
-        }
+        /// <summary>
+        /// Records that a brick batch was handed to the applier for <paramref name="view"/> this
+        /// frame. Applying bricks is the only thing that dirties replica storage, so this is what
+        /// <see cref="PropagateForRender"/> selects on instead of peeking into the storage.
+        /// </summary>
+        internal static void MarkBricksApplied(EntityView view) => view.BricksAppliedThisFrame = true;
 
         #endregion
 

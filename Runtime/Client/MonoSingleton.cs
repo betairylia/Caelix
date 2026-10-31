@@ -16,7 +16,7 @@ namespace Caelix
         private static T current;
         private bool destroyed;
 
-        /// <summary>Existing enabled instance, or null. Supports lookup before Awake.</summary>
+        /// <summary>Existing enabled instance, or null. Must be called after instance OnEnable.</summary>
         public static T Current
         {
             get

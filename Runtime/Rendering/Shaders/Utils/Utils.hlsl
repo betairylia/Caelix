@@ -1,3 +1,6 @@
+#ifndef CAELIX_UTILS_MATH_INCLUDED
+#define CAELIX_UTILS_MATH_INCLUDED
+
 #define K_PI                    3.1415926535f
 #define K_HALF_PI               1.5707963267f
 #define K_QUARTER_PI            0.7853981633f
@@ -62,3 +65,5 @@ float FresnelReflectAmountTransparent(float n1, float n2, float3 incident, float
     float xx = x*x;
     return r0 + (1.0 - r0)*xx*xx*x;
 }
+
+#endif

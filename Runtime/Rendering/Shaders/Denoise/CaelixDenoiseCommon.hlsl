@@ -20,6 +20,14 @@ TEXTURE2D(_CurrentNormalHistoryTex);
 
 float4 _CaelixFrameSize;
 
+// --- Shared camera state -------------------------------------------------------------------
+// Everything a filter needs to rebuild the ray a given pixel was traced with, this frame or last.
+// Pushed once per pass by CaelixDenoiseUniforms (C#).
+float4   _CaelixJitter;          // xy = this frame's jitter in pixels, zw = previous frame's
+float4   _CaelixProjection;      // x = zoom (tan(fov/2)), y = aspect
+float4x4 _CaelixWorldToCamera;   // this frame's view matrix
+float4x4 _CaelixPrevWorldToCamera;
+
 uint2 CaelixPixelCoord(float2 uv)
 {
     uint2 size = max(uint2(_CaelixFrameSize.xy), uint2(1, 1));
@@ -33,11 +41,22 @@ uint2 CaelixClampCoord(int2 coord)
     return (uint2)clamp(coord, int2(0, 0), maxCoord);
 }
 
-// The raygen builds its UVs against (size - 1), so every consumer of a reprojected UV has to
-// use the same denominator or history lands half a pixel off.
+// The raygen maps a pixel to UV as (index + 0.5 + jitter) / size, so every consumer of a
+// reprojected UV has to use the same denominator or history lands half a pixel off.
 float2 CaelixHistoryScale()
 {
-    return max(_CaelixFrameSize.xy - 1.0f, float2(1.0f, 1.0f));
+    return max(_CaelixFrameSize.xy, float2(1.0f, 1.0f));
+}
+
+// View-space ray through a launch-space position (pixel index + 0.5 + jitter). Unnormalised,
+// z = -1, so the point t*ray has view-forward depth t, the quantity stored in the depth targets.
+// This must match the raygen mapping exactly -- same launch space, same jitter added, same
+// zoom/aspect -- because the filters compare its predictions against depths the raygen wrote.
+float3 CaelixViewRay(float2 launchPos)
+{
+    float2 ndc = (launchPos / _CaelixFrameSize.xy) * 2.0f - 1.0f;
+    ndc *= _CaelixProjection.x;
+    return float3(ndc.x * _CaelixProjection.y, ndc.y, -1.0f);
 }
 
 float3 CaelixUnpackNormal(float2 packedNormal)

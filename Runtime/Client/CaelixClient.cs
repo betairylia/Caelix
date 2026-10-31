@@ -137,7 +137,7 @@ namespace Caelix.Client
         {
             if (!worlds.TryGetValue(worldId, out ClientWorld world))
             {
-                world = new ClientWorld(this, worldId, Sector.DefaultReplicatedSlotMask);
+                world = new ClientWorld(this, worldId, BrickReplication.DefaultReplicatedSlotMask);
                 worlds.Add(worldId, world);
                 worldList.Add(world);
                 foreach (var entry in authoredViews)
@@ -209,16 +209,17 @@ namespace Caelix.Client
             {
                 try
                 {
-                    while (channel.TryReceive(out byte[] message))
+                    while (channel.TryReceiveLease(out ReceivedMessage message))
                     {
                         try
                         {
-                            Apply(message);
+                            Apply(ref message);
                         }
                         catch (Exception exception)
                         {
                             Debug.LogException(exception);
                         }
+                        finally { message.Dispose(); }
                     }
                 }
                 finally
@@ -252,13 +253,13 @@ namespace Caelix.Client
             }
         }
 
-        private void Apply(byte[] message)
+        private void Apply(ref ReceivedMessage message)
         {
-            var reader = new NetMessageReader(message);
+            var reader = new NetMessageReader(message.Buffer, message.Length);
             NetHeader header = NetHeader.Read(ref reader);
             // All observable messages are ordering barriers: callbacks and lifecycle handlers
             // must see preceding voxel writes, and may replace or free their storage.
-            if (header.Type != NetMessageType.BrickData) brickReceiveBatch.Flush();
+            if (header.Type != NetMessageType.BrickBatch) brickReceiveBatch.Flush();
             if (header.Tick > LastServerTick)
             {
                 LastServerTick = header.Tick;
@@ -323,25 +324,18 @@ namespace Caelix.Client
                     GetOrCreateWorld(header.WorldId).OnTransform(in m);
                     break;
                 }
-                case NetMessageType.SectorAdd:
-                {
-                    var m = reader.Read<SectorMessage>();
-                    GetOrCreateWorld(header.WorldId).OnSectorAdd(in m);
-                    break;
-                }
-                case NetMessageType.SectorRemove:
-                {
-                    var m = reader.Read<SectorMessage>();
-                    GetOrCreateWorld(header.WorldId).OnSectorRemove(in m);
-                    break;
-                }
-                case NetMessageType.BrickData:
+                case NetMessageType.BrickBatch:
                 {
                     var m = reader.Read<BrickBatchHeader>();
                     // Creating a world raises a user callback, so it is also an apply barrier.
                     if (!worlds.ContainsKey(header.WorldId)) brickReceiveBatch.Flush();
-                    if (GetOrCreateWorld(header.WorldId).TryResolveBrickBatch(in m, out SectorHandle sector))
-                        brickReceiveBatch.Add(sector, message, reader.Position, m.BrickCount);
+                    // Unknown entity: the whole message is dropped; nothing reads the payload.
+                    if (GetOrCreateWorld(header.WorldId).TryGetView(m.Guid, out EntityView view))
+                    {
+                        brickReceiveBatch.Add(view.Data, ref message, reader.Position, m.BrickCount);
+                        ClientWorld.MarkBricksApplied(view);
+                    }
+
                     break;
                 }
                 case NetMessageType.Event:

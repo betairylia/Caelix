@@ -1,0 +1,68 @@
+unityVersion=6000.5.6f1
+graphicsDeviceType=Direct3D12
+supportsRayTracing=True
+supportsInlineRayTracing=True
+activeScene=SampleScene isDirtyBEFORE=False
+material=Packages/ink.irylia.caelix/Runtime/Resources/Caelix_BrickRTTest.mat name=Caelix_BrickRTTest shader=Caelix/BrickRTTest
+
+===== TEST A (interleaved: Remove(k) then Add, per group) =====
+A add i=0 -> handle=1 count=1
+A add i=1 -> handle=2 count=2
+A add i=2 -> handle=3 count=3
+A add i=3 -> handle=4 count=4
+A add i=4 -> handle=5 count=5
+A add i=5 -> handle=6 count=6
+A add i=6 -> handle=7 count=7
+A add i=7 -> handle=8 count=8
+A initial handles=[1,2,3,4,5,6,7,8] count=8
+A Build() OK
+A RemoveInstance(h3=4) count=7
+A AddInstance(for k=3) -> handle=4 count=8
+A RemoveInstance(h5=6) count=7
+A AddInstance(for k=5) -> handle=6 count=8
+A FINAL LIVE=[1,2,3,4,5,6,7,8] believedLive=8 GetInstanceCount=8 countsMatch=True DUPLICATES=NONE
+
+===== TEST B (batched: Remove(h3), Remove(h5), Add, Add) =====
+B initial handles=[1,2,3,4,5,6,7,8] count=8
+B Build() OK
+B RemoveInstance(h3=4) count=7
+B RemoveInstance(h5=6) count=6
+B AddInstance #1 -> handle=6 count=7
+B AddInstance #2 -> handle=4 count=8
+B FINAL LIVE=[1,2,3,6,5,4,7,8] believedLive=8 GetInstanceCount=8 countsMatch=True DUPLICATES=NONE
+
+===== TEST C (add-before-remove, per group) =====
+C initial handles=[1,2,3,4,5,6,7,8] count=8
+C Build() OK
+C AddInstance(new for k=3) -> handle=9 count=9
+C RemoveInstance(h3=4) count=8
+C AddInstance(new for k=5) -> handle=4 count=9
+C RemoveInstance(h5=6) count=8
+C FINAL LIVE=[1,2,3,9,5,4,7,8] believedLive=8 GetInstanceCount=8 countsMatch=True DUPLICATES=NONE
+
+===== TEST D (two configs on two different buffers) =====
+D cfg1 add i=0 -> handle=1 count=1
+D cfg1 add i=1 -> handle=2 count=2
+D cfg1 add i=2 -> handle=3 count=3
+D cfg2 add i=0 -> handle=4 count=4
+D cfg2 add i=1 -> handle=5 count=5
+D cfg2 add i=2 -> handle=6 count=6
+D AFTER-ADDS LIVE=[1,2,3,4,5,6] believedLive=6 GetInstanceCount=6 countsMatch=True DUPLICATES=NONE
+D Build() OK
+D RemoveInstance(cfg1 idx1 = 2) count=5
+D AddInstance(cfg2 new) -> handle=2 count=6
+D FINAL LIVE=[1,3,4,5,6,2] believedLive=6 GetInstanceCount=6 countsMatch=True DUPLICATES=NONE
+
+===== TEST E (Build() between mutations) =====
+E initial handles=[1,2,3,4,5,6,7,8] count=8
+E#1 Build() OK
+E RemoveInstance(h3=4) count=7
+E AddInstance(for k=3) -> handle=4 count=8
+E#2 Build() OK
+E RemoveInstance(h5=6) count=7
+E AddInstance(for k=5) -> handle=6 count=8
+E#3 Build() OK
+E FINAL LIVE=[1,2,3,4,5,6,7,8] believedLive=8 GetInstanceCount=8 countsMatch=True DUPLICATES=NONE
+
+disposed AS=5/5 buffers=6/6
+activeScene=SampleScene isDirtyAFTER=False

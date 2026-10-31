@@ -7,8 +7,10 @@ using UnityEditor;
 using UnityEngine;
 using Unity.Profiling;
 using Caelix.Client;
+using Caelix.IO;
 using Caelix.Net;
 using Caelix.Rendering.Meshing;
+using Caelix.Rendering.RayQuery;
 using Caelix.Simulation;
 using Stopwatch = System.Diagnostics.Stopwatch;
 
@@ -55,8 +57,14 @@ namespace Caelix
         [SerializeField] protected PhysicsWorldConfig physicsWorld;
 
         [SerializeField] protected VoxelRayCast rayCaster;
-        [SerializeField] protected CaelixRenderer rayTracedRenderer;
+
+        [Tooltip("Inline ray query renderer. Enable at most one ray-traced renderer.")]
+        [SerializeField] protected CaelixRayQueryRenderer rayQueryRenderer;
+
         [SerializeField] protected VoxelMeshRendererComponent meshingRenderer;
+
+        [Tooltip("Native Vulkan plugin renderer. When empty, the active CaelixNativeRenderer of this host is ticked.")]
+        [SerializeField] protected Caelix.Rendering.Native.CaelixNativeRenderer nativeRenderer;
 
         // ---------------- SIMULATION ------------------
         [Header("Simulation")]
@@ -68,12 +76,19 @@ namespace Caelix
                  "fixed step. Turn off to keep the project's fixed timestep and tick at that rate instead.")]
         public bool driveFixedTimestep = true;
 
+        /// <summary>External drivers call Step and PumpClientFrame explicitly.</summary>
+        public bool ManualDrive { get; set; }
+
+        public long ClientPendingBytes => clientEnd?.PendingBytes ?? 0;
+        public long ClientPeakPendingBytes => clientEnd?.PeakPendingBytes ?? 0;
+        public long ClientReceivedBytes => clientEnd?.TotalReceivedBytes ?? 0;
+
         [Header("Alien Dirty Propagation")]
         [Tooltip("Propagate dirtiness between entities through the post-physics brick-overlap graph.")]
         public bool doAlienPropagation = false;
 
         [Tooltip("Flags a moving (non-static) entity's bricks hand to their alien neighbors.")]
-        [SerializeField] private DirtyFlags alienMotionDirtyMask = DirtyFlags.GeneralAutomata;
+        [SerializeField] private BrickUpdateFlags alienMotionDirtyMask = BrickUpdateFlags.Automata0;
 
         [Tooltip("Query every allocated brick of every non-static entity, not only the dirty ones. " +
                  "This is the heaviest input the graph can get; keep it on to benchmark motion.")]
@@ -211,6 +226,7 @@ namespace Caelix
                 if (!Mathf.Approximately(Time.fixedDeltaTime, step))
                 {
                     Time.fixedDeltaTime = step;
+                    Time.maximumDeltaTime = step;
                 }
             }
 
@@ -240,6 +256,7 @@ namespace Caelix
         /// </summary>
         private void FixedUpdate()
         {
+            if (ManualDrive) return;
             if (!IsCurrent || Server == null || Client == null)
             {
                 return;
@@ -268,6 +285,12 @@ namespace Caelix
         }
 
         private void Update()
+        {
+            if (!ManualDrive) PumpClientFrame();
+        }
+
+        /// <summary>Applies queued replication and updates presentation once, without advancing simulation.</summary>
+        public void PumpClientFrame()
         {
             if (!IsCurrent || Server == null || Client == null)
             {
@@ -301,12 +324,15 @@ namespace Caelix
 
             long clientEnd = Stopwatch.GetTimestamp();
 
-            bool usedRayTracing = rayTracedRenderer != null && rayTracedRenderer.enabled;
+            bool usedRayQuery = rayQueryRenderer != null && rayQueryRenderer.enabled;
             bool usedMeshing = meshingRenderer != null && meshingRenderer.enabled;
+            Caelix.Rendering.Native.CaelixNativeRenderer native = ResolveNativeRenderer();
             using (s_RenderersMarker.Auto())
             {
-                if (usedRayTracing) rayTracedRenderer.Tick();
+                if (usedRayQuery) rayQueryRenderer.Tick();
                 if (usedMeshing) meshingRenderer.Tick();
+                // Reads the same change lists as the renderers above and clears nothing.
+                if (native != null) native.Tick();
             }
 
             long renderEnd = Stopwatch.GetTimestamp();
@@ -323,7 +349,7 @@ namespace Caelix
             LastTickTimings = new HostTimingStats
             {
                 IsCreated = true,
-                UsedRayTracing = usedRayTracing,
+                UsedRayTracing = usedRayQuery,
                 UsedMeshing = usedMeshing,
                 ServerTicks = serverTicks,
                 ServerMilliseconds = TicksToMilliseconds(serverElapsed),
@@ -334,6 +360,18 @@ namespace Caelix
                 RenderingMilliseconds = TicksToMilliseconds(renderEnd - clientEnd),
                 TotalMilliseconds = TicksToMilliseconds(serverElapsed + (Stopwatch.GetTimestamp() - frameStart)),
             };
+        }
+
+        /// <summary>
+        /// The native renderer to tick: the serialized one when set and enabled, otherwise the
+        /// active instance when it draws this host (its own host field is empty or this host).
+        /// </summary>
+        private Caelix.Rendering.Native.CaelixNativeRenderer ResolveNativeRenderer()
+        {
+            if (nativeRenderer != null) return nativeRenderer.isActiveAndEnabled ? nativeRenderer : null;
+            Caelix.Rendering.Native.CaelixNativeRenderer active = Caelix.Rendering.Native.CaelixNativeRenderer.Active;
+            if (active == null || !active.isActiveAndEnabled) return null;
+            return active.Host == null || active.Host == this ? active : null;
         }
 
         private static double TicksToMilliseconds(long ticks)
@@ -347,7 +385,11 @@ namespace Caelix
             EnsureInitialized();
             if (!IsCurrent || !initialized) return;
             PushSettings();
-            Server.Step(Mathf.Max(1, count));
+            int steps = Mathf.Max(1, count);
+            long start = Stopwatch.GetTimestamp();
+            using (s_ServerTickMarker.Auto()) Server.Step(steps);
+            serverTicksElapsed += Stopwatch.GetTimestamp() - start;
+            ticksSinceLastFrame += steps;
         }
 
         #endregion
@@ -379,14 +421,23 @@ namespace Caelix
 
         #region Save / Load
 
-        /// <summary>Saves the server world to a <c>.cxw</c> file at <paramref name="path"/>.</summary>
+        /// <summary>Saves the server world to a <c>.cxw</c> file at <paramref name="path"/> without a player pose.</summary>
         public void Save(string path)
+        {
+            Save(path, WorldRecord.None);
+        }
+
+        /// <summary>
+        /// Saves the server world plus a world-level record (player pose) to a <c>.cxw</c> file at
+        /// <paramref name="path"/>. The host does not know the player; the game passes the pose in.
+        /// </summary>
+        public void Save(string path, in WorldRecord world)
         {
             EnsureInitialized();
             if (!IsCurrent || !initialized)
                 throw new InvalidOperationException("Save/load requires an enabled, initialized host that owns the singleton slot.");
             path = EnsureWorldSaveExtension(path);
-            World.Save(path);
+            World.Save(path, in world);
         }
 
         [InspectorButton("Save World", PlayModeOnly = true)]
@@ -405,16 +456,19 @@ namespace Caelix
 
         /// <summary>
         /// Loads every entity stored in the <c>.cxw</c> file at <paramref name="path"/> into the
-        /// server world. The client spawns view objects for them on the next tick.
+        /// server world. The client spawns view objects for them on the next tick. Returns the
+        /// file's world-level record (player pose) for the game to apply; <see cref="WorldRecord.None"/>
+        /// for files older than format v7.
         /// </summary>
-        public void Load(string path)
+        public WorldRecord Load(string path)
         {
             EnsureInitialized();
             if (!IsCurrent || !initialized)
                 throw new InvalidOperationException("Save/load requires an enabled, initialized host that owns the singleton slot.");
             path = EnsureWorldSaveExtension(path);
-            World.Load(path);
+            WorldRecord world = World.Load(path);
             Debug.Log($"Loaded Caelix world from {path}", this);
+            return world;
         }
 
         [InspectorButton("Choose Save/Load Path")]

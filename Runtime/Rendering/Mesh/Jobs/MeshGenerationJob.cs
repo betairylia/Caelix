@@ -1,3 +1,4 @@
+using System;
 using Unity.Burst;
 using Unity.Collections;
 using Unity.Jobs;
@@ -11,12 +12,36 @@ namespace Caelix.Rendering.Meshing
     /// Processes a chunk of voxel data and outputs optimized mesh geometry.
     /// </summary>
     [BurstCompile]
-    public struct MeshGenerationJob : IJob
+    public unsafe struct MeshGenerationJob : IJob
     {
         // Input data
-        [ReadOnly] public Sector sector;
-        [ReadOnly] public int3 chunkMin;        // Start position in sector (local coordinates)
-        [ReadOnly] public int3 chunkSize;       // Size of chunk to mesh
+
+        /// <summary>
+        /// Block storage of every brick the chunk covers, x-fastest, bound by the caller. A brick
+        /// with no storage is <see cref="IntPtr.Zero"/> and reads as empty.
+        /// </summary>
+        [ReadOnly] public NativeArray<IntPtr> bricks;
+
+        /// <summary>Bricks along one axis of the chunk: <c>chunkSize / 8</c>.</summary>
+        [ReadOnly] public int bricksPerAxis;
+
+        [ReadOnly] public int3 chunkSize;       // Size of chunk to mesh, in blocks
+
+        /// <summary>
+        /// One block at a CHUNK-LOCAL position, from the bound brick table.
+        /// </summary>
+        private Block GetBlock(int3 chunkLocal)
+        {
+            int3 brick = chunkLocal >> BrickKey.Shift;
+            IntPtr ptr = bricks[brick.x + brick.y * bricksPerAxis + brick.z * bricksPerAxis * bricksPerAxis];
+            if (ptr == IntPtr.Zero)
+            {
+                return Block.Empty;
+            }
+
+            int3 local = chunkLocal & BrickKey.Mask;
+            return ((Block*)(void*)ptr)[BrickKey.ToBlockIdx(local.x, local.y, local.z)];
+        }
 
         // Output data
         public NativeList<VoxelVertex> vertices;
@@ -71,20 +96,19 @@ namespace Caelix.Rendering.Meshing
                     for (int x = 0; x < chunkSize.x; x++)
                     {
                         int3 localPos = new int3(x, y, z);
-                        int3 worldPos = chunkMin + localPos;
 
-                        Block block = sector.GetBlock(worldPos.x, worldPos.y, worldPos.z);
+                        Block block = GetBlock(localPos);
                         if (block.isEmpty) continue;
 
                         ushort blockID = block.id;
 
                         // Check all 6 faces
-                        CheckAndEmitFace(0, worldPos, localPos, blockID, new int3(1, 0, 0), quads, heads, tails, size);   // X+
-                        CheckAndEmitFace(1, worldPos, localPos, blockID, new int3(-1, 0, 0), quads, heads, tails, size);  // X-
-                        CheckAndEmitFace(2, worldPos, localPos, blockID, new int3(0, 1, 0), quads, heads, tails, size);   // Y+
-                        CheckAndEmitFace(3, worldPos, localPos, blockID, new int3(0, -1, 0), quads, heads, tails, size);  // Y-
-                        CheckAndEmitFace(4, worldPos, localPos, blockID, new int3(0, 0, 1), quads, heads, tails, size);   // Z+
-                        CheckAndEmitFace(5, worldPos, localPos, blockID, new int3(0, 0, -1), quads, heads, tails, size);  // Z-
+                        CheckAndEmitFace(0, localPos, blockID, new int3(1, 0, 0), quads, heads, tails, size);   // X+
+                        CheckAndEmitFace(1, localPos, blockID, new int3(-1, 0, 0), quads, heads, tails, size);  // X-
+                        CheckAndEmitFace(2, localPos, blockID, new int3(0, 1, 0), quads, heads, tails, size);   // Y+
+                        CheckAndEmitFace(3, localPos, blockID, new int3(0, -1, 0), quads, heads, tails, size);  // Y-
+                        CheckAndEmitFace(4, localPos, blockID, new int3(0, 0, 1), quads, heads, tails, size);   // Z+
+                        CheckAndEmitFace(5, localPos, blockID, new int3(0, 0, -1), quads, heads, tails, size);  // Z-
                     }
                 }
             }
@@ -95,7 +119,6 @@ namespace Caelix.Rendering.Meshing
         /// </summary>
         private void CheckAndEmitFace(
             int faceDir,
-            int3 worldPos,
             int3 localPos,
             ushort blockID,
             int3 offset,
@@ -104,8 +127,6 @@ namespace Caelix.Rendering.Meshing
             NativeArray<int> tails,
             int size)
         {
-            int3 neighborWorld = worldPos + offset;
-
             // Check if neighbor is within chunk bounds
             int3 neighborLocal = localPos + offset;
             bool inBounds = neighborLocal.x >= 0 && neighborLocal.x < chunkSize.x &&
@@ -118,7 +139,7 @@ namespace Caelix.Rendering.Meshing
             // If in bounds, check if neighbor is empty
             if (inBounds)
             {
-                Block neighbor = sector.GetBlock(neighborWorld.x, neighborWorld.y, neighborWorld.z);
+                Block neighbor = GetBlock(neighborLocal);
                 shouldEmit = neighbor.isEmpty;
             }
 

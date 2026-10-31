@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using Unity.Collections;
 using Unity.Mathematics;
 using UnityEngine;
 using Caelix;
@@ -19,7 +20,7 @@ public class CaelixDebugGUI : MonoBehaviour
     [SerializeField] private KeyCode orbitToggleKey = KeyCode.O;
 
     [Header("References")]
-    [SerializeField] private CaelixRenderer rayTracingRenderer;
+    [SerializeField] private Caelix.Rendering.RayQuery.CaelixRayQueryRenderer rayQueryRenderer;
     [SerializeField] private VoxelMeshRendererComponent meshRendererComponent;
     [SerializeField] private CaelixHost voxelWorld;
 
@@ -27,16 +28,16 @@ public class CaelixDebugGUI : MonoBehaviour
     [SerializeField] private bool showSectorBorders = false;
     [SerializeField] private bool showBrickBorders = false;
     [SerializeField, Min(0), Tooltip(
-        "How many sectors out from the camera's own sector to draw brick borders for. " +
-        "0 draws only the sector the camera is inside, 1 draws the surrounding 3x3x3, and so on. " +
-        "Each sector holds 4096 bricks, so this grows cubically - keep it low.")]
+        "How many regions out from the camera's own region to draw brick borders for. " +
+        "0 draws only the region the camera is inside, 1 draws the surrounding 3x3x3, and so on. " +
+        "Each region holds 4096 bricks, so this grows cubically - keep it low.")]
     private int brickBorderSectorRadius = 0;
     [SerializeField] private Color sectorBorderColor = new Color(1f, 0f, 0f, 1.0f);
     [SerializeField] private Color brickBorderColor = new Color(0f, 1f, 0f, 1.0f);
     [SerializeField] private Color brickBorderColorDirty = new Color(0f, 1f, 1f, 1.0f);
 
-    /// <summary>Block position to sector position, matching VoxelEntity's arithmetic-shift convention.</summary>
-    private const int BlockToSectorShift = Sector.SHIFT_IN_BLOCKS + Sector.SHIFT_IN_BRICKS;
+    /// <summary>Block position to region position, matching VoxelEntity's arithmetic-shift convention.</summary>
+    private const int BlockToSectorShift = VoxelRegion.Shift;
 
     private const float FpsWindowSeconds = 30f;
     private const float PerformanceUpdateIntervalSeconds = 0.1f;
@@ -103,9 +104,9 @@ public class CaelixDebugGUI : MonoBehaviour
         isVisible = showOnStart;
 
         // Auto-find references if not set
-        if (rayTracingRenderer == null)
+        if (rayQueryRenderer == null)
         {
-            rayTracingRenderer = FindAnyObjectByType<CaelixRenderer>();
+            rayQueryRenderer = FindAnyObjectByType<Caelix.Rendering.RayQuery.CaelixRayQueryRenderer>();
         }
 
         if (voxelWorld == null)
@@ -314,7 +315,7 @@ public class CaelixDebugGUI : MonoBehaviour
         GUILayout.Space(SectionSpacing);
 
         // Ray Tracing Info
-        if (rayTracingRenderer != null)
+        if (rayQueryRenderer != null)
         {
             GUILayout.Label("<b>Ray Tracing:</b>", labelStyle);
 
@@ -322,31 +323,28 @@ public class CaelixDebugGUI : MonoBehaviour
             if (world != null)
             {
                 ulong hostMemory = 0;
-                int totalSectors = 0;
+                int totalRegions = 0;
                 int totalBricks = 0;
 
                 foreach (var entry in world.Entities)
                 {
                     VoxelEntityData entity = entry.Value;
                     hostMemory += entity.GetHostMemoryUsageKB();
-                    totalSectors += entity.sectors.Count;
-
-                    // Count total bricks
-                    foreach (var kvp in entity.sectors)
-                    {
-                        ref Sector sector = ref kvp.Value.Get();
-                        totalBricks += sector.NonEmptyBrickCount;
-                    }
+                    totalRegions += entity.RegionCount;
+                    totalBricks += entity.AllocatedBrickCount;
                 }
 
-                GUILayout.Label($"  Frame: {rayTracingRenderer.frameId}", labelStyle);
-                GUILayout.Label($"  Instances: {rayTracingRenderer.instanceCount}", labelStyle);
-                GUILayout.Label($"  Sectors: {totalSectors}", labelStyle);
+                GUILayout.Label($"  Frame: {rayQueryRenderer.frameId}", labelStyle);
+                GUILayout.Label($"  Instances: {rayQueryRenderer.instanceCount}", labelStyle);
+                GUILayout.Label($"  Regions: {totalRegions}", labelStyle);
                 GUILayout.Label($"  Bricks: {totalBricks}", labelStyle);
 
                 // Memory info
-                GUILayout.Label($"  AS Size: {rayTracingRenderer.voxelScene.GetSize() / 1024 / 1024} MB", labelStyle);
+                GUILayout.Label($"  AS Size: {rayQueryRenderer.voxelScene.GetSize() / 1024 / 1024} MB", labelStyle);
                 GUILayout.Label($"  Host RAM: {hostMemory / 1024} MB", labelStyle);
+                GUILayout.Label(
+                    $"  Pool: {rayQueryRenderer.poolLiveBricks} / {rayQueryRenderer.poolCapacityBricks} bricks " +
+                    $"in {rayQueryRenderer.poolPages} pages", labelStyle);
             }
         }
 
@@ -357,7 +355,7 @@ public class CaelixDebugGUI : MonoBehaviour
         {
             GUILayout.Label("<b>Mesh Rendering:</b>", labelStyle);
             GUILayout.Label($"  Entities: {meshRendererComponent.MeshRenderer.TrackedEntityCount}", labelStyle);
-            GUILayout.Label($"  Sector Renderers: {meshRendererComponent.MeshRenderer.SectorRendererCount}", labelStyle);
+            GUILayout.Label($"  Group Renderers: {meshRendererComponent.MeshRenderer.GroupRendererCount}", labelStyle);
         }
 
         GUILayout.Space(SectionSpacing);
@@ -371,8 +369,8 @@ public class CaelixDebugGUI : MonoBehaviour
 
         // Sector borders toggle
         if (GUILayout.Button(new GUIContent(
-                showSectorBorders ? "Hide Sector Borders" : "Show Sector Borders",
-                "Toggle world-space outlines for loaded voxel sectors."), buttonStyle))
+                showSectorBorders ? "Hide Region Borders" : "Show Region Borders",
+                "Toggle world-space outlines for loaded voxel regions."), buttonStyle))
         {
             showSectorBorders = !showSectorBorders;
         }
@@ -380,8 +378,8 @@ public class CaelixDebugGUI : MonoBehaviour
         // Brick borders toggle
         if (GUILayout.Button(new GUIContent(
                 showBrickBorders ? "Hide Brick Borders" : "Show Brick Borders",
-                "Toggle brick outlines for the sector the camera is inside. Dirty bricks use the " +
-                "cyan debug color. Raise Brick Border Sector Radius to include neighbouring sectors."), buttonStyle))
+                "Toggle brick outlines for the region the camera is inside. Dirty bricks use the " +
+                "cyan debug color. Raise Brick Border Sector Radius to include neighbouring regions."), buttonStyle))
         {
             showBrickBorders = !showBrickBorders;
         }
@@ -480,7 +478,7 @@ public class CaelixDebugGUI : MonoBehaviour
     private RenderingMode DetectRenderingMode()
     {
         // Match the logic in CaelixWorld.Tick (lines 123-124)
-        bool hasRayTracing = rayTracingRenderer != null && rayTracingRenderer.enabled;
+        bool hasRayTracing = rayQueryRenderer != null && rayQueryRenderer.enabled;
         bool hasMesh = meshRendererComponent != null && meshRendererComponent.enabled;
 
         if (hasRayTracing && hasMesh)
@@ -660,48 +658,30 @@ public class CaelixDebugGUI : MonoBehaviour
             // Get entity's transform matrix (position and rotation; entity scale is always 1)
             Matrix4x4 entityMatrix = entity.LocalToWorld;
 
-            // Which sector the camera occupies, in this entity's own local voxel space. Resolved once
-            // per entity rather than per sector, since each entity has its own transform.
+            // Which region the camera occupies, in this entity's own local voxel space. Resolved
+            // once per entity rather than per region, since each entity has its own transform.
             int3 cameraSectorPos = canDrawBrickBorders
                 ? WorldToSectorPos(entity.Transform, viewCamera.transform.position)
                 : default;
 
-            foreach (var kvp in entity.Data.sectors)
+            if (showSectorBorders)
             {
-                int3 sectorPos = kvp.Key;
-                ref Sector sector = ref kvp.Value.Get();
-
-                // Calculate sector local position (in entity's local space)
-                float3 sectorLocalPos = (float3)sectorPos * Sector.SECTOR_SIZE_IN_BLOCKS;
-
-                // Draw sector borders
-                if (showSectorBorders)
+                NativeArray<int3> regionPositions = entity.Data.GetRegionPositions(Allocator.Temp);
+                foreach (int3 regionPos in regionPositions)
                 {
-                    DrawWireBox(sectorLocalPos, new float3(Sector.SECTOR_SIZE_IN_BLOCKS), sectorBorderColor, entityMatrix);
+                    DrawWireBox(
+                        VoxelRegion.OriginOf(regionPos), new float3(VoxelRegion.SizeInBlocks),
+                        sectorBorderColor, entityMatrix);
                 }
 
-                // Draw brick borders, but only near the camera: a sector holds 4096 bricks, so a
-                // large world emits far more lines than the immediate-mode GL path can carry.
-                if (canDrawBrickBorders && IsSectorNearCamera(sectorPos, cameraSectorPos))
-                {
-                    for (short brickIdxAbs = 0; brickIdxAbs < Sector.SIZE_IN_BRICKS * Sector.SIZE_IN_BRICKS * Sector.SIZE_IN_BRICKS; brickIdxAbs++)
-                    {
-                        short brickIdx = sector.brickIdx[brickIdxAbs];
-                        DirtyFlags requireUpdateFlags = (DirtyFlags)sector.brickRequireUpdateFlags[brickIdxAbs];
-                        if (brickIdx != Sector.BRICKID_EMPTY || requireUpdateFlags > 0)
-                        {
-                            // Calculate brick position within sector
-                            int3 brickPos = Sector.ToBrickPos(brickIdxAbs);
-                            float3 brickLocalPos = new float3(brickPos) * Sector.SIZE_IN_BLOCKS;
-                            float3 brickInSectorPos = sectorLocalPos + brickLocalPos;
+                regionPositions.Dispose();
+            }
 
-                            Color colorToUse = (requireUpdateFlags & DirtyFlags.GeometryWithLocalNeighbor) > 0 ? brickBorderColorDirty : brickBorderColor;
-
-                            DrawWireBox(
-                                brickInSectorPos, new float3(Sector.SIZE_IN_BLOCKS), colorToUse, entityMatrix);
-                        }
-                    }
-                }
+            // Draw brick borders, but only near the camera: a region holds 4096 bricks, so a
+            // large world emits far more lines than the immediate-mode GL path can carry.
+            if (canDrawBrickBorders)
+            {
+                DrawBrickBorders(entity.Data, cameraSectorPos, entityMatrix);
             }
         }
 
@@ -710,7 +690,47 @@ public class CaelixDebugGUI : MonoBehaviour
     }
 
     /// <summary>
-    /// Converts a world position into the sector coordinate that contains it, in the local voxel
+    /// Draws one wire box per brick of the regions around the camera: allocated bricks in the
+    /// normal colour, then the bricks that still need geometry work on top, in the dirty colour.
+    /// </summary>
+    private void DrawBrickBorders(VoxelEntityData data, int3 cameraSectorPos, Matrix4x4 entityMatrix)
+    {
+        int radius = Mathf.Max(0, brickBorderSectorRadius);
+        int3 minRegion = cameraSectorPos - radius;
+        int3 maxRegion = cameraSectorPos + radius;
+        int3 minKey = VoxelRegion.FirstKeyOf(minRegion);
+        int3 maxKey = VoxelRegion.LastKeyOf(maxRegion);
+
+        foreach (int3 key in data.EnumerateBricks(minKey, maxKey))
+        {
+            DrawWireBox(
+                BrickKey.ToBlockOrigin(key), new float3(BrickKey.BlocksPerAxis),
+                brickBorderColor, entityMatrix);
+        }
+
+        // The dirty ones are collected separately, because a brick position that needs work does
+        // not have to hold storage; drawn last so it wins where both apply.
+        var dirty = new NativeList<RequiredBrick>(64, Allocator.TempJob); // TempJob: the collector runs a job
+        data.CollectRequiredBricks(
+            default, BrickUpdateFlags.GeometryWithLocalNeighbor, includeEmpty: true, dirty);
+        for (int i = 0; i < dirty.Length; i++)
+        {
+            int3 key = dirty[i].Key;
+            if (math.any(key < minKey) || math.any(key > maxKey))
+            {
+                continue;
+            }
+
+            DrawWireBox(
+                BrickKey.ToBlockOrigin(key), new float3(BrickKey.BlocksPerAxis),
+                brickBorderColorDirty, entityMatrix);
+        }
+
+        dirty.Dispose();
+    }
+
+    /// <summary>
+    /// Converts a world position into the region coordinate that contains it, in the local voxel
     /// space of <paramref name="entityTransform"/>.
     /// </summary>
     private static int3 WorldToSectorPos(Transform entityTransform, Vector3 worldPosition)
@@ -723,12 +743,6 @@ public class CaelixDebugGUI : MonoBehaviour
             Mathf.FloorToInt(localPosition.x) >> BlockToSectorShift,
             Mathf.FloorToInt(localPosition.y) >> BlockToSectorShift,
             Mathf.FloorToInt(localPosition.z) >> BlockToSectorShift);
-    }
-
-    private bool IsSectorNearCamera(int3 sectorPos, int3 cameraSectorPos)
-    {
-        int radius = Mathf.Max(0, brickBorderSectorRadius);
-        return math.all(math.abs(sectorPos - cameraSectorPos) <= radius);
     }
 
     private void DrawWireBox(float3 origin, float3 size, Color color, Matrix4x4 transform)

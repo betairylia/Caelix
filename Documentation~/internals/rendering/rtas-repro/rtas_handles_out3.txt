@@ -1,0 +1,20 @@
+activeScene=SampleScene isDirtyBEFORE=False
+
+===== TEST L (stale handle removed after reassignment) =====
+L P=1 Q=2 R=3 count=3
+L Q removed (handle 2) count=2
+L S added -> 2 count=3  (S==Q_old: True)
+L stale Q.RemoveInstance(2) count=2  <- this killed S's instance
+L T added -> 2 count=3
+L S and T both believe they own handle 2 : True
+L FINAL count=3 liveOwnersBelieved=P,R,S,T=4
+
+===== TEST M (RemoveInstance with a never-issued handle) =====
+M handles=[1,2,3] count=3
+M RemoveInstance(0) NO THROW count=3
+M RemoveInstance(9999) NO THROW count=3
+M add after bogus removes -> 4 count=4
+M add -> 5 count=5
+
+disposed AS=2/2 buffers=2/2
+activeScene=SampleScene isDirtyAFTER=False

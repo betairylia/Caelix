@@ -9,6 +9,40 @@ namespace Caelix.Tests
 {
     public class HostSingletonTests
     {
+        [UnityTest]
+        public IEnumerator ManualDrive_AdvancesOnlyOnStep_AndConsumesTimingOnce()
+        {
+            EditorSceneManager.NewScene(NewSceneSetup.EmptyScene, NewSceneMode.Single);
+            yield return new EnterPlayMode();
+            float oldStep = Time.fixedDeltaTime;
+            var root = new GameObject("manual-host-test");
+            try
+            {
+                var host = root.AddComponent<CaelixHost>();
+                host.ManualDrive = true;
+                host.freeze = false;
+                host.EnsureInitialized();
+                uint before = host.Server.TickIndex;
+                yield return new WaitForFixedUpdate();
+                yield return null;
+                Assert.That(host.Server.TickIndex, Is.EqualTo(before));
+                host.Step(2);
+                Assert.That(host.Server.TickIndex, Is.EqualTo(before + 2));
+                host.PumpClientFrame();
+                Assert.That(host.LastTickTimings.ServerTicks, Is.EqualTo(2));
+                Assert.That(host.ClientPendingBytes, Is.Zero);
+                host.PumpClientFrame();
+                Assert.That(host.LastTickTimings.ServerTicks, Is.Zero);
+                Assert.That(host.Server.TickIndex, Is.EqualTo(before + 2));
+            }
+            finally
+            {
+                Object.DestroyImmediate(root);
+                Time.fixedDeltaTime = oldStep;
+            }
+            yield return new ExitPlayMode();
+        }
+
         [Test]
         public void LookupBeforeAwake_DoesNotInitializeOrFindDisabledComponents()
         {

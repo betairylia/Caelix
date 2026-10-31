@@ -13,18 +13,14 @@ the client holds a replica for rendering and tools. `CaelixHost` runs both local
 | Understand storage | [Core: VDB-like storage](https://github.com/betairylia/Caelix-Core/blob/main/Documentation~/internals/voxel-storage.md) |
 | Choose a traversal API | [Core: enumerator rules](https://github.com/betairylia/Caelix-Core/blob/main/Documentation~/reference/enumerators.md) |
 | Author a voxel spline | [Voxel spline authoring](manual/voxel-spline-authoring.md) |
-| Work on rendering | [Budget renderer](internals/rendering/BUDGET_RENDERER.md), [RT G-buffer](internals/rendering/RT_GBUFFER_LAYOUT.md) |
+| Work on rendering | [Budget renderer](internals/rendering/BUDGET_RENDERER.md), [RT G-buffer](internals/rendering/RT_GBUFFER_LAYOUT.md), [Ray query backend](internals/rendering/RAYQUERY_RENDERER.md) |
 | Review the detailed network contract | [Server/client architecture](internals/SERVER_CLIENT_ARCHITECTURE.md) |
 | Understand earlier decisions and measurements | [Historical documents](archive/index.md) |
 | Write or maintain a page | [Documentation guide](documentation-guide.md) |
 
-New contributors should read Get started, the storage model, and the tick page
-in that order. Before changing replication, also read the server/client contract
-and message guide. Historical reports retain their original evidence and are
-marked separately from newly checked introductions.
-
-Cross-repository links target `main`; new Core pages become available there after
-its documentation change is merged. Local source links follow the checked-out branch.
+Start with Get started. Read the owning contract before changing a subsystem.
+Cross-repository links target `main` and may await merging; local source links
+follow this checkout.
 
 ## Source and validation
 

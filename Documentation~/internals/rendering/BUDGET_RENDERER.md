@@ -42,14 +42,18 @@ filters are built for.
 | --- | --- |
 | `Runtime/Rendering/RendererFeature/CaelixBudgetRendererFeature.cs` | settings surface + wiring |
 | `Runtime/Rendering/RendererFeature/CaelixBudgetSettings.cs` | `CaelixBudgetTraceSettings`, `CaelixBudgetShadingSettings` |
-| `Runtime/Rendering/RendererFeature/Passes/CaelixBudgetGBufferPass.cs` | stage 1, the DXR dispatch; also hosts `CaelixBudgetLighting` (shared light/sky resolution) |
+| `Runtime/Rendering/RendererFeature/Passes/CaelixBudgetGBufferPass.cs` | stage 1, the compute dispatch; also hosts `CaelixBudgetLighting` (shared light/sky resolution) |
 | `Runtime/Rendering/RendererFeature/Passes/CaelixBudgetDenoisePass.cs` | stage 2, filter + deferred shade |
-| `Runtime/Rendering/Shaders/Budget/CaelixBudget.raytrace` | the raygen |
+| `Runtime/Rendering/RendererFeature/Passes/CaelixRayQueryDispatch.cs` | the scene bindings both G-buffer stages share: pages, instance table, material table, bake kernels |
+| `Runtime/Rendering/Shaders/Budget/CaelixBudgetRQ.compute` | the trace kernel (`CaelixBudgetKernel`) |
 | `Runtime/Rendering/Shaders/Budget/CaelixBudgetShade.shader` | 4 passes: a-trous, temporal, deferred shade, cross resolve |
 
 Reused unchanged: `CaelixPresentPass`, `CaelixCameraHistory`, `CaelixFrameResources`,
-`CaelixATrousFilterSettings`, `CaelixTemporalRadianceSettings`, `PostFlip.shader`,
-`BrickRTTest.shader` (the hit group), `RayPayload`.
+`CaelixATrousFilterSettings`, `CaelixTemporalRadianceSettings`, `PostFlip.shader`, `RayPayload`,
+and the whole ray query trace side — `RayQuery/CaelixRayQueryTrace.hlsl`,
+`RayQuery/CaelixMaterialTable.hlsl`, `CaelixAabbInstance.shader` (the AABB instances' placeholder
+material) and `CaelixRayQueryRenderer` itself, which owns the acceleration structure, the brick pool
+and the instance table for whichever feature is enabled.
 
 ### Shared denoise kernels
 
@@ -111,7 +115,7 @@ refractions filter and accumulate at their own apparent distance rather than the
 Transparency detection is **already done by the DDA**, by testing the ray direction against which
 of the cell's faces border a different medium. Budget mode inherits that rather than re-deriving it.
 
-- `SectorRenderer.Jobs.cs` `GetRendererBlockData` builds `faceMask`: bit *i* is set when the
+- `BrickRecordLayout.GetRendererBlockData` builds `faceMask`: bit *i* is set when the
   neighbour in `NeighborhoodSettings.Directions[i]` is a *different* transparent medium.
   `Directions` is `+X, -X, +Y, -Y, +Z, -Z`.
 - `CaelixBrickTrace.hlsl:273` terminates on `GetFaceBits(blockID) & normalFlags`, where
@@ -126,7 +130,7 @@ different medium. So:
 
 The air cell in front of a pane of glass is *not* reported to a ray arriving through air (its `-X`
 neighbour is also air). The glass cell is. On the way out, the air cell behind the glass is — that
-hit *is* the exit event, and it correctly reports air. This is the invariant `Full_raygen`'s
+hit *is* the exit event, and it correctly reports air. This is the invariant the path tracer's
 `previousTransparentMaterial` already relies on, and budget mode now uses the same convention
 (`path.mediumMaterial`, a material ID, `0` = vacuum; `MatTableTransparent[0]` is air —
 `{albedo (1,1,1), smoothness 0, metallic 0, IOR 1}` — so `GET_MATERIAL` is safe to call on it
@@ -204,7 +208,7 @@ gathering — emissive voxels still glow (their emission is in the G-buffer) but
 
 ## Pass order
 
-1. `Caelix Budget DXR Trace` — G-buffer + raw AO/shadow.
+1. `Caelix Budget RayQuery Trace` — G-buffer + raw AO/shadow.
 2. `Caelix Budget AO A-Trous Filter 1..N` — shared a-trous over AO/shadow, ping-ponged, rebinding
    `_BudgetAOShadowTex` after each iteration.
 3. `Caelix Budget AO Temporal Accumulation` — shared temporal kernel into
@@ -219,7 +223,7 @@ gathering — emissive voxels still glow (their emission is in the G-buffer) but
 On the renderer asset, add **Caelix Budget Renderer Feature** and disable the path-traced
 `Caelix Renderer Feature`. Assign:
 
-- **Tracer** → `CaelixBudget.raytrace`
+- **Ray Query Tracer** → `Budget/CaelixBudgetRQ.compute`
 - **Budget Shade Shader** → `Hidden/Caelix/BudgetShade`
 - **Post Process Material Flip** → the same flip material the path-traced feature uses
 - **Blue Noise Texture** → the same 128×8192 R8G8 STBN texture (required: AO ray directions come

@@ -11,6 +11,9 @@ struct RayPayload
     uint materialID_voxelFaceHash;
     uint packedWorldNormal;
     uint2 packedPrevWorldOffset;
+    // RTAS instance ID (= instance table slot) of the committed hit; 0 on a miss. The GI mode
+    // G-buffer uses it to store the primary surface in the object space of its instance.
+    uint instanceId;
 };
 
 inline void CaelixClearRayPayload(out RayPayload payload)
@@ -19,6 +22,7 @@ inline void CaelixClearRayPayload(out RayPayload payload)
     payload.materialID_voxelFaceHash = 0u;
     payload.packedWorldNormal = 0u;
     payload.packedPrevWorldOffset = uint2(0u, 0u);
+    payload.instanceId = 0u;
 }
 
 inline bool CaelixRayPayloadHasHit(RayPayload payload)
