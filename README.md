@@ -1,10 +1,5 @@
 # Caelix
 
-<<<<<<< HEAD
-Experimental voxel engine for Unity URP: world simulation, rendering, and authoring.
-Uses [Caelix Core](https://github.com/betairylia/Caelix-Core) for storage and
-[Caelix Physics](https://github.com/betairylia/Caelix-physics) for physics.
-=======
 **This repository is in an early research and experimental stage. Expect massive API changes.**
 
 I'm sorry that the current docs are very sloppy. Later (not anytime soon, tho) I will write some proper docs by myself.
@@ -14,24 +9,27 @@ I'm sorry that the current docs are very sloppy. Later (not anytime soon, tho) I
 ---
 
 Caelix is an experimental voxel engine package for Unity URP.
->>>>>>> origin/main
 
-Start with [Get started](Documentation~/manual/get-started.md), or choose a task
-in the [documentation](Documentation~/index.md).
+This package contains rendering, authoring, and world orchestration. It uses Caelix Core for voxel data and Caelix Physics for simulation.
 
-<<<<<<< HEAD
-## License
-=======
 ## Roadmap
 
 - v0.2: Optimize memory usage; Improved rendering & GI; Playable LAN multiplayer
 - v0.3: Proper physics engine with at least contact merging & manifold creation; Infinite world streaming
->>>>>>> origin/main
+
+## Related Repositories
+
+- [Caelix-Core](https://github.com/betairylia/Caelix-Core) — Basic voxel data layouts + I/O.
+- [Caelix-physics](https://github.com/betairylia/Caelix-physics) — Voxel fork of Unity Physics.
+- [Caelix-Renderer](https://github.com/betairylia/Caelix-Renderer) — Caelix's Vulkan native rendering plugin.
+- [Caelix](https://github.com/betairylia/Caelix) — Custom voxel rendering & physics engine backend.
+- [Titania](https://github.com/betairylia/Titania) — A voxel sandbox project built on Caelix, demonstrates Caelix usage.
+
+## License
 
 Caelix is licensed under the GNU General Public License, version 3 (see `LICENSE`),
 with the following additional permission.
 
-<<<<<<< HEAD
 ### Additional permission under GNU GPL version 3 section 7
 
 If you modify this Program, or any covered work, by linking or combining it
@@ -56,10 +54,3 @@ The native Vulkan renderer needs `caelix_unity.dll`, `caelix_renderer.dll`,
 of this repository: take them from a
 [Caelix-Renderer](https://github.com/betairylia/Caelix-RenderingPlugin) release, which
 carries their third-party notices.
-=======
-- [Caelix-Core](https://github.com/betairylia/Caelix-Core) — Basic voxel data layouts + I/O.
-- [Caelix-physics](https://github.com/betairylia/Caelix-physics) — Voxel fork of Unity Physics.
-- [Caelix-Renderer](https://github.com/betairylia/Caelix-Renderer) — Caelix's Vulkan native rendering plugin.
-- [Caelix](https://github.com/betairylia/Caelix) — Custom voxel rendering & physics engine backend.
-- [Titania](https://github.com/betairylia/Titania) — A voxel sandbox project built on Caelix, demonstrates Caelix usage.
->>>>>>> origin/main
