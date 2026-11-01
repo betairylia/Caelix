@@ -1,8 +1,8 @@
 # Caelix
 
-**This repository is in an early research and experimental stage. Expect massive API changes.**
-
-I'm sorry that the current docs are very sloppy. Later (not anytime soon, tho) I will write some proper docs by myself.
+This repository is archived at v0.2.0. Caelix development continues in private.  
+Much of the recent code was written with AI tools, and I no longer review every line before I publish it. I am not very comfortable sharing them at that standard.  
+v0.2.0 remains available under its license.  
 
 <img width="480" height="560" align="center" alt="silly-bird-loop" src="https://github.com/user-attachments/assets/4e62968c-d537-4bd5-be48-49b1a0201753" />
 
